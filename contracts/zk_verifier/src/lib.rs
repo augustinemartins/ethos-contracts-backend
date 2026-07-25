@@ -63,6 +63,10 @@ pub enum VerifierError {
     /// The caller is not permitted to view this credential at its current
     /// privacy level.
     AccessDenied = 16,
+    /// No version exists with the given number for this credential — either
+    /// it was never recorded, or it has since been pruned by the retention
+    /// policy.
+    VersionNotFound = 17,
 }
 
 /// Storage key discriminants.
@@ -103,6 +107,11 @@ mod keys {
         /// retained snapshot for that credential (bounded by
         /// MAX_CREDENTIAL_SNAPSHOTS).
         CredentialSnapshotTimestamps(u64),
+        /// credential_id -> Vec<version>, ascending, a parallel index to
+        /// `CredentialSnapshotTimestamps` (same length, same order, same
+        /// retention bound) mapping each retained snapshot to its version
+        /// number.
+        CredentialSnapshotVersions(u64),
         /// credential_id -> PrivacyLevel. Absence means `Public`, so
         /// pre-existing credentials are unaffected until an admin opts them
         /// into a stricter level via `set_credential_privacy`.
@@ -124,7 +133,8 @@ pub struct AttestationRecord {
 /// A point-in-time snapshot of a credential's attestation state, captured
 /// whenever that state changes (re-attestation, or a dispute resolving).
 /// Used to answer historical questions like "was this credential valid at
-/// time T?" via [`ZkVerifierContract::get_credential_at_time`].
+/// time T?" via [`ZkVerifierContract::get_credential_at_time`], or "what did
+/// version N look like?" via [`ZkVerifierContract::get_credential_version`].
 #[contracttype]
 #[derive(Clone)]
 pub struct CredentialSnapshot {
@@ -133,6 +143,33 @@ pub struct CredentialSnapshot {
     pub invalidated: bool,
     /// Ledger timestamp at which this snapshot was captured.
     pub timestamp: u64,
+    /// Monotonically increasing version number for this credential, starting
+    /// at 1. Unlike the snapshot itself, a version number is never reused or
+    /// renumbered once assigned — even after the retention policy prunes the
+    /// snapshot it identifies, so audit references to "version N" remain
+    /// meaningful (as "not found") rather than silently pointing at a
+    /// different state. See docs/zk-verifier.md, "Credential Version
+    /// History".
+    pub version: u32,
+}
+
+/// The result of comparing two recorded versions of a credential's
+/// attestation state, returned by
+/// [`ZkVerifierContract::diff_credential_versions`].
+#[contracttype]
+#[derive(Clone)]
+pub struct CredentialVersionDiff {
+    pub credential_id: u64,
+    pub from_version: u32,
+    pub to_version: u32,
+    pub from_timestamp: u64,
+    pub to_timestamp: u64,
+    pub oracle_changed: bool,
+    pub previous_oracle: Address,
+    pub current_oracle: Address,
+    pub invalidated_changed: bool,
+    pub previous_invalidated: bool,
+    pub current_invalidated: bool,
 }
 
 /// Controls who may read a credential's attestation state via
@@ -553,6 +590,80 @@ impl ZkVerifierContract {
             .get(&DataKey::CredentialSnapshot(credential_id, snapshot_ts))
     }
 
+    /// Returns `credential_id`'s recorded state as of a specific `version`
+    /// number, or `None` if that version was never recorded or has since
+    /// been pruned by the retention policy (see docs/zk-verifier.md,
+    /// "Credential Version History").
+    ///
+    /// Version numbers start at 1 and increment by one each time the
+    /// credential's attestation or invalidation status changes; unlike
+    /// timestamps, they are never reused, so "version 3" always identifies
+    /// the same historical state even if snapshots around it are pruned.
+    ///
+    /// `requester` is subject to the same [`PrivacyLevel`] access check as
+    /// [`Self::get_credential_at_time`].
+    pub fn get_credential_version(
+        env: Env,
+        requester: Address,
+        credential_id: u64,
+        version: u32,
+    ) -> Option<CredentialSnapshot> {
+        requester.require_auth();
+        Self::require_credential_access(&env, &requester, credential_id);
+        Self::load_version_snapshot(&env, credential_id, version)
+    }
+
+    /// Returns the latest version number recorded for `credential_id` (0 if
+    /// it has never been attested), regardless of whether earlier versions
+    /// have since been pruned.
+    pub fn credential_version_count(env: Env, credential_id: u64) -> u32 {
+        let versions: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CredentialSnapshotVersions(credential_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        versions.last().unwrap_or(0)
+    }
+
+    /// Compares two recorded versions of `credential_id` and reports what
+    /// changed between them — whether the attesting oracle changed and
+    /// whether the invalidated status changed, plus both versions' raw
+    /// state and timestamps. `from_version` and `to_version` need not be
+    /// adjacent or in chronological order.
+    ///
+    /// Panics with `VersionNotFound` if either version was never recorded or
+    /// has since been pruned. `requester` is subject to the same
+    /// [`PrivacyLevel`] access check as [`Self::get_credential_at_time`].
+    pub fn diff_credential_versions(
+        env: Env,
+        requester: Address,
+        credential_id: u64,
+        from_version: u32,
+        to_version: u32,
+    ) -> CredentialVersionDiff {
+        requester.require_auth();
+        Self::require_credential_access(&env, &requester, credential_id);
+
+        let from = Self::load_version_snapshot(&env, credential_id, from_version)
+            .unwrap_or_else(|| panic_with_error!(&env, VerifierError::VersionNotFound));
+        let to = Self::load_version_snapshot(&env, credential_id, to_version)
+            .unwrap_or_else(|| panic_with_error!(&env, VerifierError::VersionNotFound));
+
+        CredentialVersionDiff {
+            credential_id,
+            from_version,
+            to_version,
+            from_timestamp: from.timestamp,
+            to_timestamp: to.timestamp,
+            oracle_changed: from.oracle != to.oracle,
+            previous_oracle: from.oracle,
+            current_oracle: to.oracle,
+            invalidated_changed: from.invalidated != to.invalidated,
+            previous_invalidated: from.invalidated,
+            current_invalidated: to.invalidated,
+        }
+    }
+
     /// Returns the number of concurring votes required to resolve a
     /// dispute.
     pub fn dispute_threshold(env: Env) -> u32 {
@@ -663,18 +774,45 @@ impl ZkVerifierContract {
     }
 
     /// Captures a `CredentialSnapshot` for `credential_id` at the current
-    /// ledger timestamp, appending it to that credential's snapshot index.
-    /// If a snapshot was already captured at this exact timestamp (e.g. two
-    /// state changes land in the same ledger close), it is overwritten
-    /// in place rather than duplicated in the index — this keeps the index
-    /// strictly ascending, which `get_credential_at_time`'s binary search
-    /// depends on.
+    /// ledger timestamp, appending it to that credential's snapshot and
+    /// version indexes. If a snapshot was already captured at this exact
+    /// timestamp (e.g. two state changes land in the same ledger close), it
+    /// is overwritten in place rather than duplicated in the index — this
+    /// keeps the index strictly ascending, which `get_credential_at_time`'s
+    /// binary search depends on — and its version number is reused rather
+    /// than incremented, since it does not represent a new distinct
+    /// historical state.
     ///
     /// Once the credential's retained-snapshot count exceeds
     /// `MAX_CREDENTIAL_SNAPSHOTS`, the oldest snapshot is pruned. See
-    /// docs/zk-verifier.md, "Credential Retention Policy".
+    /// docs/zk-verifier.md, "Credential Retention Policy". Its version
+    /// number is *not* reused by a future snapshot — it simply becomes
+    /// unqueryable via `get_credential_version`, per
+    /// docs/zk-verifier.md, "Credential Version History".
     fn record_credential_snapshot(env: &Env, credential_id: u64, oracle: Address, invalidated: bool) {
         let timestamp = env.ledger().timestamp();
+
+        let mut timestamps: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CredentialSnapshotTimestamps(credential_id))
+            .unwrap_or_else(|| Vec::new(env));
+        let mut versions: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CredentialSnapshotVersions(credential_id))
+            .unwrap_or_else(|| Vec::new(env));
+
+        // Same-timestamp state changes overwrite the existing snapshot (see
+        // `get_credential_at_time`'s doc comment) and reuse its version
+        // number rather than minting a new one, so a version always
+        // corresponds to a distinct retained timestamp.
+        let is_new_timestamp = timestamps.last() != Some(timestamp);
+        let version = if is_new_timestamp {
+            versions.last().unwrap_or(0) + 1
+        } else {
+            versions.last().unwrap_or(1)
+        };
 
         env.storage().persistent().set(
             &DataKey::CredentialSnapshot(credential_id, timestamp),
@@ -683,17 +821,13 @@ impl ZkVerifierContract {
                 oracle,
                 invalidated,
                 timestamp,
+                version,
             },
         );
 
-        let mut timestamps: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::CredentialSnapshotTimestamps(credential_id))
-            .unwrap_or_else(|| Vec::new(env));
-
-        if timestamps.last() != Some(timestamp) {
+        if is_new_timestamp {
             timestamps.push_back(timestamp);
+            versions.push_back(version);
 
             if timestamps.len() > MAX_CREDENTIAL_SNAPSHOTS {
                 if let Some(oldest) = timestamps.first() {
@@ -701,6 +835,7 @@ impl ZkVerifierContract {
                         .persistent()
                         .remove(&DataKey::CredentialSnapshot(credential_id, oldest));
                     timestamps.remove(0);
+                    versions.remove(0);
                 }
             }
 
@@ -708,7 +843,55 @@ impl ZkVerifierContract {
                 &DataKey::CredentialSnapshotTimestamps(credential_id),
                 &timestamps,
             );
+            env.storage().persistent().set(
+                &DataKey::CredentialSnapshotVersions(credential_id),
+                &versions,
+            );
         }
+    }
+
+    /// Returns the index of the entry in `versions` exactly equal to
+    /// `target`, or `None` if absent. Requires `versions` to be sorted
+    /// ascending with no duplicates, which holds by construction (see
+    /// `record_credential_snapshot`).
+    fn version_index(versions: &Vec<u32>, target: u32) -> Option<u32> {
+        let mut lo: u32 = 0;
+        let mut hi: u32 = versions.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let v = versions.get(mid).unwrap();
+            if v == target {
+                return Some(mid);
+            } else if v < target {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        None
+    }
+
+    /// Looks up the retained snapshot for `credential_id` at exactly
+    /// `version`, without any auth or access-control check — callers are
+    /// responsible for enforcing those first.
+    fn load_version_snapshot(env: &Env, credential_id: u64, version: u32) -> Option<CredentialSnapshot> {
+        let versions: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CredentialSnapshotVersions(credential_id))
+            .unwrap_or_else(|| Vec::new(env));
+        let idx = Self::version_index(&versions, version)?;
+
+        let timestamps: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CredentialSnapshotTimestamps(credential_id))
+            .unwrap_or_else(|| Vec::new(env));
+        let timestamp = timestamps.get(idx)?;
+
+        env.storage()
+            .persistent()
+            .get(&DataKey::CredentialSnapshot(credential_id, timestamp))
     }
 
     /// Returns the index of the rightmost entry in `timestamps` that is

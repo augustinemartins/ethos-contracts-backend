@@ -80,6 +80,22 @@ pub fn set_credential_privacy(env: Env, credential_id: u64, level: PrivacyLevel)
 
 /// Returns a credential's current PrivacyLevel (defaults to `Public`).
 pub fn credential_privacy(env: Env, credential_id: u64) -> PrivacyLevel
+
+/// Returns the credential's recorded state as of a specific version number
+/// (1-based, monotonically increasing, never reused), or `None` if that
+/// version was never recorded or has since been pruned. Same PrivacyLevel
+/// gating as `get_credential_at_time`.
+pub fn get_credential_version(env: Env, requester: Address, credential_id: u64, version: u32) -> Option<CredentialSnapshot>
+
+/// Returns the latest version number recorded for a credential (0 if it has
+/// never been attested), regardless of whether earlier versions have since
+/// been pruned.
+pub fn credential_version_count(env: Env, credential_id: u64) -> u32
+
+/// Compares two recorded versions of a credential and reports what changed
+/// between them. Panics with VersionNotFound if either version is unknown.
+/// Same PrivacyLevel gating as `get_credential_at_time`.
+pub fn diff_credential_versions(env: Env, requester: Address, credential_id: u64, from_version: u32, to_version: u32) -> CredentialVersionDiff
 ```
 
 ### Current Verification Logic
@@ -207,6 +223,78 @@ Practical implications:
 
 ---
 
+## Credential Version History
+
+`get_credential_at_time` answers "what was true at timestamp T?"; it does
+not give an audit trail a stable identity — an off-chain caller cannot say
+"show me version 3" and get the same answer regardless of what has been
+pruned around it, because timestamps are not renumbered but *are*
+context-dependent (you need to already know roughly when a change
+happened). Credential versions give every recorded state change a stable,
+gap-free, 1-based number instead.
+
+### Version semantics
+
+- **Numbering**: the first recorded state for a credential (its initial
+  `attest`) is version 1. Each subsequent state change — a re-attestation
+  that changes the attesting oracle, or a dispute resolving — increments
+  the version by exactly one. Versions are per-credential; credential 1's
+  version 3 and credential 2's version 3 are unrelated.
+- **Stability**: a version number is assigned once and never reassigned,
+  even after retention prunes the snapshot it identifies. Once pruned,
+  `get_credential_version` for that version returns `None` — it never
+  starts pointing at a different state, unlike, hypothetically, a
+  position-based index would.
+- **Same-timestamp changes do not create new versions**: if two state
+  changes land at the same ledger timestamp (e.g. a dispute filed and
+  resolved without any ledger-time advance), they share one version number,
+  matching the snapshot-overwrite behavior described above under
+  "Credential Temporal Queries". A version therefore corresponds 1:1 with a
+  *distinct retained timestamp*, not with "every call that touched credential
+  state."
+- **Storage**: versions are not a parallel history store. They are a second,
+  parallel index (`DataKey::CredentialSnapshotVersions`) over the same
+  `CredentialSnapshot` records `get_credential_at_time` already uses, kept
+  in lockstep with `DataKey::CredentialSnapshotTimestamps` — same length,
+  same retention bound (`MAX_CREDENTIAL_SNAPSHOTS`), same pruning behavior.
+  No credential state is duplicated on-chain to support version lookups.
+
+### Usage
+
+```rust
+// version 1 is always the credential's original attested state (until/unless
+// pruned).
+let v1 = client.get_credential_version(&requester, &credential_id, &1u32);
+
+// How many versions has this credential gone through?
+let latest = client.credential_version_count(&credential_id);
+
+// What changed between the original attestation and its current state?
+let diff = client.diff_credential_versions(&requester, &credential_id, &1u32, &latest);
+if diff.oracle_changed {
+    // diff.previous_oracle -> diff.current_oracle
+}
+if diff.invalidated_changed {
+    // diff.previous_invalidated -> diff.current_invalidated
+}
+```
+
+`diff_credential_versions` panics with `VersionNotFound` (#17) if either
+`from_version` or `to_version` was never recorded or has since been pruned.
+`from_version` and `to_version` need not be adjacent or chronologically
+ordered — diffing version 3 against version 1 is valid and simply reports
+the same fields with signs effectively reversed.
+
+Both `get_credential_version` and `diff_credential_versions` require
+`requester` to authorize the call and enforce the same [`PrivacyLevel`]
+access check as `get_credential_at_time` (see "Credential Privacy Levels"
+below) — version history is exactly as sensitive as the state it records.
+`credential_version_count` is not privacy-gated, since a bare version count
+does not expose any oracle or invalidation data, mirroring
+`get_credential_disputes`'s ungated dispute count.
+
+---
+
 ## Credential Privacy Levels
 
 By default every credential is equally visible to anyone who knows its
@@ -238,9 +326,10 @@ let snapshot = client.get_credential_at_time(&requester, &1u64, &timestamp);
 
 ### What this does and does not cover
 
-Privacy filtering applies to `get_credential_at_time`, the query that
-exposes a credential's full attestation state (oracle, invalidated flag,
-timestamp). It intentionally does **not** gate `verify_claim`: that call
+Privacy filtering applies to `get_credential_at_time`, `get_credential_version`,
+and `diff_credential_versions` — every query that exposes a credential's full
+attestation state (oracle, invalidated flag, timestamp). It intentionally
+does **not** gate `verify_claim`: that call
 already requires the caller to possess the exact `proof` and `claim` bytes,
 so it authenticates via knowledge of the secret rather than identity, and
 restricting it further would not add confidentiality — only availability
@@ -498,6 +587,7 @@ fn test_oracle_attestation_flow() {
 | 14 | ReasonTooLarge | Dispute reason exceeds MAX_REASON_SIZE (1 KB) |
 | 15 | InvalidThreshold | Dispute threshold must be greater than zero |
 | 16 | AccessDenied | Caller is not permitted to view this credential at its current privacy level |
+| 17 | VersionNotFound | No version exists with the given number for this credential (never recorded, or since pruned) |
 
 ---
 

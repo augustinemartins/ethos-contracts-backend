@@ -805,3 +805,220 @@ fn test_confidential_privacy_denies_attesting_oracle() {
 
     client.get_credential_at_time(&oracle, &credential_id, &0u64);
 }
+
+// ── Credential version history tests ──────────────────────────────────────────
+
+/// A credential that has never been attested has no versions at all.
+#[test]
+fn test_credential_version_count_unknown_credential_is_zero() {
+    let (env, _, client) = setup();
+    assert_eq!(client.credential_version_count(&999u64), 0);
+    let viewer = Address::generate(&env);
+    assert!(client
+        .get_credential_version(&viewer, &999u64, &1u32)
+        .is_none());
+}
+
+/// attest() creates version 1; re-attesting at a later timestamp advances to
+/// version 2, and both remain independently queryable by version number.
+#[test]
+fn test_get_credential_version_returns_each_recorded_version() {
+    let (env, _, client) = setup();
+    env.ledger().set_timestamp(100);
+    let oracle_a = Address::generate(&env);
+    let oracle_b = Address::generate(&env);
+    client.register_oracle(&oracle_a);
+    client.register_oracle(&oracle_b);
+
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+    let credential_id = client.attest(&oracle_a, &proof, &claim);
+    assert_eq!(client.credential_version_count(&credential_id), 1);
+
+    env.ledger().set_timestamp(200);
+    client.attest(&oracle_b, &proof, &claim);
+    assert_eq!(client.credential_version_count(&credential_id), 2);
+
+    let viewer = Address::generate(&env);
+    let v1 = client
+        .get_credential_version(&viewer, &credential_id, &1u32)
+        .unwrap();
+    assert_eq!(v1.oracle, oracle_a);
+    assert_eq!(v1.timestamp, 100);
+    assert_eq!(v1.version, 1);
+
+    let v2 = client
+        .get_credential_version(&viewer, &credential_id, &2u32)
+        .unwrap();
+    assert_eq!(v2.oracle, oracle_b);
+    assert_eq!(v2.timestamp, 200);
+    assert_eq!(v2.version, 2);
+
+    assert!(client
+        .get_credential_version(&viewer, &credential_id, &3u32)
+        .is_none());
+}
+
+/// Multiple state changes landing at the same ledger timestamp (dispute
+/// filed and resolved without any ledger-time advance) share a single
+/// version number rather than each minting a new one.
+#[test]
+fn test_get_credential_version_same_timestamp_reuses_version() {
+    let (env, _, client) = setup();
+    env.ledger().set_timestamp(1);
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+    client.set_dispute_threshold(&1u32);
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+    let credential_id = client.attest(&oracle, &proof, &claim);
+    assert_eq!(client.credential_version_count(&credential_id), 1);
+
+    let initiator = Address::generate(&env);
+    let reason = bytes!(&env, 0xaa);
+    let dispute_id = client.initiate_credential_dispute(&credential_id, &initiator, &reason);
+    client.vote_on_dispute(&dispute_id, &oracle, &true);
+    assert!(client.is_credential_invalidated(&credential_id));
+
+    // The dispute resolving at the same timestamp as attest() must not
+    // advance the version number, and version 1 now reflects the latest
+    // (invalidated) state.
+    assert_eq!(client.credential_version_count(&credential_id), 1);
+    let viewer = Address::generate(&env);
+    let v1 = client
+        .get_credential_version(&viewer, &credential_id, &1u32)
+        .unwrap();
+    assert!(v1.invalidated);
+}
+
+/// Version numbers are never reused: once retention prunes the oldest
+/// snapshot, its version becomes permanently unqueryable rather than being
+/// reassigned to a newer state.
+#[test]
+fn test_credential_version_retention_prunes_oldest_without_renumbering() {
+    let (env, _, client) = setup();
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+
+    env.ledger().set_timestamp(1);
+    let credential_id = client.attest(&oracle, &proof, &claim);
+
+    for ts in 2..=(MAX_CREDENTIAL_SNAPSHOTS as u64 + 1) {
+        env.ledger().set_timestamp(ts);
+        client.attest(&oracle, &proof, &claim);
+    }
+
+    // Version 1 (the very first attestation) has been pruned...
+    let viewer = Address::generate(&env);
+    assert!(client
+        .get_credential_version(&viewer, &credential_id, &1u32)
+        .is_none());
+    // ...but version 2 is still retained and still identifies itself as
+    // version 2, not renumbered to 1.
+    let oldest_retained = client
+        .get_credential_version(&viewer, &credential_id, &2u32)
+        .unwrap();
+    assert_eq!(oldest_retained.version, 2);
+    assert_eq!(oldest_retained.timestamp, 2);
+    // The latest version number keeps counting up regardless of pruning.
+    assert_eq!(
+        client.credential_version_count(&credential_id),
+        MAX_CREDENTIAL_SNAPSHOTS + 1
+    );
+}
+
+/// diff_credential_versions reports an oracle change and no invalidation
+/// change across a re-attestation under a different oracle.
+#[test]
+fn test_diff_credential_versions_reports_oracle_change() {
+    let (env, _, client) = setup();
+    env.ledger().set_timestamp(100);
+    let oracle_a = Address::generate(&env);
+    let oracle_b = Address::generate(&env);
+    client.register_oracle(&oracle_a);
+    client.register_oracle(&oracle_b);
+
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+    let credential_id = client.attest(&oracle_a, &proof, &claim);
+
+    env.ledger().set_timestamp(200);
+    client.attest(&oracle_b, &proof, &claim);
+
+    let viewer = Address::generate(&env);
+    let diff = client.diff_credential_versions(&viewer, &credential_id, &1u32, &2u32);
+    assert_eq!(diff.credential_id, credential_id);
+    assert_eq!(diff.from_version, 1);
+    assert_eq!(diff.to_version, 2);
+    assert_eq!(diff.from_timestamp, 100);
+    assert_eq!(diff.to_timestamp, 200);
+    assert!(diff.oracle_changed);
+    assert_eq!(diff.previous_oracle, oracle_a);
+    assert_eq!(diff.current_oracle, oracle_b);
+    assert!(!diff.invalidated_changed);
+    assert!(!diff.previous_invalidated);
+    assert!(!diff.current_invalidated);
+}
+
+/// diff_credential_versions reports an invalidation change (and no oracle
+/// change) across a dispute being upheld.
+#[test]
+fn test_diff_credential_versions_reports_invalidation_change() {
+    let (env, _, client) = setup();
+    env.ledger().set_timestamp(100);
+    let oracles = register_oracles(&env, &client, 3);
+    let attester = oracles.get(0).unwrap();
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+    let credential_id = client.attest(&attester, &proof, &claim);
+
+    env.ledger().set_timestamp(200);
+    let initiator = Address::generate(&env);
+    let reason = bytes!(&env, 0xaa);
+    let dispute_id = client.initiate_credential_dispute(&credential_id, &initiator, &reason);
+    for oracle in oracles.iter() {
+        client.vote_on_dispute(&dispute_id, &oracle, &true);
+    }
+    assert!(client.is_credential_invalidated(&credential_id));
+
+    let viewer = Address::generate(&env);
+    let diff = client.diff_credential_versions(&viewer, &credential_id, &1u32, &2u32);
+    assert!(!diff.oracle_changed);
+    assert!(diff.invalidated_changed);
+    assert!(!diff.previous_invalidated);
+    assert!(diff.current_invalidated);
+}
+
+/// Diffing a version that was never recorded panics with VersionNotFound.
+#[test]
+#[should_panic(expected = "Error(Contract, #17)")]
+fn test_diff_credential_versions_unknown_version_panics() {
+    let (env, _, client) = setup();
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+    let credential_id = client.attest(&oracle, &proof, &claim);
+
+    let viewer = Address::generate(&env);
+    client.diff_credential_versions(&viewer, &credential_id, &1u32, &99u32);
+}
+
+/// get_credential_version respects the same privacy gating as
+/// get_credential_at_time: a stranger is denied on an Internal credential.
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn test_get_credential_version_denies_stranger_on_internal_privacy() {
+    let (env, _, client) = setup();
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+    let credential_id = client.attest(&oracle, &proof, &claim);
+    client.set_credential_privacy(&credential_id, &PrivacyLevel::Internal);
+
+    let stranger = Address::generate(&env);
+    client.get_credential_version(&stranger, &credential_id, &1u32);
+}
