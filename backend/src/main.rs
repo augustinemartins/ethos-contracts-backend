@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::{
     extract::State,
     http::{HeaderValue, Method, StatusCode},
-    routing::{get, post},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use tower_http::cors::CorsLayer;
@@ -107,6 +107,39 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/vaults/:vault_id/simulate-release",
             get(routes::simulate_release),
+        )
+        .route(
+            "/api/maintenance/idempotency-cleanup",
+            post(routes::cleanup_idempotency_keys),
+        )
+        .route(
+            "/api/tenants",
+            post(routes::create_tenant),
+        )
+        .route(
+            "/api/tenants/:tenant_id/vaults",
+            get(routes::get_tenant_vaults)
+                .post(routes::add_vault_to_tenant),
+        )
+        .route(
+            "/api/tenants/billing",
+            get(routes::get_tenant_billing),
+        )
+        .route(
+            "/api/vaults/:vault_id/updates",
+            post(routes::record_credential_update),
+        )
+        .route(
+            "/api/vaults/:vault_id/transform",
+            post(routes::apply_operational_transform),
+        )
+        .route(
+            "/api/vaults/:vault_id/presence",
+            get(routes::get_vault_presence),
+        )
+        .route(
+            "/api/search",
+            get(routes::full_text_search),
         )
         .layer(build_cors_layer())
         .with_state(state)
