@@ -74,6 +74,35 @@ the current version, or beyond `CURRENT_SCHEMA_VERSION` — and `true` once
 applied. Adding a new schema version is a matter of bumping
 `CURRENT_SCHEMA_VERSION` and adding one new `match` arm.
 
+## #51 — Recovery Code System
+
+Lost SBTs (lost keys, lost devices) can't otherwise be recovered since
+there's no transfer function.
+
+- `generate_sbt_recovery_codes(env, sbt_id) -> Vec<BytesN<32>>` — owner-only,
+  generates a fresh batch of one-time codes and returns the plaintext values
+  once. Only `sha256(code)` is persisted; regenerating replaces (and thus
+  invalidates) any previously issued, unused codes.
+- `recover_sbt_with_recovery_code(env, sbt_id, recovery_code, new_holder) ->
+  bool` — hashes the submitted code, checks it against the stored, unused
+  hashes, and on a match reassigns the SBT's holder to `new_holder` and
+  evicts the holder cache. `new_holder` is an explicit parameter (a
+  deliberate departure from the issue's suggested signature): Soroban has no
+  implicit caller identity, so the address regaining control must be passed
+  and must authorize the call itself, since by definition the original
+  owner can no longer sign.
+- **Attempt tracking & rate limiting**: every call — success or failure —
+  counts against a per-SBT limit of `RECOVERY_MAX_ATTEMPTS` (5) attempts per
+  `RECOVERY_ATTEMPT_WINDOW_SECONDS` (1 hour). Exceeding it panics with
+  `RecoveryRateLimited` rather than silently failing, so brute-forcing a
+  code is bounded.
+
+**Known limitation**: recovery codes are generated with `env.prng()`, which
+the Soroban SDK documents as unsuitable for secrets in low-risk-tolerance
+applications. This is acceptable for the current scope but should be
+revisited (e.g. an off-chain-generated, on-chain-committed scheme) before
+using this contract to guard high-value identities.
+
 ## Error Codes
 
 | Code | Name | Description |
@@ -90,3 +119,5 @@ applied. Adding a new schema version is a matter of bumping
 | 10 | NoIdentityLinked | SBT has no linked identity to unlink |
 | 11 | AttestationNotFound | No matching, currently-trusted attestation |
 | 12 | InvalidSchemaTransition | Not a valid forward migration target |
+| 13 | NoRecoveryCodes | No unused recovery codes exist for this SBT |
+| 14 | RecoveryRateLimited | Too many recovery attempts in the current window |

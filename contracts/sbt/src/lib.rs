@@ -1,16 +1,19 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, panic_with_error, Address, Bytes, BytesN, Env,
+    contract, contracterror, contractimpl, panic_with_error, Address, Bytes, BytesN, Env, Vec,
 };
 
 mod types;
 
 use types::{
-    CacheStats, DataKey, HolderCacheEntry, IdentityLink, Sbt, CURRENT_SCHEMA_VERSION,
-    HOLDER_CACHE_TTL_SECONDS, IDENTITY_LINKED_TOPIC, IDENTITY_UNLINKED_TOPIC,
-    INSTANCE_TTL_LEDGERS, INSTANCE_TTL_THRESHOLD, MAX_IDENTITY_PROOF_SIZE, MAX_METADATA_SIZE,
-    METADATA_MIGRATED_TOPIC, MINT_TOPIC, RECORD_TTL_LEDGERS, RECORD_TTL_THRESHOLD,
+    CacheStats, DataKey, HolderCacheEntry, IdentityLink, RecoveryAttemptState, Sbt,
+    CURRENT_SCHEMA_VERSION, HOLDER_CACHE_TTL_SECONDS, IDENTITY_LINKED_TOPIC,
+    IDENTITY_UNLINKED_TOPIC, INSTANCE_TTL_LEDGERS, INSTANCE_TTL_THRESHOLD,
+    MAX_IDENTITY_PROOF_SIZE, MAX_METADATA_SIZE, METADATA_MIGRATED_TOPIC, MINT_TOPIC,
+    RECORD_TTL_LEDGERS, RECORD_TTL_THRESHOLD, RECOVERY_ATTEMPT_WINDOW_SECONDS,
+    RECOVERY_CODES_GENERATED_TOPIC, RECOVERY_CODE_COUNT, RECOVERY_MAX_ATTEMPTS,
+    RECOVERY_RATE_LIMITED_TOPIC, RECOVERY_SUCCEEDED_TOPIC,
 };
 
 #[contracterror]
@@ -41,6 +44,10 @@ pub enum SbtError {
     AttestationNotFound = 11,
     /// Requested schema version is not a valid forward migration target.
     InvalidSchemaTransition = 12,
+    /// SBT has no unused recovery codes; generate new ones first.
+    NoRecoveryCodes = 13,
+    /// Recovery attempts have exceeded the allowed rate for the current window.
+    RecoveryRateLimited = 14,
 }
 
 #[contract]
@@ -357,6 +364,103 @@ impl SbtContract {
         true
     }
 
+    // ---- issue #51: recovery code system ----
+    //
+    // Recovery codes let a lost SBT be reclaimed without the original
+    // owner's signature (the whole point of a recovery flow is that the
+    // owner can no longer sign). Only `sha256(code)` is ever stored; the
+    // plaintext codes are returned once, at generation time, and the caller
+    // is responsible for storing them off-chain. Regenerating replaces (and
+    // so invalidates) any previously issued, unused codes.
+    //
+    // `recover_sbt_with_recovery_code` takes an explicit `new_holder`
+    // address rather than relying on an implicit caller identity: Soroban
+    // has no `msg.sender` equivalent, so the address regaining control must
+    // be passed and authorized explicitly. This is the one place this
+    // contract's API intentionally departs from the issue's suggested
+    // signature.
+    //
+    // Security note: recovery codes are generated with `env.prng()`, which
+    // the Soroban SDK documents as unsuitable for secrets in applications
+    // with low risk tolerance. This is acceptable for the scope of this
+    // issue but should be revisited (e.g. moving to an off-chain-generated,
+    // on-chain-committed scheme) before using this contract to guard
+    // high-value identities.
+
+    /// Generates `RECOVERY_CODE_COUNT` fresh one-time recovery codes for
+    /// `sbt_id`, returning the plaintext codes. Only their SHA-256 hashes
+    /// are persisted. Owner only.
+    pub fn generate_sbt_recovery_codes(env: Env, sbt_id: u64) -> Vec<BytesN<32>> {
+        let sbt = Self::load_sbt(&env, sbt_id);
+        sbt.owner.require_auth();
+
+        let prng = env.prng();
+        let mut plaintext_codes: Vec<BytesN<32>> = Vec::new(&env);
+        let mut hashed_codes: Vec<BytesN<32>> = Vec::new(&env);
+
+        for _ in 0..RECOVERY_CODE_COUNT {
+            let raw: [u8; 32] = prng.gen();
+            let code = BytesN::from_array(&env, &raw);
+            let code_bytes: Bytes = code.clone().into();
+            let hash: BytesN<32> = env.crypto().sha256(&code_bytes).into();
+            plaintext_codes.push_back(code);
+            hashed_codes.push_back(hash);
+        }
+
+        let codes_key = DataKey::RecoveryCodes(sbt_id);
+        env.storage().persistent().set(&codes_key, &hashed_codes);
+        env.storage()
+            .persistent()
+            .extend_ttl(&codes_key, RECORD_TTL_THRESHOLD, RECORD_TTL_LEDGERS);
+
+        env.events().publish(
+            (RECOVERY_CODES_GENERATED_TOPIC, sbt_id),
+            hashed_codes.len(),
+        );
+        plaintext_codes
+    }
+
+    /// Reclaims `sbt_id` for `new_holder` by redeeming a still-unused
+    /// recovery code. `new_holder` must authorize the call. Rate limited to
+    /// `RECOVERY_MAX_ATTEMPTS` attempts per `RECOVERY_ATTEMPT_WINDOW_SECONDS`
+    /// per SBT, counting both successful and failed attempts. Returns
+    /// `true` and reassigns the holder on success; `false` if the code does
+    /// not match any unused, stored hash.
+    pub fn recover_sbt_with_recovery_code(
+        env: Env,
+        sbt_id: u64,
+        recovery_code: Bytes,
+        new_holder: Address,
+    ) -> bool {
+        new_holder.require_auth();
+
+        let mut sbt = Self::load_sbt(&env, sbt_id);
+        Self::enforce_recovery_rate_limit(&env, sbt_id);
+
+        let codes_key = DataKey::RecoveryCodes(sbt_id);
+        let mut hashed_codes: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&codes_key)
+            .unwrap_or_else(|| panic_with_error!(&env, SbtError::NoRecoveryCodes));
+
+        let submitted_hash: BytesN<32> = env.crypto().sha256(&recovery_code).into();
+        let Some(index) = hashed_codes.first_index_of(submitted_hash) else {
+            return false;
+        };
+
+        hashed_codes.remove(index);
+        env.storage().persistent().set(&codes_key, &hashed_codes);
+
+        sbt.owner = new_holder.clone();
+        Self::save_sbt(&env, sbt_id, &sbt);
+        Self::evict_holder_cache(&env, sbt_id);
+
+        env.events()
+            .publish((RECOVERY_SUCCEEDED_TOPIC, sbt_id), new_holder);
+        true
+    }
+
     // ---- internal helpers ----
 
     fn require_admin(env: &Env) {
@@ -433,6 +537,36 @@ impl SbtContract {
             }
             _ => panic_with_error!(env, SbtError::InvalidSchemaTransition),
         }
+    }
+
+    fn enforce_recovery_rate_limit(env: &Env, sbt_id: u64) {
+        let now = env.ledger().timestamp();
+        let key = DataKey::RecoveryAttempts(sbt_id);
+        let mut state = env
+            .storage()
+            .persistent()
+            .get::<DataKey, RecoveryAttemptState>(&key)
+            .unwrap_or(RecoveryAttemptState {
+                attempt_count: 0,
+                window_start: now,
+            });
+
+        if now.saturating_sub(state.window_start) >= RECOVERY_ATTEMPT_WINDOW_SECONDS {
+            state.window_start = now;
+            state.attempt_count = 0;
+        }
+
+        if state.attempt_count >= RECOVERY_MAX_ATTEMPTS {
+            env.events()
+                .publish((RECOVERY_RATE_LIMITED_TOPIC, sbt_id), state.attempt_count);
+            panic_with_error!(env, SbtError::RecoveryRateLimited);
+        }
+
+        state.attempt_count += 1;
+        env.storage().persistent().set(&key, &state);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, RECORD_TTL_THRESHOLD, RECORD_TTL_LEDGERS);
     }
 }
 
