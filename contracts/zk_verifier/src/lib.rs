@@ -1,5 +1,8 @@
 #![no_std]
 
+pub mod compression;
+use compression::{compress_proof as rle_compress, decompress_proof as rle_decompress};
+
 use soroban_sdk::{
     contract, contracterror, contractimpl, panic_with_error, symbol_short, Address, Bytes, BytesN,
     Env,
@@ -175,6 +178,45 @@ impl ZkVerifierContract {
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic_with_error!(env, VerifierError::NotInitialized));
         admin.require_auth();
+    }
+
+    // ---- Proof compression (#64) ────────────────────────────────────────────
+
+    /// Compress a proof using RLE to reduce storage and transmission costs.
+    ///
+    /// Returns the compressed bytes.  The first byte of the result is always
+    /// the `0xC0` magic sentinel so that callers can detect compressed streams.
+    ///
+    /// Panics with [`VerifierError::EmptyProof`] if `proof` is empty.
+    pub fn compress_proof(env: Env, proof: Bytes) -> Bytes {
+        if proof.is_empty() {
+            panic_with_error!(&env, VerifierError::EmptyProof);
+        }
+        match rle_compress(&env, &proof) {
+            Ok(compressed) => compressed,
+            Err(_) => panic_with_error!(&env, VerifierError::EmptyProof),
+        }
+    }
+
+    /// Decompress a proof previously compressed with [`compress_proof`].
+    ///
+    /// `max_size` caps decompressed output to prevent decompression bombs;
+    /// pass [`MAX_PROOF_SIZE`] (4096) for normal proof payloads.
+    ///
+    /// Panics with [`VerifierError::ProofTooLarge`] when the result would
+    /// exceed `max_size`, or [`VerifierError::EmptyProof`] for empty / corrupt
+    /// input.
+    pub fn decompress_proof(env: Env, proof: Bytes, max_size: u32) -> Bytes {
+        if proof.is_empty() {
+            panic_with_error!(&env, VerifierError::EmptyProof);
+        }
+        match rle_decompress(&env, &proof, max_size) {
+            Ok(decompressed) => decompressed,
+            Err(compression::CompressionError::OutputTooLarge) => {
+                panic_with_error!(&env, VerifierError::ProofTooLarge)
+            }
+            Err(_) => panic_with_error!(&env, VerifierError::EmptyProof),
+        }
     }
 }
 
