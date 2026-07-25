@@ -4,7 +4,7 @@ use super::*;
 use soroban_sdk::{
     bytes,
     testutils::{Address as _, Events as _, Ledger},
-    Bytes, Env,
+    vec, Bytes, Env,
 };
 
 fn setup() -> (Env, Address, ZkVerifierContractClient<'static>) {
@@ -1021,4 +1021,267 @@ fn test_get_credential_version_denies_stranger_on_internal_privacy() {
 
     let stranger = Address::generate(&env);
     client.get_credential_version(&stranger, &credential_id, &1u32);
+}
+
+// ── Credential hierarchy tests ────────────────────────────────────────────────
+
+/// A root credential (created via plain `attest`) has no recorded parent.
+#[test]
+fn test_root_credential_has_no_parent() {
+    let (env, _, client) = setup();
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+    let credential_id = client.attest(&oracle, &proof, &claim);
+
+    assert!(client.get_credential_parent(&credential_id).is_none());
+    assert_eq!(client.get_credential_chain(&credential_id), vec![&env, credential_id]);
+    assert!(client.is_credential_chain_valid(&credential_id));
+}
+
+/// create_derived_credential mints a distinct credential_id, records the
+/// given parent, and get_credential_chain reports the two-element ancestry.
+#[test]
+fn test_create_derived_credential_records_parent() {
+    let (env, _, client) = setup();
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+
+    let degree_proof = bytes!(&env, 0x01);
+    let degree_claim = bytes!(&env, 0x02);
+    let degree_id = client.attest(&oracle, &degree_proof, &degree_claim);
+
+    let cert_proof = bytes!(&env, 0x03);
+    let cert_claim = bytes!(&env, 0x04);
+    let cert_id = client.create_derived_credential(&oracle, &degree_id, &cert_proof, &cert_claim);
+
+    assert_ne!(cert_id, degree_id);
+    assert_eq!(client.get_credential_parent(&cert_id), Some(degree_id));
+    assert_eq!(
+        client.get_credential_chain(&cert_id),
+        vec![&env, cert_id, degree_id]
+    );
+}
+
+/// A three-level chain (transcript -> degree -> certificate) reports its
+/// full ancestry, oldest-descendant first.
+#[test]
+fn test_credential_chain_multi_level() {
+    let (env, _, client) = setup();
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+
+    let transcript_id = client.attest(&oracle, &bytes!(&env, 0x01), &bytes!(&env, 0x02));
+    let degree_id = client.create_derived_credential(
+        &oracle,
+        &transcript_id,
+        &bytes!(&env, 0x03),
+        &bytes!(&env, 0x04),
+    );
+    let cert_id = client.create_derived_credential(
+        &oracle,
+        &degree_id,
+        &bytes!(&env, 0x05),
+        &bytes!(&env, 0x06),
+    );
+
+    assert_eq!(
+        client.get_credential_chain(&cert_id),
+        vec![&env, cert_id, degree_id, transcript_id]
+    );
+    assert!(client.is_credential_chain_valid(&cert_id));
+}
+
+/// Deriving from a parent_id that was never attested must panic.
+#[test]
+#[should_panic(expected = "Error(Contract, #8)")]
+fn test_create_derived_credential_unknown_parent_panics() {
+    let (env, _, client) = setup();
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+    client.create_derived_credential(&oracle, &999u64, &bytes!(&env, 0x01), &bytes!(&env, 0x02));
+}
+
+/// A non-oracle address cannot create a derived credential.
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_create_derived_credential_requires_registered_oracle() {
+    let (env, _, client) = setup();
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+    let parent_id = client.attest(&oracle, &bytes!(&env, 0x01), &bytes!(&env, 0x02));
+
+    let rogue = Address::generate(&env);
+    client.create_derived_credential(&rogue, &parent_id, &bytes!(&env, 0x03), &bytes!(&env, 0x04));
+}
+
+/// Once the immediate parent is invalidated by an upheld dispute, no new
+/// credential may be derived from it.
+#[test]
+#[should_panic(expected = "Error(Contract, #18)")]
+fn test_create_derived_credential_invalidated_parent_panics() {
+    let (env, _, client) = setup();
+    let oracles = register_oracles(&env, &client, 3);
+    let attester = oracles.get(0).unwrap();
+    let parent_id = client.attest(&attester, &bytes!(&env, 0x01), &bytes!(&env, 0x02));
+
+    let initiator = Address::generate(&env);
+    let dispute_id =
+        client.initiate_credential_dispute(&parent_id, &initiator, &bytes!(&env, 0xaa));
+    for oracle in oracles.iter() {
+        client.vote_on_dispute(&dispute_id, &oracle, &true);
+    }
+    assert!(client.is_credential_invalidated(&parent_id));
+
+    client.create_derived_credential(&attester, &parent_id, &bytes!(&env, 0x03), &bytes!(&env, 0x04));
+}
+
+/// Recursive validation: the immediate parent is itself valid, but an
+/// ancestor further up the chain (the grandparent) has been invalidated.
+/// create_derived_credential must still panic — a certificate built on a
+/// degree is only as good as the transcript the degree itself rests on.
+#[test]
+#[should_panic(expected = "Error(Contract, #18)")]
+fn test_create_derived_credential_recursive_validation_catches_grandparent() {
+    let (env, _, client) = setup();
+    let oracles = register_oracles(&env, &client, 3);
+    let attester = oracles.get(0).unwrap();
+
+    let transcript_id = client.attest(&attester, &bytes!(&env, 0x01), &bytes!(&env, 0x02));
+    let degree_id = client.create_derived_credential(
+        &attester,
+        &transcript_id,
+        &bytes!(&env, 0x03),
+        &bytes!(&env, 0x04),
+    );
+
+    // Dispute and invalidate the transcript (the grandparent-to-be), not
+    // the degree itself.
+    let initiator = Address::generate(&env);
+    let dispute_id =
+        client.initiate_credential_dispute(&transcript_id, &initiator, &bytes!(&env, 0xaa));
+    for oracle in oracles.iter() {
+        client.vote_on_dispute(&dispute_id, &oracle, &true);
+    }
+    assert!(client.is_credential_invalidated(&transcript_id));
+    // The degree itself was never directly disputed.
+    assert!(!client.is_credential_invalidated(&degree_id));
+    assert!(!client.is_credential_chain_valid(&degree_id));
+
+    // Issuing a certificate on top of the (transitively invalid) degree
+    // must be rejected.
+    client.create_derived_credential(
+        &attester,
+        &degree_id,
+        &bytes!(&env, 0x05),
+        &bytes!(&env, 0x06),
+    );
+}
+
+/// A credential cannot be derived from itself: passing the parent's own
+/// (proof, claim) bytes back in as the derived credential's bytes dedups to
+/// the same credential_id as the requested parent.
+#[test]
+#[should_panic(expected = "Error(Contract, #20)")]
+fn test_create_derived_credential_self_referential_parent_panics() {
+    let (env, _, client) = setup();
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+    let proof = bytes!(&env, 0x01);
+    let claim = bytes!(&env, 0x02);
+    let parent_id = client.attest(&oracle, &proof, &claim);
+
+    client.create_derived_credential(&oracle, &parent_id, &proof, &claim);
+}
+
+/// A credential's parent is fixed at its first creation: re-deriving the
+/// same (proof, claim) pair under a different parent must panic rather than
+/// silently rewriting the hierarchy.
+#[test]
+#[should_panic(expected = "Error(Contract, #21)")]
+fn test_create_derived_credential_parent_already_set_panics() {
+    let (env, _, client) = setup();
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+
+    let parent_a = client.attest(&oracle, &bytes!(&env, 0x01), &bytes!(&env, 0x02));
+    let parent_b = client.attest(&oracle, &bytes!(&env, 0x03), &bytes!(&env, 0x04));
+
+    let child_proof = bytes!(&env, 0x05);
+    let child_claim = bytes!(&env, 0x06);
+    client.create_derived_credential(&oracle, &parent_a, &child_proof, &child_claim);
+
+    // Same (proof, claim) pair -> same credential_id, but a different
+    // requested parent.
+    client.create_derived_credential(&oracle, &parent_b, &child_proof, &child_claim);
+}
+
+/// Re-deriving the exact same (proof, claim, parent) triple is idempotent —
+/// it must not panic, and must keep returning the same credential_id.
+#[test]
+fn test_create_derived_credential_idempotent_on_same_parent() {
+    let (env, _, client) = setup();
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+    let parent_id = client.attest(&oracle, &bytes!(&env, 0x01), &bytes!(&env, 0x02));
+
+    let child_proof = bytes!(&env, 0x03);
+    let child_claim = bytes!(&env, 0x04);
+    let first = client.create_derived_credential(&oracle, &parent_id, &child_proof, &child_claim);
+    let second = client.create_derived_credential(&oracle, &parent_id, &child_proof, &child_claim);
+
+    assert_eq!(first, second);
+    assert_eq!(client.get_credential_parent(&first), Some(parent_id));
+}
+
+/// A parent chain exceeding MAX_CREDENTIAL_CHAIN_DEPTH hops is rejected
+/// rather than allowing unbounded recursive validation.
+#[test]
+#[should_panic(expected = "Error(Contract, #19)")]
+fn test_create_derived_credential_chain_too_deep_panics() {
+    let (env, _, client) = setup();
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+
+    let mut current = client.attest(
+        &oracle,
+        &Bytes::from_array(&env, &[0xaa, 0x00]),
+        &Bytes::from_array(&env, &[0xbb, 0x00]),
+    );
+    // MAX_CREDENTIAL_CHAIN_DEPTH is 32; comfortably exceed it so the chain
+    // walk is forced to hit the depth cap before this loop ends.
+    for i in 1..=(MAX_CREDENTIAL_CHAIN_DEPTH + 10) {
+        let proof = Bytes::from_array(&env, &[0xaa, i as u8]);
+        let claim = Bytes::from_array(&env, &[0xbb, i as u8]);
+        current = client.create_derived_credential(&oracle, &current, &proof, &claim);
+    }
+}
+
+/// is_credential_chain_valid reflects invalidation anywhere in the
+/// ancestry, not just the queried credential itself.
+#[test]
+fn test_is_credential_chain_valid_reflects_ancestor_invalidation() {
+    let (env, _, client) = setup();
+    let oracles = register_oracles(&env, &client, 3);
+    let attester = oracles.get(0).unwrap();
+
+    let root_id = client.attest(&attester, &bytes!(&env, 0x01), &bytes!(&env, 0x02));
+    let child_id = client.create_derived_credential(
+        &attester,
+        &root_id,
+        &bytes!(&env, 0x03),
+        &bytes!(&env, 0x04),
+    );
+    assert!(client.is_credential_chain_valid(&child_id));
+
+    let initiator = Address::generate(&env);
+    let dispute_id =
+        client.initiate_credential_dispute(&root_id, &initiator, &bytes!(&env, 0xaa));
+    for oracle in oracles.iter() {
+        client.vote_on_dispute(&dispute_id, &oracle, &true);
+    }
+
+    assert!(!client.is_credential_chain_valid(&root_id));
+    assert!(!client.is_credential_chain_valid(&child_id));
 }

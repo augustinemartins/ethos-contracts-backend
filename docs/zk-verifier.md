@@ -96,6 +96,24 @@ pub fn credential_version_count(env: Env, credential_id: u64) -> u32
 /// between them. Panics with VersionNotFound if either version is unknown.
 /// Same PrivacyLevel gating as `get_credential_at_time`.
 pub fn diff_credential_versions(env: Env, requester: Address, credential_id: u64, from_version: u32, to_version: u32) -> CredentialVersionDiff
+
+/// Attests (proof, claim) as a credential derived from `parent_id`.
+/// Recursively validates parent_id's entire ancestor chain before issuing;
+/// panics if any ancestor is invalidated, the chain is too deep, the
+/// derived credential would be its own parent, or this (proof, claim) pair
+/// was already derived from a different parent. Returns the credential_id.
+pub fn create_derived_credential(env: Env, oracle: Address, parent_id: u64, proof: Bytes, claim: Bytes) -> u64
+
+/// Returns the immediate parent of a credential, or None if it is a root.
+pub fn get_credential_parent(env: Env, credential_id: u64) -> Option<u64>
+
+/// Returns a credential's full ancestry, starting with itself and walking
+/// up to its root: [credential_id, parent, grandparent, ...].
+pub fn get_credential_chain(env: Env, credential_id: u64) -> Vec<u64>
+
+/// Returns whether a credential and every one of its ancestors is
+/// currently valid (none invalidated by an upheld dispute).
+pub fn is_credential_chain_valid(env: Env, credential_id: u64) -> bool
 ```
 
 ### Current Verification Logic
@@ -292,6 +310,96 @@ below) — version history is exactly as sensitive as the state it records.
 `credential_version_count` is not privacy-gated, since a bare version count
 does not expose any oracle or invalidation data, mirroring
 `get_credential_disputes`'s ungated dispute count.
+
+---
+
+## Credential Hierarchies
+
+Some credentials are only meaningful in light of another credential they
+were built on — a certificate issued on the basis of a degree, which was
+itself issued on the basis of a transcript. Before this feature, `attest`
+had no way to express that relationship: every credential was a standalone
+root with no notion of provenance.
+
+`create_derived_credential(oracle, parent_id, proof, claim)` attests a new
+credential exactly like `attest` (same dedup rule: identical `(proof,
+claim)` bytes always map to the same stable `credential_id`), but also
+records `parent_id` as its parent.
+
+### How it works
+
+1. **Parent reference**: each credential's parent (if any) is stored as
+   `DataKey::CredentialParent(child_id) -> parent_id`, set the first time a
+   credential_id is derived and never reassigned afterward — a credential's
+   place in the hierarchy is fixed at creation.
+2. **Recursive validation before issuance**: before minting or re-attesting
+   the derived credential, `create_derived_credential` walks `parent_id`'s
+   *entire* ancestor chain — not just its immediate state — via
+   `validate_credential_chain`, checking every credential in that chain
+   (`parent_id` itself, its parent, its grandparent, and so on) for
+   invalidation. A single directly-invalidated ancestor anywhere in the
+   chain blocks new issuance, even if the immediate parent was never
+   itself disputed. This is what makes the validation *recursive* rather
+   than a single-level check.
+3. **Depth bound**: the ancestor walk is capped at
+   `MAX_CREDENTIAL_CHAIN_DEPTH` (**32**) hops. A parent chain that would
+   require more hops than that to validate is rejected with
+   `CredentialChainTooDeep`, keeping chain-walk cost — and the cost of
+   `get_credential_chain` / `is_credential_chain_valid` queries over it —
+   bounded regardless of how deep a malicious or accidental chain grows.
+
+### Usage
+
+```rust
+// A transcript is a root credential — no parent.
+let transcript_id = client.attest(&oracle, &transcript_proof, &transcript_claim);
+
+// A degree is derived from the transcript. This panics if the transcript
+// (or anything above it) has been invalidated by an upheld dispute.
+let degree_id = client.create_derived_credential(
+    &oracle, &transcript_id, &degree_proof, &degree_claim,
+);
+
+// A certificate derived from the degree — three levels deep.
+let cert_id = client.create_derived_credential(
+    &oracle, &degree_id, &cert_proof, &cert_claim,
+);
+
+// Full ancestry, most-derived first: [cert_id, degree_id, transcript_id].
+let chain = client.get_credential_chain(&cert_id);
+
+// True only if cert_id and every one of its ancestors is currently valid.
+let still_valid = client.is_credential_chain_valid(&cert_id);
+```
+
+If the transcript is later disputed and invalidated, `is_credential_chain_valid`
+for the degree or certificate returns `false` even though neither was
+directly disputed — and any further `create_derived_credential` call built
+on the degree panics with `ParentCredentialInvalid`, since the compromised
+ancestor makes the whole chain untrustworthy.
+
+### Error conditions
+
+`create_derived_credential` panics with:
+
+- `CredentialNotFound` (#8) — `parent_id` was never attested.
+- `ParentCredentialInvalid` (#18) — `parent_id` or any of its ancestors has
+  been invalidated by an upheld dispute.
+- `CredentialChainTooDeep` (#19) — `parent_id`'s ancestor chain already
+  exceeds `MAX_CREDENTIAL_CHAIN_DEPTH` hops.
+- `SelfReferentialParent` (#20) — `proof`/`claim` hash to the same
+  credential_id as `parent_id` (a credential cannot be its own parent).
+- `ParentAlreadySet` (#21) — this exact `(proof, claim)` pair was already
+  derived from a *different* parent; re-deriving it under a new parent is
+  rejected rather than silently rewriting the hierarchy. Re-deriving it
+  under the *same* parent is a no-op, matching `attest`'s re-attestation
+  idempotency.
+
+`create_derived_credential` does not itself gate on privacy or add any new
+gating to `verify_claim` — it only governs *issuance*. `is_credential_chain_valid`
+and `get_credential_chain` are not privacy-gated (mirroring
+`credential_version_count` and `get_credential_disputes`), since they only
+expose id relationships and a boolean, not oracle or invalidation detail.
 
 ---
 
@@ -588,6 +696,10 @@ fn test_oracle_attestation_flow() {
 | 15 | InvalidThreshold | Dispute threshold must be greater than zero |
 | 16 | AccessDenied | Caller is not permitted to view this credential at its current privacy level |
 | 17 | VersionNotFound | No version exists with the given number for this credential (never recorded, or since pruned) |
+| 18 | ParentCredentialInvalid | An ancestor in the parent chain (the parent itself, or one of its own ancestors) has been invalidated by an upheld dispute |
+| 19 | CredentialChainTooDeep | The parent chain exceeds MAX_CREDENTIAL_CHAIN_DEPTH (32) hops |
+| 20 | SelfReferentialParent | A credential cannot be derived from itself |
+| 21 | ParentAlreadySet | This (proof, claim) pair was already derived from a different parent |
 
 ---
 
