@@ -7,10 +7,10 @@ use soroban_sdk::{
 mod types;
 
 use types::{
-    DataKey, IdentityLink, Sbt, CURRENT_SCHEMA_VERSION, IDENTITY_LINKED_TOPIC,
-    IDENTITY_UNLINKED_TOPIC, INSTANCE_TTL_LEDGERS, INSTANCE_TTL_THRESHOLD,
-    MAX_IDENTITY_PROOF_SIZE, MAX_METADATA_SIZE, MINT_TOPIC, RECORD_TTL_LEDGERS,
-    RECORD_TTL_THRESHOLD,
+    CacheStats, DataKey, HolderCacheEntry, IdentityLink, Sbt, CURRENT_SCHEMA_VERSION,
+    HOLDER_CACHE_TTL_SECONDS, IDENTITY_LINKED_TOPIC, IDENTITY_UNLINKED_TOPIC,
+    INSTANCE_TTL_LEDGERS, INSTANCE_TTL_THRESHOLD, MAX_IDENTITY_PROOF_SIZE, MAX_METADATA_SIZE,
+    MINT_TOPIC, RECORD_TTL_LEDGERS, RECORD_TTL_THRESHOLD,
 };
 
 #[contracterror]
@@ -246,6 +246,76 @@ impl SbtContract {
             .map(|link| link.identity_hash)
     }
 
+    // ---- issue #49: holder verification cache ----
+    //
+    // `get_holder` already does a single storage read, but callers that
+    // verify the same SBT's holder repeatedly within a short window (e.g. a
+    // gating check run on every request) can skip re-reading the canonical
+    // record by going through this cache instead. Entries expire after
+    // `HOLDER_CACHE_TTL_SECONDS` and are eagerly invalidated whenever a
+    // holder actually changes (see `recover_sbt_with_recovery_code`).
+
+    /// Verifies whether `claimed_holder` currently holds `sbt_id`, serving
+    /// the answer from a short-lived cache when possible. Returns the same
+    /// result `get_holder(sbt_id) == claimed_holder` would, just faster on
+    /// a cache hit.
+    pub fn verify_holder_cached(env: Env, sbt_id: u64, claimed_holder: Address) -> bool {
+        let now = env.ledger().timestamp();
+        let cache_key = DataKey::HolderCache(sbt_id);
+
+        if let Some(entry) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, HolderCacheEntry>(&cache_key)
+        {
+            if entry.expires_at > now {
+                Self::record_cache_stat(&env, true);
+                return entry.holder == claimed_holder;
+            }
+        }
+
+        Self::record_cache_stat(&env, false);
+        let holder = Self::load_sbt(&env, sbt_id).owner;
+        let entry = HolderCacheEntry {
+            holder: holder.clone(),
+            cached_at: now,
+            expires_at: now + HOLDER_CACHE_TTL_SECONDS,
+        };
+        env.storage().persistent().set(&cache_key, &entry);
+        env.storage()
+            .persistent()
+            .extend_ttl(&cache_key, RECORD_TTL_THRESHOLD, RECORD_TTL_LEDGERS);
+
+        holder == claimed_holder
+    }
+
+    /// Manually evicts the cached holder entry for an SBT. Admin only;
+    /// normal invalidation on holder change happens automatically.
+    pub fn invalidate_holder_cache(env: Env, sbt_id: u64) {
+        Self::require_admin(&env);
+        Self::evict_holder_cache(&env, sbt_id);
+    }
+
+    /// Returns cumulative cache hit/miss counters since the contract was
+    /// initialized. Used to benchmark cache effectiveness off-chain: divide
+    /// `hits` by `hits + misses` for the hit rate, or call
+    /// `cache_hit_rate_bps`.
+    pub fn get_cache_stats(env: Env) -> CacheStats {
+        Self::load_cache_stats(&env)
+    }
+
+    /// Cache hit rate in basis points (0-10000), computed from
+    /// `get_cache_stats`. Returns 0 if `verify_holder_cached` has never
+    /// been called.
+    pub fn cache_hit_rate_bps(env: Env) -> u32 {
+        let stats = Self::load_cache_stats(&env);
+        let total = stats.hits + stats.misses;
+        if total == 0 {
+            return 0;
+        }
+        ((stats.hits * 10_000) / total) as u32
+    }
+
     // ---- internal helpers ----
 
     fn require_admin(env: &Env) {
@@ -276,5 +346,28 @@ impl SbtContract {
         env.storage()
             .persistent()
             .extend_ttl(&key, RECORD_TTL_THRESHOLD, RECORD_TTL_LEDGERS);
+    }
+
+    fn evict_holder_cache(env: &Env, sbt_id: u64) {
+        env.storage()
+            .persistent()
+            .remove(&DataKey::HolderCache(sbt_id));
+    }
+
+    fn load_cache_stats(env: &Env) -> CacheStats {
+        env.storage()
+            .instance()
+            .get(&DataKey::CacheStats)
+            .unwrap_or(CacheStats { hits: 0, misses: 0 })
+    }
+
+    fn record_cache_stat(env: &Env, hit: bool) {
+        let mut stats = Self::load_cache_stats(env);
+        if hit {
+            stats.hits += 1;
+        } else {
+            stats.misses += 1;
+        }
+        env.storage().instance().set(&DataKey::CacheStats, &stats);
     }
 }

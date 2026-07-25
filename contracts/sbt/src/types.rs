@@ -10,6 +10,9 @@ pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 pub const MAX_METADATA_SIZE: u32 = 4096;
 pub const MAX_IDENTITY_PROOF_SIZE: u32 = 4096;
 
+/// How long a cached holder lookup is considered fresh.
+pub const HOLDER_CACHE_TTL_SECONDS: u64 = 300;
+
 pub const INSTANCE_TTL_THRESHOLD: u32 = 17280; // ~1 day of ledgers at 5s/ledger
 pub const INSTANCE_TTL_LEDGERS: u32 = 518_400; // ~30 days
 pub const RECORD_TTL_THRESHOLD: u32 = 17280;
@@ -32,6 +35,10 @@ pub enum DataKey {
     IdentityAttestation(BytesN<32>, BytesN<32>),
     /// sbt_id -> linked identity, once revealed via `link_sbt_to_identity`. issue #48.
     IdentityLink(u64),
+    /// sbt_id -> cached holder lookup. issue #49.
+    HolderCache(u64),
+    /// Global cache hit/miss counters. issue #49.
+    CacheStats,
 }
 
 #[contracttype]
@@ -52,4 +59,19 @@ pub struct IdentityLink {
     pub identity_hash: BytesN<32>,
     pub attestor: Address,
     pub linked_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct HolderCacheEntry {
+    pub holder: Address,
+    pub cached_at: u64,
+    pub expires_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct CacheStats {
+    pub hits: u64,
+    pub misses: u64,
 }

@@ -40,6 +40,24 @@ delete existing links, but blocks new links from being redeemed against that
 attestor's outstanding commitments — mirroring `zk_verifier`'s oracle
 revocation semantics.
 
+## #49 — Holder Verification Cache (`verify_holder_cached`)
+
+`get_holder` is already a single storage read, but callers that check the
+same SBT's holder repeatedly in a short window can go through
+`verify_holder_cached(env, sbt_id, claimed_holder)` instead.
+
+**Strategy**: each cache entry stores `(holder, cached_at, expires_at)` with
+a fixed TTL (`HOLDER_CACHE_TTL_SECONDS`, 300s). A hit returns the cached
+holder comparison directly; a miss re-reads the canonical record and
+repopulates the entry. The cache is invalidated automatically whenever a
+holder actually changes (i.e. on successful recovery) and can be evicted
+manually via the admin-only `invalidate_holder_cache`.
+
+**Benchmarking**: every lookup increments a global hit/miss counter.
+`get_cache_stats` returns the raw counters and `cache_hit_rate_bps` derives
+a basis-points hit rate from them, so hit-rate can be measured on-chain over
+time rather than only in an isolated benchmark run.
+
 ## Error Codes
 
 | Code | Name | Description |
