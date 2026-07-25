@@ -58,6 +58,22 @@ manually via the admin-only `invalidate_holder_cache`.
 a basis-points hit rate from them, so hit-rate can be measured on-chain over
 time rather than only in an isolated benchmark run.
 
+## #50 — Metadata Schema Versioning (`migrate_sbt_metadata`)
+
+Each SBT carries a `schema_version`. `CURRENT_SCHEMA_VERSION` is the ceiling
+new mints are issued at; existing SBTs stay on their version until migrated.
+
+**Strategy**: migrations are pure, single-step functions of
+`(from_version, metadata)` defined in `apply_schema_migration`. Migrating to
+a target more than one version ahead replays each intermediate step in
+order (v1 -> v2 -> v3, not a direct v1 -> v3 jump), so every version's
+transform only ever needs to know about the version immediately before it.
+`migrate_sbt_metadata(env, sbt_id, new_schema_version) -> bool` returns
+`false` (rather than panicking) for a no-op or invalid target — at or below
+the current version, or beyond `CURRENT_SCHEMA_VERSION` — and `true` once
+applied. Adding a new schema version is a matter of bumping
+`CURRENT_SCHEMA_VERSION` and adding one new `match` arm.
+
 ## Error Codes
 
 | Code | Name | Description |
@@ -73,3 +89,4 @@ time rather than only in an isolated benchmark run.
 | 9 | IdentityAlreadyLinked | SBT already has a linked identity |
 | 10 | NoIdentityLinked | SBT has no linked identity to unlink |
 | 11 | AttestationNotFound | No matching, currently-trusted attestation |
+| 12 | InvalidSchemaTransition | Not a valid forward migration target |

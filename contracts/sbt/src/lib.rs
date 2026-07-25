@@ -10,7 +10,7 @@ use types::{
     CacheStats, DataKey, HolderCacheEntry, IdentityLink, Sbt, CURRENT_SCHEMA_VERSION,
     HOLDER_CACHE_TTL_SECONDS, IDENTITY_LINKED_TOPIC, IDENTITY_UNLINKED_TOPIC,
     INSTANCE_TTL_LEDGERS, INSTANCE_TTL_THRESHOLD, MAX_IDENTITY_PROOF_SIZE, MAX_METADATA_SIZE,
-    MINT_TOPIC, RECORD_TTL_LEDGERS, RECORD_TTL_THRESHOLD,
+    METADATA_MIGRATED_TOPIC, MINT_TOPIC, RECORD_TTL_LEDGERS, RECORD_TTL_THRESHOLD,
 };
 
 #[contracterror]
@@ -39,6 +39,8 @@ pub enum SbtError {
     NoIdentityLinked = 10,
     /// No attestation matches the given (identity_hash, proof) pair.
     AttestationNotFound = 11,
+    /// Requested schema version is not a valid forward migration target.
+    InvalidSchemaTransition = 12,
 }
 
 #[contract]
@@ -316,6 +318,45 @@ impl SbtContract {
         ((stats.hits * 10_000) / total) as u32
     }
 
+    // ---- issue #50: metadata schema versioning ----
+    //
+    // Migrations are applied one version step at a time, in order, so a
+    // multi-version jump (e.g. v1 -> v3) replays v1 -> v2 then v2 -> v3.
+    // Each step is a pure function of `(from_version, metadata)` defined in
+    // `apply_schema_migration`. Bumping `CURRENT_SCHEMA_VERSION` and adding
+    // a new arm there is the only change needed to support a future schema
+    // revision; existing SBTs stay on their current version until this
+    // function is called for them.
+
+    /// Migrates an SBT's metadata forward to `new_schema_version`. Owner
+    /// only. Returns `true` if the migration was applied, `false` if
+    /// `new_schema_version` is not a valid forward migration target (at or
+    /// below the current version, or beyond `CURRENT_SCHEMA_VERSION`).
+    pub fn migrate_sbt_metadata(env: Env, sbt_id: u64, new_schema_version: u32) -> bool {
+        let mut sbt = Self::load_sbt(&env, sbt_id);
+        sbt.owner.require_auth();
+
+        if new_schema_version <= sbt.schema_version || new_schema_version > CURRENT_SCHEMA_VERSION
+        {
+            return false;
+        }
+
+        let mut version = sbt.schema_version;
+        let mut metadata = sbt.metadata.clone();
+        while version < new_schema_version {
+            metadata = Self::apply_schema_migration(&env, version, metadata);
+            version += 1;
+        }
+
+        sbt.metadata = metadata;
+        sbt.schema_version = version;
+        Self::save_sbt(&env, sbt_id, &sbt);
+
+        env.events()
+            .publish((METADATA_MIGRATED_TOPIC, sbt_id), new_schema_version);
+        true
+    }
+
     // ---- internal helpers ----
 
     fn require_admin(env: &Env) {
@@ -370,4 +411,30 @@ impl SbtContract {
         }
         env.storage().instance().set(&DataKey::CacheStats, &stats);
     }
+
+    /// Applies a single schema migration step. Panics on an unrecognized
+    /// `from_version`; unreachable in practice because
+    /// `migrate_sbt_metadata` only ever calls this with versions in
+    /// `[sbt.schema_version, CURRENT_SCHEMA_VERSION)`, which is always
+    /// exactly `{1}` today. The panic exists so a future version bump that
+    /// forgets to add a matching arm here fails loudly instead of silently
+    /// truncating metadata.
+    fn apply_schema_migration(env: &Env, from_version: u32, metadata: Bytes) -> Bytes {
+        match from_version {
+            // v1 -> v2: v1 metadata was an opaque blob with no
+            // self-describing format. v2 prefixes a 1-byte schema tag so
+            // downstream readers can identify the encoding without an
+            // external version lookup.
+            1 => {
+                let mut migrated = Bytes::new(env);
+                migrated.push_back(2u8);
+                migrated.append(&metadata);
+                migrated
+            }
+            _ => panic_with_error!(env, SbtError::InvalidSchemaTransition),
+        }
+    }
 }
+
+#[cfg(test)]
+mod test;

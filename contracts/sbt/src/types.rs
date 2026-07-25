@@ -21,6 +21,7 @@ pub const RECORD_TTL_LEDGERS: u32 = 518_400;
 pub const MINT_TOPIC: Symbol = symbol_short!("sbt_mint");
 pub const IDENTITY_LINKED_TOPIC: Symbol = symbol_short!("id_link");
 pub const IDENTITY_UNLINKED_TOPIC: Symbol = symbol_short!("id_unlink");
+pub const METADATA_MIGRATED_TOPIC: Symbol = symbol_short!("md_migr");
 
 #[contracttype]
 pub enum DataKey {
