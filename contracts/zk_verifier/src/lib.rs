@@ -1,14 +1,15 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, panic_with_error, symbol_short, Address, Bytes, BytesN,
-    Env,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short,
+    xdr::FromXdr, Address, Bytes, BytesN, Env,
 };
 
 pub const MAX_PROOF_SIZE: u32 = 4096;
 pub const MAX_CLAIM_SIZE: u32 = 1024;
 
 const VERIFY_CLAIM_TOPIC: soroban_sdk::Symbol = symbol_short!("vfy_claim");
+const VERIFY_CONDITIONAL_TOPIC: soroban_sdk::Symbol = symbol_short!("vfy_cond");
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -28,6 +29,31 @@ pub enum VerifierError {
     NotInitialized = 6,
     /// The oracle address is not registered.
     OracleNotFound = 7,
+    /// `proof` could not be decoded as a `ConditionalProof`.
+    MalformedConditionalProof = 8,
+}
+
+/// The on-chain format for a conditional ("prove X if Y, else prove Z")
+/// proof, encoded into the opaque `proof: Bytes` argument of
+/// [`ZkVerifierContract::verify_conditional_proof`] via XDR.
+///
+/// The condition `Y` is the caller-supplied `condition` claim; this bundle
+/// carries the proof for `Y` plus both branches' claim/proof pairs so the
+/// contract itself — not the caller — decides and checks which branch
+/// applies, exactly once `Y`'s truth is established from oracle attestation.
+#[contracttype]
+#[derive(Clone)]
+pub struct ConditionalProof {
+    /// Proof that the `condition` claim (`Y`) holds.
+    pub condition_proof: Bytes,
+    /// Claim `X`, checked when the condition is true.
+    pub then_claim: Bytes,
+    /// Proof that claim `X` holds.
+    pub then_proof: Bytes,
+    /// Claim `Z`, checked when the condition is false.
+    pub else_claim: Bytes,
+    /// Proof that claim `Z` holds.
+    pub else_proof: Bytes,
 }
 
 /// Storage key discriminants.
@@ -132,36 +158,50 @@ impl ZkVerifierContract {
     /// Emits a `vfy_claim` event with `(result, claim_hash)` on every call
     /// that passes input validation.
     pub fn verify_claim(env: Env, proof: Bytes, claim: Bytes) -> bool {
-        if proof.is_empty() {
-            panic_with_error!(&env, VerifierError::EmptyProof);
-        }
-        if proof.len() > MAX_PROOF_SIZE {
-            panic_with_error!(&env, VerifierError::ProofTooLarge);
-        }
-        if claim.is_empty() {
-            panic_with_error!(&env, VerifierError::EmptyClaim);
-        }
-        if claim.len() > MAX_CLAIM_SIZE {
-            panic_with_error!(&env, VerifierError::ClaimTooLarge);
-        }
-
-        let proof_hash: BytesN<32> = env.crypto().sha256(&proof).into();
         let claim_hash: BytesN<32> = env.crypto().sha256(&claim).into();
-
-        let result = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::Attestation(proof_hash, claim_hash.clone()))
-            .map(|attesting_oracle| {
-                env.storage()
-                    .instance()
-                    .get::<DataKey, bool>(&DataKey::Oracle(attesting_oracle))
-                    .unwrap_or(false)
-            })
-            .unwrap_or(false);
+        let result = Self::verify_internal(&env, &proof, &claim);
 
         env.events()
             .publish((VERIFY_CLAIM_TOPIC,), (result, claim_hash));
+
+        result
+    }
+
+    /// Verifies a conditional ("prove X if Y, else prove Z") proof.
+    ///
+    /// `condition` is claim `Y`. `proof` is the XDR encoding of a
+    /// [`ConditionalProof`] bundle carrying the proof for `Y` plus both
+    /// branches. The condition is checked first via the same oracle
+    /// attestation model as [`Self::verify_claim`]; the contract then
+    /// verifies the `then` branch if the condition holds, or the `else`
+    /// branch otherwise — the caller cannot pick a branch that skips the
+    /// condition check.
+    ///
+    /// Returns `false` (does not panic) when the condition or the selected
+    /// branch is unattested; panics with `MalformedConditionalProof` if
+    /// `proof` is not a valid `ConditionalProof` encoding.
+    ///
+    /// Emits a `vfy_cond` event with `(result, condition_result, claim_hash)`
+    /// of the branch that was checked.
+    pub fn verify_conditional_proof(env: Env, proof: Bytes, condition: Bytes) -> bool {
+        let bundle = ConditionalProof::from_xdr(&env, &proof)
+            .unwrap_or_else(|_| panic_with_error!(&env, VerifierError::MalformedConditionalProof));
+
+        let condition_result = Self::verify_internal(&env, &bundle.condition_proof, &condition);
+
+        let (branch_proof, branch_claim) = if condition_result {
+            (bundle.then_proof, bundle.then_claim)
+        } else {
+            (bundle.else_proof, bundle.else_claim)
+        };
+
+        let claim_hash: BytesN<32> = env.crypto().sha256(&branch_claim).into();
+        let result = Self::verify_internal(&env, &branch_proof, &branch_claim);
+
+        env.events().publish(
+            (VERIFY_CONDITIONAL_TOPIC,),
+            (result, condition_result, claim_hash),
+        );
 
         result
     }
@@ -175,6 +215,41 @@ impl ZkVerifierContract {
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic_with_error!(env, VerifierError::NotInitialized));
         admin.require_auth();
+    }
+
+    /// Validates size/emptiness constraints on `proof`/`claim`, then looks
+    /// up whether a currently-registered oracle has attested this exact
+    /// pair. Shared by [`Self::verify_claim`] and
+    /// [`Self::verify_conditional_proof`] so both branch checks and the
+    /// top-level claim check apply identical validation and revocation
+    /// semantics.
+    fn verify_internal(env: &Env, proof: &Bytes, claim: &Bytes) -> bool {
+        if proof.is_empty() {
+            panic_with_error!(env, VerifierError::EmptyProof);
+        }
+        if proof.len() > MAX_PROOF_SIZE {
+            panic_with_error!(env, VerifierError::ProofTooLarge);
+        }
+        if claim.is_empty() {
+            panic_with_error!(env, VerifierError::EmptyClaim);
+        }
+        if claim.len() > MAX_CLAIM_SIZE {
+            panic_with_error!(env, VerifierError::ClaimTooLarge);
+        }
+
+        let proof_hash: BytesN<32> = env.crypto().sha256(proof).into();
+        let claim_hash: BytesN<32> = env.crypto().sha256(claim).into();
+
+        env.storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Attestation(proof_hash, claim_hash))
+            .map(|attesting_oracle| {
+                env.storage()
+                    .instance()
+                    .get::<DataKey, bool>(&DataKey::Oracle(attesting_oracle))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
     }
 }
 
