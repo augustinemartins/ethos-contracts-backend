@@ -10,8 +10,10 @@ use soroban_sdk::{
     Address, Bytes, BytesN, Env, String, Vec,
 };
 
+pub mod composition_rules;
 mod oracle;
 pub mod ranking;
+pub mod slice_performance;
 mod types;
 use types::{
     ArchivedVaultInfo, AuditEntry, BackupCode, BeneficiaryCommitment, BeneficiaryEntry,
@@ -108,6 +110,8 @@ mod beneficiary_vesting_tests;
 #[cfg(test)]
 mod bps_invariant_tests;
 #[cfg(test)]
+mod composition_rules_tests;
+#[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]
 mod passkey_audit_tests;
@@ -119,6 +123,8 @@ mod passkey_escrow_tests;
 mod passkey_expiry_notification_tests;
 #[cfg(test)]
 mod regression_tests;
+#[cfg(test)]
+mod slice_performance_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
@@ -332,6 +338,8 @@ pub enum ContractError {
     AlreadyInEscrow = 112,
     // Issue #559: check-in attempted with a passkey currently held in escrow
     PasskeyInEscrow = 113,
+    // Issue #44: composition rule not found
+    RuleNotFound = 114,
 }
 
 #[contract]
@@ -14448,5 +14456,187 @@ impl TtlVaultContract {
             }
             None => false,
         }
+    }
+
+    // ── Issue #36: Slice Performance-Based Weighting ─────────────────────────
+
+    /// Record one performance observation for `attestor` on `slice_id`.
+    ///
+    /// Only the vault owner may record performance data.
+    ///
+    /// - `success` — `true` if the attestor responded correctly.
+    /// - `response_time_ms` — observed round-trip latency in milliseconds.
+    pub fn record_attestor_performance(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        slice_id: u64,
+        attestor: Address,
+        success: bool,
+        response_time_ms: u64,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        slice_performance::record_attestor_performance(
+            &env,
+            slice_id,
+            &attestor,
+            success,
+            response_time_ms,
+        );
+        Ok(())
+    }
+
+    /// Return the accumulated `PerformanceMetrics` for `attestor` on `slice_id`.
+    ///
+    /// Returns `None` when no observations have been recorded yet.
+    pub fn get_attestor_performance(
+        env: Env,
+        slice_id: u64,
+        attestor: Address,
+    ) -> Option<slice_performance::PerformanceMetrics> {
+        slice_performance::get_attestor_performance(&env, slice_id, &attestor)
+    }
+
+    /// Compute optimal BPS weights for `attestors` on `slice_id` based on
+    /// stored performance data, without persisting the result.
+    ///
+    /// Use `reweight_slice` to both compute and persist in one call.
+    pub fn calculate_optimal_weights(
+        env: Env,
+        slice_id: u64,
+        attestors: Vec<Address>,
+    ) -> Vec<slice_performance::AttestorWeight> {
+        slice_performance::calculate_optimal_weights(&env, slice_id, &attestors)
+    }
+
+    /// Compute optimal weights for `attestors` on `slice_id` and persist them.
+    ///
+    /// Only the vault owner may trigger a reweight.
+    pub fn reweight_slice(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        slice_id: u64,
+        attestors: Vec<Address>,
+    ) -> Result<Vec<slice_performance::AttestorWeight>, ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        let weights = slice_performance::calculate_optimal_weights(&env, slice_id, &attestors);
+        slice_performance::reweight_slice(&env, slice_id, weights.clone());
+        Ok(weights)
+    }
+
+    /// Return the latest persisted BPS weights for `slice_id`.
+    pub fn get_slice_weights(
+        env: Env,
+        slice_id: u64,
+    ) -> Option<Vec<slice_performance::AttestorWeight>> {
+        slice_performance::get_slice_weights(&env, slice_id)
+    }
+
+    // ── Issue #44: Slice Composition Validation Rules Engine ─────────────────
+
+    /// Register a new composition rule and return its auto-assigned `rule_id`.
+    ///
+    /// Only the vault admin may register global rules.
+    ///
+    /// - `rule_bytes` — opaque policy payload.
+    /// - `priority` — lower value == higher priority (0 == highest).
+    /// - `tag` — numeric label/category for the rule.
+    pub fn register_composition_rule(
+        env: Env,
+        caller: Address,
+        rule_bytes: Bytes,
+        priority: u32,
+        tag: u32,
+    ) -> Result<u64, ContractError> {
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if caller != admin {
+            return Err(ContractError::NotAdmin);
+        }
+        Ok(composition_rules::register_composition_rule(
+            &env, rule_bytes, priority, tag,
+        ))
+    }
+
+    /// Enable or disable an existing composition rule.
+    pub fn set_rule_enabled(
+        env: Env,
+        caller: Address,
+        rule_id: u64,
+        enabled: bool,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if caller != admin {
+            return Err(ContractError::NotAdmin);
+        }
+        // Verify the rule exists before mutating.
+        if composition_rules::get_rule(&env, rule_id).is_none() {
+            return Err(ContractError::RuleNotFound);
+        }
+        composition_rules::set_rule_enabled(&env, rule_id, enabled);
+        Ok(())
+    }
+
+    /// Associate an ordered list of rule IDs with `slice_id`.
+    ///
+    /// Only the vault owner may configure which rules apply to a slice.
+    pub fn set_slice_rules(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        slice_id: u64,
+        rule_ids: Vec<u64>,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        composition_rules::set_slice_rules(&env, slice_id, rule_ids);
+        Ok(())
+    }
+
+    /// Validate `slice_id` against all its associated enabled rules.
+    ///
+    /// `slice_data` is the raw bytes representation of the slice composition
+    /// being validated.  Returns a `ValidationResult` with per-rule outcomes,
+    /// any detected conflicts, and an `overall_valid` flag.
+    pub fn validate_slice_with_rules(
+        env: Env,
+        slice_id: u64,
+        slice_data: Bytes,
+    ) -> composition_rules::ValidationResult {
+        composition_rules::validate_slice_with_rules(&env, slice_id, &slice_data)
+    }
+
+    /// Retrieve a single composition rule by ID.
+    pub fn get_composition_rule(
+        env: Env,
+        rule_id: u64,
+    ) -> Option<composition_rules::CompositionRule> {
+        composition_rules::get_rule(&env, rule_id)
+    }
+
+    /// Retrieve the rule IDs associated with `slice_id`.
+    pub fn get_slice_rule_ids(env: Env, slice_id: u64) -> Vec<u64> {
+        composition_rules::get_slice_rules(&env, slice_id)
     }
 }
