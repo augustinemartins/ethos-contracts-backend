@@ -9,6 +9,7 @@ pub mod handlers;
 pub mod metrics;
 pub mod models;
 pub mod notifications;
+pub mod oncall;
 pub mod routes;
 pub mod scheduler;
 pub mod streaming;
