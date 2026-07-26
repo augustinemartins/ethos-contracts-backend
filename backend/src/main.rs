@@ -18,6 +18,7 @@ use ethos_protocol_backend::{
         create_audit_store, create_event_store, create_share_store, create_share_token_store,
         create_vault_store, AppState, Db, PoolConfig,
     },
+    error_context::correlation_id_middleware,
     graphql::{build_schema, graphql_handler, graphql_playground},
     retry_policy::{self, RetryPolicyState},
     routes, scheduler,
@@ -146,6 +147,8 @@ pub fn build_router(state: AppState) -> Router {
             timeout_state,
             timeout_policy::timeout_middleware,
         ))
+        // ── Correlation IDs: ensure every response carries X-Correlation-Id ──
+        .layer(middleware::from_fn(correlation_id_middleware))
         .layer(build_cors_layer())
         .with_state(state)
 }
