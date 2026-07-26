@@ -6,6 +6,7 @@ pub mod db;
 pub mod error;
 pub mod graphql;
 pub mod handlers;
+pub mod incidents;
 pub mod metrics;
 pub mod models;
 pub mod notifications;
