@@ -16,6 +16,10 @@ use ethos_protocol_backend::{
         create_audit_store, create_event_store, create_share_store, create_share_token_store,
         create_vault_store, AppState, Db, PoolConfig,
     },
+    fallback::{
+        get_fallback_chain, list_fallback_chains, register_fallback_chain, test_fallback_chain,
+        FallbackState,
+    },
     graphql::{build_schema, graphql_handler, graphql_playground},
     routes, scheduler,
     streaming::{stream_events, stream_vaults},
@@ -122,6 +126,16 @@ pub fn build_router(state: AppState) -> Router {
         // ── Streaming routes (#67) ───────────────────────────────────────────
         .route("/stream/vaults", get(stream_vaults))
         .route("/stream/events", get(stream_events))
+        // ── Fallback chain admin routes ──────────────────────────────────────
+        .route(
+            "/admin/fallback-chains",
+            post(register_fallback_chain).get(list_fallback_chains),
+        )
+        .route("/admin/fallback-chains/:id", get(get_fallback_chain))
+        .route(
+            "/admin/fallback-chains/:id/test",
+            post(test_fallback_chain),
+        )
         .layer(build_cors_layer())
         .with_state(state)
 }
@@ -196,6 +210,7 @@ async fn main() {
         consensus,
         webhook_state: Arc::new(WebhookState::new()),
         graphql_schema,
+        fallback_state: Arc::new(FallbackState::new()),
     };
 
     let app = build_router(state);

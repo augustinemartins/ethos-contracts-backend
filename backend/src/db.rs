@@ -62,6 +62,8 @@ pub struct AppState {
     pub webhook_state: Arc<crate::webhook::WebhookState>,
     /// GraphQL schema for the /graphql endpoint (#66).
     pub graphql_schema: crate::graphql::EthosSchema,
+    /// Fallback chain registry for graceful degradation.
+    pub fallback_state: Arc<crate::fallback::FallbackState>,
 }
 
 impl axum::extract::FromRef<AppState> for Arc<Db> {
@@ -85,6 +87,12 @@ impl axum::extract::FromRef<AppState> for Arc<crate::webhook::WebhookState> {
 impl axum::extract::FromRef<AppState> for crate::graphql::EthosSchema {
     fn from_ref(state: &AppState) -> crate::graphql::EthosSchema {
         state.graphql_schema.clone()
+    }
+}
+
+impl axum::extract::FromRef<AppState> for Arc<crate::fallback::FallbackState> {
+    fn from_ref(state: &AppState) -> Arc<crate::fallback::FallbackState> {
+        Arc::clone(&state.fallback_state)
     }
 }
 
