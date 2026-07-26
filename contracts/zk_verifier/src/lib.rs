@@ -1,5 +1,8 @@
 #![no_std]
 
+pub mod compression;
+use compression::{compress_proof as rle_compress, decompress_proof as rle_decompress};
+
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short,
     xdr::FromXdr, Address, Bytes, BytesN, Env,
