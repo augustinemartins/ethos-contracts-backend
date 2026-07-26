@@ -23,6 +23,7 @@ use ethos_protocol_backend::{
         create_vault_store, AppState, Db, PoolConfig,
     },
     graphql::{build_schema, graphql_handler, graphql_playground},
+    log_analysis::{ingest_logs, search_logs, LogStore},
     routes, scheduler,
     streaming::{stream_events, stream_vaults},
     webhook::{delete_webhook, list_webhooks, register_webhook, WebhookState},
@@ -238,10 +239,18 @@ async fn main() {
         .route("/anomaly/baseline/:metric", get(get_baseline))
         .with_state(anomaly_store);
 
+    // ── Structured log parsing / search routes ───────────────────────────
+    let log_store = LogStore::new();
+    let log_router = Router::new()
+        .route("/logs/ingest", post(ingest_logs))
+        .route("/logs/search", get(search_logs))
+        .with_state(log_store);
+
     let app = build_router(state)
         .merge(acl_router)
         .merge(custom_metrics_router)
-        .merge(anomaly_router);
+        .merge(anomaly_router)
+        .merge(log_router);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     tracing::info!("listening on {}", listener.local_addr().unwrap());

@@ -9,6 +9,7 @@ pub mod db;
 pub mod error;
 pub mod graphql;
 pub mod handlers;
+pub mod log_analysis;
 pub mod metrics;
 pub mod models;
 pub mod notifications;
