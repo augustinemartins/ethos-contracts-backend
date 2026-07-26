@@ -16,6 +16,7 @@ use ethos_protocol_backend::{
         create_audit_store, create_event_store, create_share_store, create_share_token_store,
         create_vault_store, AppState, Db, PoolConfig,
     },
+    dlq::{list_dlq_entries, replay_dlq_entries, DlqState},
     fallback::{
         get_fallback_chain, list_fallback_chains, register_fallback_chain, test_fallback_chain,
         FallbackState,
@@ -136,6 +137,9 @@ pub fn build_router(state: AppState) -> Router {
             "/admin/fallback-chains/:id/test",
             post(test_fallback_chain),
         )
+        // ── Dead-letter queue admin routes ───────────────────────────────────
+        .route("/admin/dlq", get(list_dlq_entries))
+        .route("/admin/dlq/replay", post(replay_dlq_entries))
         .layer(build_cors_layer())
         .with_state(state)
 }
@@ -200,6 +204,8 @@ async fn main() {
     let event_store = create_event_store();
     let graphql_schema = build_schema(Arc::clone(&vault_store), Arc::clone(&event_store));
 
+    let dlq_state = Arc::new(DlqState::new());
+
     let state = AppState {
         db,
         vault_store,
@@ -208,9 +214,10 @@ async fn main() {
         share_store: create_share_store(),
         share_token_store: create_share_token_store(),
         consensus,
-        webhook_state: Arc::new(WebhookState::new()),
+        webhook_state: Arc::new(WebhookState::with_dlq(Arc::clone(&dlq_state))),
         graphql_schema,
         fallback_state: Arc::new(FallbackState::new()),
+        dlq_state,
     };
 
     let app = build_router(state);

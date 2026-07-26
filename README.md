@@ -159,6 +159,7 @@ The script will display the target network and identity, then require you to typ
 - [Vesting Schedules](docs/vesting-schedules.md)
 - [Beneficiary Advanced Features](docs/beneficiary-advanced-features.md)
 - [Fallback Chains](docs/fallback-chains.md)
+- [Dead-Letter Queue](docs/dead-letter-queue.md)
 
 ## 🎓 Smart Contract API
 

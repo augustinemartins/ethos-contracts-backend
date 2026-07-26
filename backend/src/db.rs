@@ -64,6 +64,8 @@ pub struct AppState {
     pub graphql_schema: crate::graphql::EthosSchema,
     /// Fallback chain registry for graceful degradation.
     pub fallback_state: Arc<crate::fallback::FallbackState>,
+    /// Dead-letter queue for failed asynchronous deliveries.
+    pub dlq_state: Arc<crate::dlq::DlqState>,
 }
 
 impl axum::extract::FromRef<AppState> for Arc<Db> {
@@ -93,6 +95,12 @@ impl axum::extract::FromRef<AppState> for crate::graphql::EthosSchema {
 impl axum::extract::FromRef<AppState> for Arc<crate::fallback::FallbackState> {
     fn from_ref(state: &AppState) -> Arc<crate::fallback::FallbackState> {
         Arc::clone(&state.fallback_state)
+    }
+}
+
+impl axum::extract::FromRef<AppState> for Arc<crate::dlq::DlqState> {
+    fn from_ref(state: &AppState) -> Arc<crate::dlq::DlqState> {
+        Arc::clone(&state.dlq_state)
     }
 }
 

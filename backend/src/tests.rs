@@ -46,6 +46,7 @@ fn test_state(db: Arc<Db>) -> AppState {
         webhook_state: Arc::new(WebhookState::new()),
         graphql_schema,
         fallback_state: Arc::new(ethos_protocol_backend::fallback::FallbackState::new()),
+        dlq_state: Arc::new(ethos_protocol_backend::dlq::DlqState::new()),
     }
 }
 
@@ -316,6 +317,7 @@ async fn test_consensus_health_detects_and_resolves_divergence() {
         webhook_state: Arc::new(WebhookState::new()),
         graphql_schema: build_schema(create_vault_store(), create_event_store()),
         fallback_state: Arc::new(ethos_protocol_backend::fallback::FallbackState::new()),
+        dlq_state: Arc::new(ethos_protocol_backend::dlq::DlqState::new()),
     };
     db.migrate().unwrap();
 
