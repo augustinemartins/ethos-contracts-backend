@@ -22,6 +22,7 @@ use ethos_protocol_backend::{
     retry_policy::{self, RetryPolicyState},
     routes, scheduler,
     streaming::{stream_events, stream_vaults},
+    timeout_policy::{self, TimeoutState},
     webhook::{delete_webhook, list_webhooks, register_webhook, WebhookState},
 };
 
@@ -94,6 +95,7 @@ async fn consensus_health_handler(
 pub fn build_router(state: AppState) -> Router {
     let retry_state = RetryPolicyState::new();
     let bulkhead_registry = Arc::new(BulkheadRegistry::new(BulkheadConfig::default()));
+    let timeout_state = TimeoutState::new();
 
     Router::new()
         // ── Health ──────────────────────────────────────────────────────────
@@ -104,6 +106,8 @@ pub fn build_router(state: AppState) -> Router {
         .merge(retry_policy::router(retry_state))
         // ── Bulkhead metrics admin route ────────────────────────────────────
         .merge(bulkhead::router(bulkhead_registry.clone()))
+        // ── Timeout policy admin routes ─────────────────────────────────────
+        .merge(timeout_policy::router(timeout_state.clone()))
         // ── Legacy reminder / subscription routes ────────────────────────────
         .route(
             "/api/vaults/:vault_id/reminder-preferences",
@@ -136,6 +140,11 @@ pub fn build_router(state: AppState) -> Router {
         .layer(middleware::from_fn_with_state(
             bulkhead_registry,
             bulkhead::bulkhead_middleware,
+        ))
+        // ── Per-endpoint timeout enforcement ─────────────────────────────────
+        .layer(middleware::from_fn_with_state(
+            timeout_state,
+            timeout_policy::timeout_middleware,
         ))
         .layer(build_cors_layer())
         .with_state(state)
