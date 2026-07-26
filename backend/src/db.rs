@@ -64,6 +64,8 @@ pub struct AppState {
     pub graphql_schema: crate::graphql::EthosSchema,
     /// Feature flag storage and evaluation state.
     pub flag_state: Arc<crate::feature_flags::FlagState>,
+    /// Continuous profiling / flame graph / regression detection state.
+    pub profiler_state: Arc<crate::profiler::ProfilerState>,
 }
 
 impl axum::extract::FromRef<AppState> for Arc<Db> {
@@ -93,6 +95,12 @@ impl axum::extract::FromRef<AppState> for crate::graphql::EthosSchema {
 impl axum::extract::FromRef<AppState> for Arc<crate::feature_flags::FlagState> {
     fn from_ref(state: &AppState) -> Arc<crate::feature_flags::FlagState> {
         Arc::clone(&state.flag_state)
+    }
+}
+
+impl axum::extract::FromRef<AppState> for Arc<crate::profiler::ProfilerState> {
+    fn from_ref(state: &AppState) -> Arc<crate::profiler::ProfilerState> {
+        Arc::clone(&state.profiler_state)
     }
 }
 

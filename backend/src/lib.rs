@@ -8,6 +8,7 @@ pub mod feature_flags;
 pub mod graphql;
 pub mod handlers;
 pub mod metrics;
+pub mod profiler;
 pub mod models;
 pub mod notifications;
 pub mod routes;

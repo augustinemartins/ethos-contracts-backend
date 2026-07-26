@@ -18,6 +18,7 @@ use ethos_protocol_backend::{
     },
     feature_flags::{evaluate_flag_handler, get_flag, list_flags, upsert_flag, FlagState},
     graphql::{build_schema, graphql_handler, graphql_playground},
+    profiler::{get_flamegraph, get_regressions, list_samples, set_baseline, ProfilerState},
     routes, scheduler,
     streaming::{stream_events, stream_vaults},
     webhook::{delete_webhook, list_webhooks, register_webhook, WebhookState},
@@ -127,6 +128,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/admin/flags", post(upsert_flag).get(list_flags))
         .route("/admin/flags/:key", get(get_flag))
         .route("/admin/flags/:key/evaluate", post(evaluate_flag_handler))
+        // ── Continuous profiling routes ──────────────────────────────────────
+        .route("/admin/profiler/samples", get(list_samples))
+        .route("/admin/profiler/flamegraph", get(get_flamegraph))
+        .route("/admin/profiler/baseline", post(set_baseline))
+        .route("/admin/profiler/regressions", get(get_regressions))
         .layer(build_cors_layer())
         .with_state(state)
 }
@@ -202,6 +208,7 @@ async fn main() {
         webhook_state: Arc::new(WebhookState::new()),
         graphql_schema,
         flag_state: Arc::new(FlagState::new()),
+        profiler_state: Arc::new(ProfilerState::new()),
     };
 
     let app = build_router(state);
