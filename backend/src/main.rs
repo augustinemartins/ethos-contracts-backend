@@ -17,6 +17,7 @@ use ethos_protocol_backend::{
         create_vault_store, AppState, Db, PoolConfig,
     },
     graphql::{build_schema, graphql_handler, graphql_playground},
+    retry_policy::{self, RetryPolicyState},
     routes, scheduler,
     streaming::{stream_events, stream_vaults},
     webhook::{delete_webhook, list_webhooks, register_webhook, WebhookState},
@@ -89,11 +90,15 @@ async fn consensus_health_handler(
 }
 
 pub fn build_router(state: AppState) -> Router {
+    let retry_state = RetryPolicyState::new();
+
     Router::new()
         // ── Health ──────────────────────────────────────────────────────────
         .route("/health", get(health_handler))
         .route("/health/consensus", get(consensus_health_handler))
         .route("/ready", get(ready_handler))
+        // ── Retry policy admin routes ─────────────────────────────────────────
+        .merge(retry_policy::router(retry_state))
         // ── Legacy reminder / subscription routes ────────────────────────────
         .route(
             "/api/vaults/:vault_id/reminder-preferences",
