@@ -1,4 +1,5 @@
 pub mod acl;
+pub mod anomaly_detection;
 pub mod audit;
 pub mod cache;
 pub mod consensus;

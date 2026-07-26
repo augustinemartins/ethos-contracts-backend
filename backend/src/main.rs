@@ -11,6 +11,7 @@ use tracing_subscriber::EnvFilter;
 
 use ethos_protocol_backend::{
     acl::{acl_audit_trail, create_acl_rule, delete_acl_rule, list_acl_rules, AclStore},
+    anomaly_detection::{get_baseline, list_alerts, observe_metric, AnomalyStore},
     consensus::NodeCache,
     contract_version_check::{check_contract_version, parse_min_contract_version},
     custom_metrics::{
@@ -229,9 +230,18 @@ async fn main() {
         .route("/dashboards/shared/:token", get(get_shared_dashboard))
         .with_state(custom_metrics_store);
 
+    // ── Anomaly detection routes ──────────────────────────────────────────
+    let anomaly_store = AnomalyStore::new();
+    let anomaly_router = Router::new()
+        .route("/anomaly/observe", post(observe_metric))
+        .route("/anomaly/alerts", get(list_alerts))
+        .route("/anomaly/baseline/:metric", get(get_baseline))
+        .with_state(anomaly_store);
+
     let app = build_router(state)
         .merge(acl_router)
-        .merge(custom_metrics_router);
+        .merge(custom_metrics_router)
+        .merge(anomaly_router);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     tracing::info!("listening on {}", listener.local_addr().unwrap());
