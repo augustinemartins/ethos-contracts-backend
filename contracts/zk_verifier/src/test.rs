@@ -3,7 +3,7 @@
 use super::*;
 use soroban_sdk::{
     bytes,
-    testutils::{Address as _, Events as _},
+    testutils::{Address as _, Events as _, Ledger},
     Bytes, Env,
 };
 
@@ -487,4 +487,538 @@ fn test_admin_configurable_dispute_threshold() {
 fn test_zero_threshold_rejected() {
     let (_, _, client) = setup();
     client.set_dispute_threshold(&0u32);
+}
+
+// ── Credential temporal query tests ───────────────────────────────────────────
+
+/// An unknown credential id has no snapshot history at all.
+#[test]
+fn test_get_credential_at_time_unknown_credential_returns_none() {
+    let (env, _, client) = setup();
+    let viewer = Address::generate(&env);
+    assert!(client
+        .get_credential_at_time(&viewer, &999u64, &0u64)
+        .is_none());
+}
+
+/// Querying a timestamp before the credential's first snapshot returns None.
+#[test]
+fn test_get_credential_at_time_before_first_snapshot_returns_none() {
+    let (env, _, client) = setup();
+    env.ledger().set_timestamp(100);
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+    let credential_id = client.attest(&oracle, &proof, &claim);
+
+    let viewer = Address::generate(&env);
+    assert!(client
+        .get_credential_at_time(&viewer, &credential_id, &50u64)
+        .is_none());
+}
+
+/// attest() captures a snapshot at the ledger timestamp of attestation.
+/// Querying at that timestamp, or any later one, returns it.
+#[test]
+fn test_get_credential_at_time_returns_snapshot_at_and_after_attest() {
+    let (env, _, client) = setup();
+    env.ledger().set_timestamp(100);
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+    let credential_id = client.attest(&oracle, &proof, &claim);
+
+    let viewer = Address::generate(&env);
+    let snapshot = client
+        .get_credential_at_time(&viewer, &credential_id, &100u64)
+        .unwrap();
+    assert_eq!(snapshot.credential_id, credential_id);
+    assert_eq!(snapshot.oracle, oracle);
+    assert!(!snapshot.invalidated);
+    assert_eq!(snapshot.timestamp, 100);
+
+    env.ledger().set_timestamp(500);
+    let later = client
+        .get_credential_at_time(&viewer, &credential_id, &500u64)
+        .unwrap();
+    assert_eq!(later.timestamp, 100);
+}
+
+/// The historical query must reflect state as of the queried timestamp, not
+/// the credential's current state: valid before a dispute resolves, invalid
+/// from the moment it does.
+#[test]
+fn test_get_credential_at_time_reflects_state_before_and_after_dispute() {
+    let (env, _, client) = setup();
+    env.ledger().set_timestamp(100);
+    let oracles = register_oracles(&env, &client, 3);
+    let attester = oracles.get(0).unwrap();
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+    let credential_id = client.attest(&attester, &proof, &claim);
+
+    env.ledger().set_timestamp(200);
+    let initiator = Address::generate(&env);
+    let reason = bytes!(&env, 0xaa);
+    let dispute_id = client.initiate_credential_dispute(&credential_id, &initiator, &reason);
+
+    env.ledger().set_timestamp(300);
+    for oracle in oracles.iter() {
+        client.vote_on_dispute(&dispute_id, &oracle, &true);
+    }
+    assert!(client.is_credential_invalidated(&credential_id));
+
+    let viewer = Address::generate(&env);
+    // As of a moment before the dispute was even filed, the credential was
+    // valid — even though it is invalid *now*.
+    let before = client
+        .get_credential_at_time(&viewer, &credential_id, &150u64)
+        .unwrap();
+    assert!(!before.invalidated);
+
+    // As of the moment the dispute resolved, it was already invalid.
+    let after = client
+        .get_credential_at_time(&viewer, &credential_id, &300u64)
+        .unwrap();
+    assert!(after.invalidated);
+    assert_eq!(after.timestamp, 300);
+}
+
+/// Re-attesting a credential under a different oracle records a new
+/// snapshot without erasing the earlier one — a query at the old timestamp
+/// still reports the original oracle.
+#[test]
+fn test_get_credential_at_time_tracks_oracle_change_on_reattestation() {
+    let (env, _, client) = setup();
+    env.ledger().set_timestamp(100);
+    let oracle_a = Address::generate(&env);
+    let oracle_b = Address::generate(&env);
+    client.register_oracle(&oracle_a);
+    client.register_oracle(&oracle_b);
+
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+    let credential_id = client.attest(&oracle_a, &proof, &claim);
+
+    env.ledger().set_timestamp(200);
+    let reattested_id = client.attest(&oracle_b, &proof, &claim);
+    assert_eq!(reattested_id, credential_id);
+
+    let viewer = Address::generate(&env);
+    let early = client
+        .get_credential_at_time(&viewer, &credential_id, &150u64)
+        .unwrap();
+    assert_eq!(early.oracle, oracle_a);
+
+    let late = client
+        .get_credential_at_time(&viewer, &credential_id, &200u64)
+        .unwrap();
+    assert_eq!(late.oracle, oracle_b);
+}
+
+/// Two state changes landing at the same ledger timestamp overwrite the
+/// snapshot in place instead of duplicating the timestamp index — a dispute
+/// filed and resolved without any ledger-time advance still yields exactly
+/// one snapshot for that timestamp, holding the latest state.
+#[test]
+fn test_get_credential_at_time_same_timestamp_overwrites_snapshot() {
+    let (env, _, client) = setup();
+    env.ledger().set_timestamp(1);
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+    client.set_dispute_threshold(&1u32);
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+    let credential_id = client.attest(&oracle, &proof, &claim);
+
+    let initiator = Address::generate(&env);
+    let reason = bytes!(&env, 0xaa);
+    let dispute_id = client.initiate_credential_dispute(&credential_id, &initiator, &reason);
+    client.vote_on_dispute(&dispute_id, &oracle, &true);
+    assert!(client.is_credential_invalidated(&credential_id));
+
+    // All three state changes (attest, dispute filed, dispute resolved)
+    // happened at timestamp 1; the query must return the latest one.
+    let viewer = Address::generate(&env);
+    let snapshot = client
+        .get_credential_at_time(&viewer, &credential_id, &1u64)
+        .unwrap();
+    assert!(snapshot.invalidated);
+    assert_eq!(snapshot.timestamp, 1);
+}
+
+/// The snapshot history is capped at MAX_CREDENTIAL_SNAPSHOTS per
+/// credential: once exceeded, the oldest snapshot is pruned and becomes
+/// unqueryable, while the next-oldest remains.
+#[test]
+fn test_credential_snapshot_retention_prunes_oldest() {
+    let (env, _, client) = setup();
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+
+    env.ledger().set_timestamp(1);
+    let credential_id = client.attest(&oracle, &proof, &claim);
+
+    // Re-attest at a fresh timestamp each time so every call records a
+    // distinct snapshot, until retention is forced to prune the oldest.
+    for ts in 2..=(MAX_CREDENTIAL_SNAPSHOTS as u64 + 1) {
+        env.ledger().set_timestamp(ts);
+        client.attest(&oracle, &proof, &claim);
+    }
+
+    // The very first snapshot (timestamp 1) has been pruned...
+    let viewer = Address::generate(&env);
+    assert!(client
+        .get_credential_at_time(&viewer, &credential_id, &1u64)
+        .is_none());
+    // ...but the second (timestamp 2) is still the oldest retained, and is
+    // what a query for anything before it now falls back to finding absent.
+    let oldest_retained = client
+        .get_credential_at_time(&viewer, &credential_id, &2u64)
+        .unwrap();
+    assert_eq!(oldest_retained.timestamp, 2);
+}
+
+// ── Credential privacy tests ──────────────────────────────────────────────────
+
+/// A freshly attested credential defaults to `Public` — anyone may read its
+/// state via `get_credential_at_time` without it being set explicitly.
+#[test]
+fn test_credential_privacy_defaults_to_public() {
+    let (env, _, client) = setup();
+    env.ledger().set_timestamp(1);
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+    let credential_id = client.attest(&oracle, &proof, &claim);
+
+    assert_eq!(client.credential_privacy(&credential_id), PrivacyLevel::Public);
+
+    let stranger = Address::generate(&env);
+    assert!(client
+        .get_credential_at_time(&stranger, &credential_id, &1u64)
+        .is_some());
+}
+
+/// Setting privacy on a credential id that was never attested must panic.
+#[test]
+#[should_panic(expected = "Error(Contract, #8)")]
+fn test_set_credential_privacy_unknown_credential_panics() {
+    let (_, _, client) = setup();
+    client.set_credential_privacy(&999u64, &PrivacyLevel::Internal);
+}
+
+/// The admin can change a credential's privacy level, and `credential_privacy`
+/// reflects the update.
+#[test]
+fn test_set_credential_privacy_updates_getter() {
+    let (env, _, client) = setup();
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+    let credential_id = client.attest(&oracle, &proof, &claim);
+
+    client.set_credential_privacy(&credential_id, &PrivacyLevel::Confidential);
+    assert_eq!(
+        client.credential_privacy(&credential_id),
+        PrivacyLevel::Confidential
+    );
+}
+
+/// An `Internal` credential is readable by the admin and by any registered
+/// oracle (not just the one that attested it).
+#[test]
+fn test_internal_privacy_allows_admin_and_any_oracle() {
+    let (env, admin, client) = setup();
+    env.ledger().set_timestamp(1);
+    let attester = Address::generate(&env);
+    client.register_oracle(&attester);
+    let other_oracle = Address::generate(&env);
+    client.register_oracle(&other_oracle);
+
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+    let credential_id = client.attest(&attester, &proof, &claim);
+    client.set_credential_privacy(&credential_id, &PrivacyLevel::Internal);
+
+    assert!(client
+        .get_credential_at_time(&admin, &credential_id, &1u64)
+        .is_some());
+    assert!(client
+        .get_credential_at_time(&other_oracle, &credential_id, &1u64)
+        .is_some());
+}
+
+/// An `Internal` credential is not readable by an address that is neither
+/// the admin nor a registered oracle.
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn test_internal_privacy_denies_stranger() {
+    let (env, _, client) = setup();
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+    let credential_id = client.attest(&oracle, &proof, &claim);
+    client.set_credential_privacy(&credential_id, &PrivacyLevel::Internal);
+
+    let stranger = Address::generate(&env);
+    client.get_credential_at_time(&stranger, &credential_id, &0u64);
+}
+
+/// A `Confidential` credential is readable by the admin...
+#[test]
+fn test_confidential_privacy_allows_admin() {
+    let (env, admin, client) = setup();
+    env.ledger().set_timestamp(1);
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+    let credential_id = client.attest(&oracle, &proof, &claim);
+    client.set_credential_privacy(&credential_id, &PrivacyLevel::Confidential);
+
+    assert!(client
+        .get_credential_at_time(&admin, &credential_id, &1u64)
+        .is_some());
+}
+
+/// ...but not by a registered oracle — `Confidential` is stricter than
+/// `Internal` and excludes everyone but the admin, including the oracle that
+/// attested the credential in the first place.
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn test_confidential_privacy_denies_attesting_oracle() {
+    let (env, _, client) = setup();
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+    let credential_id = client.attest(&oracle, &proof, &claim);
+    client.set_credential_privacy(&credential_id, &PrivacyLevel::Confidential);
+
+    client.get_credential_at_time(&oracle, &credential_id, &0u64);
+}
+
+// ── Credential version history tests ──────────────────────────────────────────
+
+/// A credential that has never been attested has no versions at all.
+#[test]
+fn test_credential_version_count_unknown_credential_is_zero() {
+    let (env, _, client) = setup();
+    assert_eq!(client.credential_version_count(&999u64), 0);
+    let viewer = Address::generate(&env);
+    assert!(client
+        .get_credential_version(&viewer, &999u64, &1u32)
+        .is_none());
+}
+
+/// attest() creates version 1; re-attesting at a later timestamp advances to
+/// version 2, and both remain independently queryable by version number.
+#[test]
+fn test_get_credential_version_returns_each_recorded_version() {
+    let (env, _, client) = setup();
+    env.ledger().set_timestamp(100);
+    let oracle_a = Address::generate(&env);
+    let oracle_b = Address::generate(&env);
+    client.register_oracle(&oracle_a);
+    client.register_oracle(&oracle_b);
+
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+    let credential_id = client.attest(&oracle_a, &proof, &claim);
+    assert_eq!(client.credential_version_count(&credential_id), 1);
+
+    env.ledger().set_timestamp(200);
+    client.attest(&oracle_b, &proof, &claim);
+    assert_eq!(client.credential_version_count(&credential_id), 2);
+
+    let viewer = Address::generate(&env);
+    let v1 = client
+        .get_credential_version(&viewer, &credential_id, &1u32)
+        .unwrap();
+    assert_eq!(v1.oracle, oracle_a);
+    assert_eq!(v1.timestamp, 100);
+    assert_eq!(v1.version, 1);
+
+    let v2 = client
+        .get_credential_version(&viewer, &credential_id, &2u32)
+        .unwrap();
+    assert_eq!(v2.oracle, oracle_b);
+    assert_eq!(v2.timestamp, 200);
+    assert_eq!(v2.version, 2);
+
+    assert!(client
+        .get_credential_version(&viewer, &credential_id, &3u32)
+        .is_none());
+}
+
+/// Multiple state changes landing at the same ledger timestamp (dispute
+/// filed and resolved without any ledger-time advance) share a single
+/// version number rather than each minting a new one.
+#[test]
+fn test_get_credential_version_same_timestamp_reuses_version() {
+    let (env, _, client) = setup();
+    env.ledger().set_timestamp(1);
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+    client.set_dispute_threshold(&1u32);
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+    let credential_id = client.attest(&oracle, &proof, &claim);
+    assert_eq!(client.credential_version_count(&credential_id), 1);
+
+    let initiator = Address::generate(&env);
+    let reason = bytes!(&env, 0xaa);
+    let dispute_id = client.initiate_credential_dispute(&credential_id, &initiator, &reason);
+    client.vote_on_dispute(&dispute_id, &oracle, &true);
+    assert!(client.is_credential_invalidated(&credential_id));
+
+    // The dispute resolving at the same timestamp as attest() must not
+    // advance the version number, and version 1 now reflects the latest
+    // (invalidated) state.
+    assert_eq!(client.credential_version_count(&credential_id), 1);
+    let viewer = Address::generate(&env);
+    let v1 = client
+        .get_credential_version(&viewer, &credential_id, &1u32)
+        .unwrap();
+    assert!(v1.invalidated);
+}
+
+/// Version numbers are never reused: once retention prunes the oldest
+/// snapshot, its version becomes permanently unqueryable rather than being
+/// reassigned to a newer state.
+#[test]
+fn test_credential_version_retention_prunes_oldest_without_renumbering() {
+    let (env, _, client) = setup();
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+
+    env.ledger().set_timestamp(1);
+    let credential_id = client.attest(&oracle, &proof, &claim);
+
+    for ts in 2..=(MAX_CREDENTIAL_SNAPSHOTS as u64 + 1) {
+        env.ledger().set_timestamp(ts);
+        client.attest(&oracle, &proof, &claim);
+    }
+
+    // Version 1 (the very first attestation) has been pruned...
+    let viewer = Address::generate(&env);
+    assert!(client
+        .get_credential_version(&viewer, &credential_id, &1u32)
+        .is_none());
+    // ...but version 2 is still retained and still identifies itself as
+    // version 2, not renumbered to 1.
+    let oldest_retained = client
+        .get_credential_version(&viewer, &credential_id, &2u32)
+        .unwrap();
+    assert_eq!(oldest_retained.version, 2);
+    assert_eq!(oldest_retained.timestamp, 2);
+    // The latest version number keeps counting up regardless of pruning.
+    assert_eq!(
+        client.credential_version_count(&credential_id),
+        MAX_CREDENTIAL_SNAPSHOTS + 1
+    );
+}
+
+/// diff_credential_versions reports an oracle change and no invalidation
+/// change across a re-attestation under a different oracle.
+#[test]
+fn test_diff_credential_versions_reports_oracle_change() {
+    let (env, _, client) = setup();
+    env.ledger().set_timestamp(100);
+    let oracle_a = Address::generate(&env);
+    let oracle_b = Address::generate(&env);
+    client.register_oracle(&oracle_a);
+    client.register_oracle(&oracle_b);
+
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+    let credential_id = client.attest(&oracle_a, &proof, &claim);
+
+    env.ledger().set_timestamp(200);
+    client.attest(&oracle_b, &proof, &claim);
+
+    let viewer = Address::generate(&env);
+    let diff = client.diff_credential_versions(&viewer, &credential_id, &1u32, &2u32);
+    assert_eq!(diff.credential_id, credential_id);
+    assert_eq!(diff.from_version, 1);
+    assert_eq!(diff.to_version, 2);
+    assert_eq!(diff.from_timestamp, 100);
+    assert_eq!(diff.to_timestamp, 200);
+    assert!(diff.oracle_changed);
+    assert_eq!(diff.previous_oracle, oracle_a);
+    assert_eq!(diff.current_oracle, oracle_b);
+    assert!(!diff.invalidated_changed);
+    assert!(!diff.previous_invalidated);
+    assert!(!diff.current_invalidated);
+}
+
+/// diff_credential_versions reports an invalidation change (and no oracle
+/// change) across a dispute being upheld.
+#[test]
+fn test_diff_credential_versions_reports_invalidation_change() {
+    let (env, _, client) = setup();
+    env.ledger().set_timestamp(100);
+    let oracles = register_oracles(&env, &client, 3);
+    let attester = oracles.get(0).unwrap();
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+    let credential_id = client.attest(&attester, &proof, &claim);
+
+    env.ledger().set_timestamp(200);
+    let initiator = Address::generate(&env);
+    let reason = bytes!(&env, 0xaa);
+    let dispute_id = client.initiate_credential_dispute(&credential_id, &initiator, &reason);
+    for oracle in oracles.iter() {
+        client.vote_on_dispute(&dispute_id, &oracle, &true);
+    }
+    assert!(client.is_credential_invalidated(&credential_id));
+
+    let viewer = Address::generate(&env);
+    let diff = client.diff_credential_versions(&viewer, &credential_id, &1u32, &2u32);
+    assert!(!diff.oracle_changed);
+    assert!(diff.invalidated_changed);
+    assert!(!diff.previous_invalidated);
+    assert!(diff.current_invalidated);
+}
+
+/// Diffing a version that was never recorded panics with VersionNotFound.
+#[test]
+#[should_panic(expected = "Error(Contract, #17)")]
+fn test_diff_credential_versions_unknown_version_panics() {
+    let (env, _, client) = setup();
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+    let credential_id = client.attest(&oracle, &proof, &claim);
+
+    let viewer = Address::generate(&env);
+    client.diff_credential_versions(&viewer, &credential_id, &1u32, &99u32);
+}
+
+/// get_credential_version respects the same privacy gating as
+/// get_credential_at_time: a stranger is denied on an Internal credential.
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn test_get_credential_version_denies_stranger_on_internal_privacy() {
+    let (env, _, client) = setup();
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+    let credential_id = client.attest(&oracle, &proof, &claim);
+    client.set_credential_privacy(&credential_id, &PrivacyLevel::Internal);
+
+    let stranger = Address::generate(&env);
+    client.get_credential_version(&stranger, &credential_id, &1u32);
 }

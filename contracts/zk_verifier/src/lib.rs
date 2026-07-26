@@ -14,6 +14,11 @@ pub const MAX_REASON_SIZE: u32 = 1024;
 /// upholding or rejecting it) when no explicit threshold has been configured
 /// by the admin via [`ZkVerifierContract::set_dispute_threshold`].
 pub const DEFAULT_DISPUTE_THRESHOLD: u32 = 3;
+/// Maximum number of historical snapshots retained per credential. Once a
+/// credential's snapshot count exceeds this, the oldest snapshot is pruned
+/// to bound persistent-storage growth. See docs/zk-verifier.md, "Credential
+/// Retention Policy".
+pub const MAX_CREDENTIAL_SNAPSHOTS: u32 = 1000;
 
 const VERIFY_CLAIM_TOPIC: soroban_sdk::Symbol = symbol_short!("vfy_claim");
 const VERIFY_CONDITIONAL_TOPIC: soroban_sdk::Symbol = symbol_short!("vfy_cond");
@@ -94,6 +99,22 @@ mod keys {
         /// Number of concurring votes needed to resolve a dispute. Falls
         /// back to DEFAULT_DISPUTE_THRESHOLD when unset.
         DisputeThreshold,
+        /// (credential_id, timestamp) -> CredentialSnapshot, captured every
+        /// time a credential's attestation or invalidation status changes.
+        CredentialSnapshot(u64, u64),
+        /// credential_id -> Vec<timestamp>, ascending, one entry per
+        /// retained snapshot for that credential (bounded by
+        /// MAX_CREDENTIAL_SNAPSHOTS).
+        CredentialSnapshotTimestamps(u64),
+        /// credential_id -> Vec<version>, ascending, a parallel index to
+        /// `CredentialSnapshotTimestamps` (same length, same order, same
+        /// retention bound) mapping each retained snapshot to its version
+        /// number.
+        CredentialSnapshotVersions(u64),
+        /// credential_id -> PrivacyLevel. Absence means `Public`, so
+        /// pre-existing credentials are unaffected until an admin opts them
+        /// into a stricter level via `set_credential_privacy`.
+        CredentialPrivacy(u64),
     }
 }
 
@@ -106,6 +127,63 @@ use keys::DataKey;
 pub struct AttestationRecord {
     pub credential_id: u64,
     pub oracle: Address,
+}
+
+/// A point-in-time snapshot of a credential's attestation state, captured
+/// whenever that state changes (re-attestation, or a dispute resolving).
+/// Used to answer historical questions like "was this credential valid at
+/// time T?" via [`ZkVerifierContract::get_credential_at_time`], or "what did
+/// version N look like?" via [`ZkVerifierContract::get_credential_version`].
+#[contracttype]
+#[derive(Clone)]
+pub struct CredentialSnapshot {
+    pub credential_id: u64,
+    pub oracle: Address,
+    pub invalidated: bool,
+    /// Ledger timestamp at which this snapshot was captured.
+    pub timestamp: u64,
+    /// Monotonically increasing version number for this credential, starting
+    /// at 1. Unlike the snapshot itself, a version number is never reused or
+    /// renumbered once assigned — even after the retention policy prunes the
+    /// snapshot it identifies, so audit references to "version N" remain
+    /// meaningful (as "not found") rather than silently pointing at a
+    /// different state. See docs/zk-verifier.md, "Credential Version
+    /// History".
+    pub version: u32,
+}
+
+/// The result of comparing two recorded versions of a credential's
+/// attestation state, returned by
+/// [`ZkVerifierContract::diff_credential_versions`].
+#[contracttype]
+#[derive(Clone)]
+pub struct CredentialVersionDiff {
+    pub credential_id: u64,
+    pub from_version: u32,
+    pub to_version: u32,
+    pub from_timestamp: u64,
+    pub to_timestamp: u64,
+    pub oracle_changed: bool,
+    pub previous_oracle: Address,
+    pub current_oracle: Address,
+    pub invalidated_changed: bool,
+    pub previous_invalidated: bool,
+    pub current_invalidated: bool,
+}
+
+/// Controls who may read a credential's attestation state via
+/// [`ZkVerifierContract::get_credential_at_time`]. Set per-credential by the
+/// admin via [`ZkVerifierContract::set_credential_privacy`]; defaults to
+/// `Public` for every credential until explicitly changed.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrivacyLevel {
+    /// Readable by anyone.
+    Public,
+    /// Readable only by the admin and registered oracles.
+    Internal,
+    /// Readable only by the admin.
+    Confidential,
 }
 
 #[contracttype]
@@ -218,9 +296,12 @@ impl ZkVerifierContract {
             &attestation_key,
             &AttestationRecord {
                 credential_id,
-                oracle,
+                oracle: oracle.clone(),
             },
         );
+
+        let invalidated = Self::is_credential_invalidated(env.clone(), credential_id);
+        Self::record_credential_snapshot(&env, credential_id, oracle, invalidated);
 
         credential_id
     }
@@ -296,6 +377,31 @@ impl ZkVerifierContract {
         );
 
         result
+    }
+
+    /// Sets the [`PrivacyLevel`] governing who may call
+    /// `get_credential_at_time` for `credential_id`. Admin only.
+    pub fn set_credential_privacy(env: Env, credential_id: u64, level: PrivacyLevel) {
+        Self::require_admin(&env);
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::CredentialHashes(credential_id))
+        {
+            panic_with_error!(&env, VerifierError::CredentialNotFound);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::CredentialPrivacy(credential_id), &level);
+    }
+
+    /// Returns `credential_id`'s current [`PrivacyLevel`], defaulting to
+    /// `Public` if it has never been explicitly set.
+    pub fn credential_privacy(env: Env, credential_id: u64) -> PrivacyLevel {
+        env.storage()
+            .instance()
+            .get(&DataKey::CredentialPrivacy(credential_id))
+            .unwrap_or(PrivacyLevel::Public)
     }
 
     // ---- helpers ----

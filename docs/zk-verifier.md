@@ -67,6 +67,35 @@ pub fn dispute_threshold(env: Env) -> u32
 
 /// Sets the number of concurring oracle votes needed to resolve a dispute. Admin only.
 pub fn set_dispute_threshold(env: Env, threshold: u32)
+
+/// Returns the credential's attestation state as of `timestamp` (the most
+/// recent snapshot at or before it), or `None` if no such snapshot exists.
+/// `requester` must authorize the call and be permitted to view the
+/// credential under its current PrivacyLevel.
+pub fn get_credential_at_time(env: Env, requester: Address, credential_id: u64, timestamp: u64) -> Option<CredentialSnapshot>
+
+/// Sets the PrivacyLevel governing who may read a credential's state via
+/// `get_credential_at_time`. Admin only.
+pub fn set_credential_privacy(env: Env, credential_id: u64, level: PrivacyLevel)
+
+/// Returns a credential's current PrivacyLevel (defaults to `Public`).
+pub fn credential_privacy(env: Env, credential_id: u64) -> PrivacyLevel
+
+/// Returns the credential's recorded state as of a specific version number
+/// (1-based, monotonically increasing, never reused), or `None` if that
+/// version was never recorded or has since been pruned. Same PrivacyLevel
+/// gating as `get_credential_at_time`.
+pub fn get_credential_version(env: Env, requester: Address, credential_id: u64, version: u32) -> Option<CredentialSnapshot>
+
+/// Returns the latest version number recorded for a credential (0 if it has
+/// never been attested), regardless of whether earlier versions have since
+/// been pruned.
+pub fn credential_version_count(env: Env, credential_id: u64) -> u32
+
+/// Compares two recorded versions of a credential and reports what changed
+/// between them. Panics with VersionNotFound if either version is unknown.
+/// Same PrivacyLevel gating as `get_credential_at_time`.
+pub fn diff_credential_versions(env: Env, requester: Address, credential_id: u64, from_version: u32, to_version: u32) -> CredentialVersionDiff
 ```
 
 ### Current Verification Logic
@@ -133,6 +162,178 @@ This is deliberately a lighter-weight trust mechanism than oracle
 registration itself — voting rights are tied to the existing oracle
 allowlist rather than a separate credential-dispute-specific role, so no new
 admin surface is introduced beyond the threshold setting.
+
+---
+
+## Credential Temporal Queries & Retention Policy
+
+Every other credential query (`is_credential_invalidated`,
+`get_credential_disputes`, ...) answers "what is true *right now*?" —
+there was previously no way to ask "was this credential valid on Jan 1?"
+after the fact. `get_credential_at_time(credential_id, timestamp)` answers
+exactly that.
+
+### How it works
+
+1. **Snapshot on every state change**: whenever a credential's attestation
+   state changes — a fresh `attest` call (including re-attestation, which
+   can change the attesting oracle) or a dispute against it resolving
+   (`Upheld` or `Rejected`) — the contract records a `CredentialSnapshot`
+   (`credential_id`, `oracle`, `invalidated`, `timestamp`) at the current
+   ledger timestamp. This happens automatically; there is no separate
+   "take a snapshot" call to remember to make.
+2. **Index per credential**: each credential keeps an ascending list of the
+   ledger timestamps it has a snapshot at
+   (`DataKey::CredentialSnapshotTimestamps`). Because Soroban ledger close
+   time is monotonically non-decreasing and snapshots are only ever
+   appended, this list is always sorted — no explicit sort step is needed.
+3. **Lookup**: `get_credential_at_time` binary-searches that index for the
+   rightmost timestamp `<= timestamp` (O(log n) in the number of retained
+   snapshots for that credential) and returns the snapshot stored there, or
+   `None` if every snapshot postdates the query (including when the
+   credential has no snapshots at all). If two state changes land at the
+   same ledger timestamp — e.g. a dispute is filed and resolved without any
+   ledger-time advance — the later one overwrites the snapshot at that
+   timestamp rather than creating a duplicate index entry.
+
+### Retention policy
+
+Snapshots are stored in **persistent** storage (unlike the rest of this
+contract's state, which lives in instance storage) since they are
+write-once, append-only history rather than live state — this mirrors the
+`VaultSnapshot` pattern in `ttl_vault`. To bound persistent-storage growth,
+each credential retains at most `MAX_CREDENTIAL_SNAPSHOTS` (**1000**)
+snapshots: once a credential's snapshot count would exceed that, the
+oldest snapshot is pruned before the newest one is recorded.
+
+Practical implications:
+
+- A credential that changes state at most once per ledger close needs
+  1000 state changes (attestations/re-attestations plus dispute
+  resolutions) before its earliest history is pruned — in practice, far
+  more ledger closes than that, since state changes are comparatively
+  infrequent per credential.
+- Once pruned, a query for a timestamp older than the oldest retained
+  snapshot returns `None` — the same result as if the credential never
+  existed at that time. Callers that need unbounded history should index
+  the `disp_res`/`attest` activity off-chain (e.g. via an indexer watching
+  contract events) rather than relying on on-chain retention.
+- This cap is per-credential, not global — a busy credential does not
+  starve the retention budget of any other credential.
+
+---
+
+## Credential Version History
+
+`get_credential_at_time` answers "what was true at timestamp T?"; it does
+not give an audit trail a stable identity — an off-chain caller cannot say
+"show me version 3" and get the same answer regardless of what has been
+pruned around it, because timestamps are not renumbered but *are*
+context-dependent (you need to already know roughly when a change
+happened). Credential versions give every recorded state change a stable,
+gap-free, 1-based number instead.
+
+### Version semantics
+
+- **Numbering**: the first recorded state for a credential (its initial
+  `attest`) is version 1. Each subsequent state change — a re-attestation
+  that changes the attesting oracle, or a dispute resolving — increments
+  the version by exactly one. Versions are per-credential; credential 1's
+  version 3 and credential 2's version 3 are unrelated.
+- **Stability**: a version number is assigned once and never reassigned,
+  even after retention prunes the snapshot it identifies. Once pruned,
+  `get_credential_version` for that version returns `None` — it never
+  starts pointing at a different state, unlike, hypothetically, a
+  position-based index would.
+- **Same-timestamp changes do not create new versions**: if two state
+  changes land at the same ledger timestamp (e.g. a dispute filed and
+  resolved without any ledger-time advance), they share one version number,
+  matching the snapshot-overwrite behavior described above under
+  "Credential Temporal Queries". A version therefore corresponds 1:1 with a
+  *distinct retained timestamp*, not with "every call that touched credential
+  state."
+- **Storage**: versions are not a parallel history store. They are a second,
+  parallel index (`DataKey::CredentialSnapshotVersions`) over the same
+  `CredentialSnapshot` records `get_credential_at_time` already uses, kept
+  in lockstep with `DataKey::CredentialSnapshotTimestamps` — same length,
+  same retention bound (`MAX_CREDENTIAL_SNAPSHOTS`), same pruning behavior.
+  No credential state is duplicated on-chain to support version lookups.
+
+### Usage
+
+```rust
+// version 1 is always the credential's original attested state (until/unless
+// pruned).
+let v1 = client.get_credential_version(&requester, &credential_id, &1u32);
+
+// How many versions has this credential gone through?
+let latest = client.credential_version_count(&credential_id);
+
+// What changed between the original attestation and its current state?
+let diff = client.diff_credential_versions(&requester, &credential_id, &1u32, &latest);
+if diff.oracle_changed {
+    // diff.previous_oracle -> diff.current_oracle
+}
+if diff.invalidated_changed {
+    // diff.previous_invalidated -> diff.current_invalidated
+}
+```
+
+`diff_credential_versions` panics with `VersionNotFound` (#17) if either
+`from_version` or `to_version` was never recorded or has since been pruned.
+`from_version` and `to_version` need not be adjacent or chronologically
+ordered — diffing version 3 against version 1 is valid and simply reports
+the same fields with signs effectively reversed.
+
+Both `get_credential_version` and `diff_credential_versions` require
+`requester` to authorize the call and enforce the same [`PrivacyLevel`]
+access check as `get_credential_at_time` (see "Credential Privacy Levels"
+below) — version history is exactly as sensitive as the state it records.
+`credential_version_count` is not privacy-gated, since a bare version count
+does not expose any oracle or invalidation data, mirroring
+`get_credential_disputes`'s ungated dispute count.
+
+---
+
+## Credential Privacy Levels
+
+By default every credential is equally visible to anyone who knows its
+`credential_id` — `get_credential_at_time` never checked who was asking.
+`PrivacyLevel` lets the admin restrict that on a per-credential basis:
+
+- **`Public`** (default): anyone may read the credential's state.
+- **`Internal`**: only the admin or a currently-registered oracle may read
+  it — not necessarily the oracle that attested it, any registered oracle.
+- **`Confidential`**: only the admin may read it.
+
+### Usage
+
+```rust
+// Admin-only: restrict credential 1 to internal readers.
+client.set_credential_privacy(&1u64, &PrivacyLevel::Internal);
+
+// Anyone can check the configured level.
+let level = client.credential_privacy(&1u64);
+
+// Reads are now access-controlled: `requester` must authorize the call
+// (so it cannot be spoofed) and must satisfy the credential's privacy
+// level, or the call panics with AccessDenied (#16).
+let snapshot = client.get_credential_at_time(&requester, &1u64, &timestamp);
+```
+
+`set_credential_privacy` panics with `CredentialNotFound` (#8) if
+`credential_id` was never attested, mirroring `initiate_credential_dispute`.
+
+### What this does and does not cover
+
+Privacy filtering applies to `get_credential_at_time`, `get_credential_version`,
+and `diff_credential_versions` — every query that exposes a credential's full
+attestation state (oracle, invalidated flag, timestamp). It intentionally
+does **not** gate `verify_claim`: that call
+already requires the caller to possess the exact `proof` and `claim` bytes,
+so it authenticates via knowledge of the secret rather than identity, and
+restricting it further would not add confidentiality — only availability
+loss for legitimate holders of a confidential credential's proof.
 
 ---
 
@@ -385,6 +586,8 @@ fn test_oracle_attestation_flow() {
 | 13 | EmptyReason | Dispute reason bytes were empty |
 | 14 | ReasonTooLarge | Dispute reason exceeds MAX_REASON_SIZE (1 KB) |
 | 15 | InvalidThreshold | Dispute threshold must be greater than zero |
+| 16 | AccessDenied | Caller is not permitted to view this credential at its current privacy level |
+| 17 | VersionNotFound | No version exists with the given number for this credential (never recorded, or since pruned) |
 
 ---
 
