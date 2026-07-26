@@ -1,8 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
-    Bytes, BytesN, Env, Vec,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short,
+    xdr::FromXdr, Address, Bytes, BytesN, Env,
 };
 
 pub const MAX_PROOF_SIZE: u32 = 4096;
@@ -16,9 +16,7 @@ pub const MAX_REASON_SIZE: u32 = 1024;
 pub const DEFAULT_DISPUTE_THRESHOLD: u32 = 3;
 
 const VERIFY_CLAIM_TOPIC: soroban_sdk::Symbol = symbol_short!("vfy_claim");
-const DISPUTE_OPEN_TOPIC: soroban_sdk::Symbol = symbol_short!("disp_open");
-const DISPUTE_VOTE_TOPIC: soroban_sdk::Symbol = symbol_short!("disp_vote");
-const DISPUTE_RESOLVED_TOPIC: soroban_sdk::Symbol = symbol_short!("disp_res");
+const VERIFY_CONDITIONAL_TOPIC: soroban_sdk::Symbol = symbol_short!("vfy_cond");
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -38,23 +36,31 @@ pub enum VerifierError {
     NotInitialized = 6,
     /// The oracle address is not registered.
     OracleNotFound = 7,
-    /// No credential exists with the given id.
-    CredentialNotFound = 8,
-    /// No dispute exists with the given id.
-    DisputeNotFound = 9,
-    /// The dispute has already been resolved and no longer accepts votes.
-    DisputeNotOpen = 10,
-    /// This voter has already cast a vote on this dispute.
-    AlreadyVoted = 11,
-    /// A dispute is already open for this credential; wait for it to resolve
-    /// before filing another.
-    DisputeAlreadyOpen = 12,
-    /// Dispute reason bytes were empty.
-    EmptyReason = 13,
-    /// Dispute reason bytes exceed MAX_REASON_SIZE.
-    ReasonTooLarge = 14,
-    /// Threshold must be greater than zero.
-    InvalidThreshold = 15,
+    /// `proof` could not be decoded as a `ConditionalProof`.
+    MalformedConditionalProof = 8,
+}
+
+/// The on-chain format for a conditional ("prove X if Y, else prove Z")
+/// proof, encoded into the opaque `proof: Bytes` argument of
+/// [`ZkVerifierContract::verify_conditional_proof`] via XDR.
+///
+/// The condition `Y` is the caller-supplied `condition` claim; this bundle
+/// carries the proof for `Y` plus both branches' claim/proof pairs so the
+/// contract itself — not the caller — decides and checks which branch
+/// applies, exactly once `Y`'s truth is established from oracle attestation.
+#[contracttype]
+#[derive(Clone)]
+pub struct ConditionalProof {
+    /// Proof that the `condition` claim (`Y`) holds.
+    pub condition_proof: Bytes,
+    /// Claim `X`, checked when the condition is true.
+    pub then_claim: Bytes,
+    /// Proof that claim `X` holds.
+    pub then_proof: Bytes,
+    /// Claim `Z`, checked when the condition is false.
+    pub else_claim: Bytes,
+    /// Proof that claim `Z` holds.
+    pub else_proof: Bytes,
 }
 
 /// Storage key discriminants.
@@ -244,40 +250,8 @@ impl ZkVerifierContract {
     /// Emits a `vfy_claim` event with `(result, claim_hash)` on every call
     /// that passes input validation.
     pub fn verify_claim(env: Env, proof: Bytes, claim: Bytes) -> bool {
-        if proof.is_empty() {
-            panic_with_error!(&env, VerifierError::EmptyProof);
-        }
-        if proof.len() > MAX_PROOF_SIZE {
-            panic_with_error!(&env, VerifierError::ProofTooLarge);
-        }
-        if claim.is_empty() {
-            panic_with_error!(&env, VerifierError::EmptyClaim);
-        }
-        if claim.len() > MAX_CLAIM_SIZE {
-            panic_with_error!(&env, VerifierError::ClaimTooLarge);
-        }
-
-        let proof_hash: BytesN<32> = env.crypto().sha256(&proof).into();
         let claim_hash: BytesN<32> = env.crypto().sha256(&claim).into();
-
-        let result = env
-            .storage()
-            .instance()
-            .get::<DataKey, AttestationRecord>(&DataKey::Attestation(proof_hash, claim_hash.clone()))
-            .map(|record| {
-                let oracle_ok = env
-                    .storage()
-                    .instance()
-                    .get::<DataKey, bool>(&DataKey::Oracle(record.oracle))
-                    .unwrap_or(false);
-                let not_invalidated = !env
-                    .storage()
-                    .instance()
-                    .get::<DataKey, bool>(&DataKey::CredentialInvalidated(record.credential_id))
-                    .unwrap_or(false);
-                oracle_ok && not_invalidated
-            })
-            .unwrap_or(false);
+        let result = Self::verify_internal(&env, &proof, &claim);
 
         env.events()
             .publish((VERIFY_CLAIM_TOPIC,), (result, claim_hash));
@@ -285,193 +259,43 @@ impl ZkVerifierContract {
         result
     }
 
-    /// Files a dispute challenging the validity of `credential_id`. Anyone
-    /// may initiate a dispute (resolution, not initiation, is the trust
-    /// boundary) — `initiator` just needs to authorize the call so the
-    /// recorded initiator cannot be spoofed.
+    /// Verifies a conditional ("prove X if Y, else prove Z") proof.
     ///
-    /// Only one dispute may be open against a given credential at a time;
-    /// file a fresh one once the prior dispute resolves. Returns the new
-    /// `dispute_id`.
-    pub fn initiate_credential_dispute(
-        env: Env,
-        credential_id: u64,
-        initiator: Address,
-        reason: Bytes,
-    ) -> u64 {
-        if reason.is_empty() {
-            panic_with_error!(&env, VerifierError::EmptyReason);
-        }
-        if reason.len() > MAX_REASON_SIZE {
-            panic_with_error!(&env, VerifierError::ReasonTooLarge);
-        }
-        if !env
-            .storage()
-            .instance()
-            .has(&DataKey::CredentialHashes(credential_id))
-        {
-            panic_with_error!(&env, VerifierError::CredentialNotFound);
-        }
-        if env
-            .storage()
-            .instance()
-            .has(&DataKey::CredentialOpenDispute(credential_id))
-        {
-            panic_with_error!(&env, VerifierError::DisputeAlreadyOpen);
-        }
-        initiator.require_auth();
+    /// `condition` is claim `Y`. `proof` is the XDR encoding of a
+    /// [`ConditionalProof`] bundle carrying the proof for `Y` plus both
+    /// branches. The condition is checked first via the same oracle
+    /// attestation model as [`Self::verify_claim`]; the contract then
+    /// verifies the `then` branch if the condition holds, or the `else`
+    /// branch otherwise — the caller cannot pick a branch that skips the
+    /// condition check.
+    ///
+    /// Returns `false` (does not panic) when the condition or the selected
+    /// branch is unattested; panics with `MalformedConditionalProof` if
+    /// `proof` is not a valid `ConditionalProof` encoding.
+    ///
+    /// Emits a `vfy_cond` event with `(result, condition_result, claim_hash)`
+    /// of the branch that was checked.
+    pub fn verify_conditional_proof(env: Env, proof: Bytes, condition: Bytes) -> bool {
+        let bundle = ConditionalProof::from_xdr(&env, &proof)
+            .unwrap_or_else(|_| panic_with_error!(&env, VerifierError::MalformedConditionalProof));
 
-        let dispute_id = env
-            .storage()
-            .instance()
-            .get::<DataKey, u64>(&DataKey::DisputeCount)
-            .unwrap_or(0)
-            + 1;
-        env.storage()
-            .instance()
-            .set(&DataKey::DisputeCount, &dispute_id);
+        let condition_result = Self::verify_internal(&env, &bundle.condition_proof, &condition);
 
-        let created_at = env.ledger().timestamp();
-        let dispute = Dispute {
-            id: dispute_id,
-            credential_id,
-            initiator: initiator.clone(),
-            reason,
-            status: DisputeStatus::Open,
-            votes_for: 0,
-            votes_against: 0,
-            created_at,
-            resolved_at: 0,
+        let (branch_proof, branch_claim) = if condition_result {
+            (bundle.then_proof, bundle.then_claim)
+        } else {
+            (bundle.else_proof, bundle.else_claim)
         };
-        env.storage()
-            .instance()
-            .set(&DataKey::DisputeRecord(dispute_id), &dispute);
-        env.storage()
-            .instance()
-            .set(&DataKey::CredentialOpenDispute(credential_id), &dispute_id);
 
-        let mut history = Self::get_credential_disputes(env.clone(), credential_id);
-        history.push_back(dispute_id);
-        env.storage()
-            .instance()
-            .set(&DataKey::CredentialDisputeHistory(credential_id), &history);
+        let claim_hash: BytesN<32> = env.crypto().sha256(&branch_claim).into();
+        let result = Self::verify_internal(&env, &branch_proof, &branch_claim);
 
         env.events().publish(
-            (DISPUTE_OPEN_TOPIC,),
-            (dispute_id, credential_id, initiator),
+            (VERIFY_CONDITIONAL_TOPIC,),
+            (result, condition_result, claim_hash),
         );
 
-        dispute_id
-    }
-
-    /// Casts a registered oracle's vote on an open dispute. `vote = true`
-    /// asserts the credential is invalid; `vote = false` asserts it remains
-    /// valid. Each oracle may vote once per dispute.
-    ///
-    /// Once either side reaches the configured threshold (see
-    /// [`Self::set_dispute_threshold`]), the dispute resolves immediately:
-    /// on `Upheld`, the credential is marked invalidated and `verify_claim`
-    /// will return `false` for it going forward regardless of oracle status.
-    pub fn vote_on_dispute(env: Env, dispute_id: u64, voter: Address, vote: bool) {
-        let mut dispute: Dispute = env
-            .storage()
-            .instance()
-            .get(&DataKey::DisputeRecord(dispute_id))
-            .unwrap_or_else(|| panic_with_error!(&env, VerifierError::DisputeNotFound));
-        if dispute.status != DisputeStatus::Open {
-            panic_with_error!(&env, VerifierError::DisputeNotOpen);
-        }
-        Self::require_registered_oracle(&env, &voter);
-        voter.require_auth();
-
-        let vote_key = DataKey::DisputeVote(dispute_id, voter);
-        if env.storage().instance().has(&vote_key) {
-            panic_with_error!(&env, VerifierError::AlreadyVoted);
-        }
-        env.storage().instance().set(&vote_key, &vote);
-
-        if vote {
-            dispute.votes_for += 1;
-        } else {
-            dispute.votes_against += 1;
-        }
-
-        let threshold = Self::dispute_threshold(env.clone());
-        if dispute.votes_for >= threshold {
-            dispute.status = DisputeStatus::Upheld;
-        } else if dispute.votes_against >= threshold {
-            dispute.status = DisputeStatus::Rejected;
-        }
-
-        if dispute.status != DisputeStatus::Open {
-            dispute.resolved_at = env.ledger().timestamp();
-            env.storage()
-                .instance()
-                .remove(&DataKey::CredentialOpenDispute(dispute.credential_id));
-            if dispute.status == DisputeStatus::Upheld {
-                env.storage()
-                    .instance()
-                    .set(&DataKey::CredentialInvalidated(dispute.credential_id), &true);
-            }
-            env.events().publish(
-                (DISPUTE_RESOLVED_TOPIC,),
-                (dispute_id, dispute.credential_id, dispute.status),
-            );
-        }
-
-        env.events()
-            .publish((DISPUTE_VOTE_TOPIC,), (dispute_id, vote));
-
-        env.storage()
-            .instance()
-            .set(&DataKey::DisputeRecord(dispute_id), &dispute);
-    }
-
-    /// Returns the full record for a dispute.
-    pub fn get_dispute(env: Env, dispute_id: u64) -> Dispute {
-        env.storage()
-            .instance()
-            .get(&DataKey::DisputeRecord(dispute_id))
-            .unwrap_or_else(|| panic_with_error!(&env, VerifierError::DisputeNotFound))
-    }
-
-    /// Returns the ids of every dispute ever filed against `credential_id`,
-    /// oldest first.
-    pub fn get_credential_disputes(env: Env, credential_id: u64) -> Vec<u64> {
-        env.storage()
-            .instance()
-            .get(&DataKey::CredentialDisputeHistory(credential_id))
-            .unwrap_or_else(|| Vec::new(&env))
-    }
-
-    /// Returns whether `credential_id` has been invalidated by an upheld
-    /// dispute.
-    pub fn is_credential_invalidated(env: Env, credential_id: u64) -> bool {
-        env.storage()
-            .instance()
-            .get::<DataKey, bool>(&DataKey::CredentialInvalidated(credential_id))
-            .unwrap_or(false)
-    }
-
-    /// Returns the number of concurring votes required to resolve a
-    /// dispute.
-    pub fn dispute_threshold(env: Env) -> u32 {
-        env.storage()
-            .instance()
-            .get(&DataKey::DisputeThreshold)
-            .unwrap_or(DEFAULT_DISPUTE_THRESHOLD)
-    }
-
-    /// Sets the number of concurring votes required to resolve a dispute.
-    /// Admin only.
-    pub fn set_dispute_threshold(env: Env, threshold: u32) {
-        Self::require_admin(&env);
-        if threshold == 0 {
-            panic_with_error!(&env, VerifierError::InvalidThreshold);
-        }
-        env.storage()
-            .instance()
-            .set(&DataKey::DisputeThreshold, &threshold);
+        result
     }
 
     // ---- helpers ----
@@ -485,15 +309,39 @@ impl ZkVerifierContract {
         admin.require_auth();
     }
 
-    fn require_registered_oracle(env: &Env, oracle: &Address) {
-        if !env
-            .storage()
-            .instance()
-            .get::<DataKey, bool>(&DataKey::Oracle(oracle.clone()))
-            .unwrap_or(false)
-        {
-            panic_with_error!(env, VerifierError::OracleNotFound);
+    /// Validates size/emptiness constraints on `proof`/`claim`, then looks
+    /// up whether a currently-registered oracle has attested this exact
+    /// pair. Shared by [`Self::verify_claim`] and
+    /// [`Self::verify_conditional_proof`] so both branch checks and the
+    /// top-level claim check apply identical validation and revocation
+    /// semantics.
+    fn verify_internal(env: &Env, proof: &Bytes, claim: &Bytes) -> bool {
+        if proof.is_empty() {
+            panic_with_error!(env, VerifierError::EmptyProof);
         }
+        if proof.len() > MAX_PROOF_SIZE {
+            panic_with_error!(env, VerifierError::ProofTooLarge);
+        }
+        if claim.is_empty() {
+            panic_with_error!(env, VerifierError::EmptyClaim);
+        }
+        if claim.len() > MAX_CLAIM_SIZE {
+            panic_with_error!(env, VerifierError::ClaimTooLarge);
+        }
+
+        let proof_hash: BytesN<32> = env.crypto().sha256(proof).into();
+        let claim_hash: BytesN<32> = env.crypto().sha256(claim).into();
+
+        env.storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Attestation(proof_hash, claim_hash))
+            .map(|attesting_oracle| {
+                env.storage()
+                    .instance()
+                    .get::<DataKey, bool>(&DataKey::Oracle(attesting_oracle))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
     }
 }
 
