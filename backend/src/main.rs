@@ -16,6 +16,7 @@ use ethos_protocol_backend::{
         create_audit_store, create_event_store, create_share_store, create_share_token_store,
         create_vault_store, AppState, Db, PoolConfig,
     },
+    feature_flags::{evaluate_flag_handler, get_flag, list_flags, upsert_flag, FlagState},
     graphql::{build_schema, graphql_handler, graphql_playground},
     routes, scheduler,
     streaming::{stream_events, stream_vaults},
@@ -122,6 +123,10 @@ pub fn build_router(state: AppState) -> Router {
         // ── Streaming routes (#67) ───────────────────────────────────────────
         .route("/stream/vaults", get(stream_vaults))
         .route("/stream/events", get(stream_events))
+        // ── Feature flag admin routes ────────────────────────────────────────
+        .route("/admin/flags", post(upsert_flag).get(list_flags))
+        .route("/admin/flags/:key", get(get_flag))
+        .route("/admin/flags/:key/evaluate", post(evaluate_flag_handler))
         .layer(build_cors_layer())
         .with_state(state)
 }
@@ -196,6 +201,7 @@ async fn main() {
         consensus,
         webhook_state: Arc::new(WebhookState::new()),
         graphql_schema,
+        flag_state: Arc::new(FlagState::new()),
     };
 
     let app = build_router(state);
