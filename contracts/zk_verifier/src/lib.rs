@@ -7,6 +7,13 @@ use soroban_sdk::{
 
 pub const MAX_PROOF_SIZE: u32 = 4096;
 pub const MAX_CLAIM_SIZE: u32 = 1024;
+/// Maximum size of a dispute's `reason` bytes, mirroring MAX_CLAIM_SIZE so a
+/// dispute cannot be used to smuggle unbounded data onto the ledger.
+pub const MAX_REASON_SIZE: u32 = 1024;
+/// Number of concurring oracle votes required to resolve a dispute (either
+/// upholding or rejecting it) when no explicit threshold has been configured
+/// by the admin via [`ZkVerifierContract::set_dispute_threshold`].
+pub const DEFAULT_DISPUTE_THRESHOLD: u32 = 3;
 
 const VERIFY_CLAIM_TOPIC: soroban_sdk::Symbol = symbol_short!("vfy_claim");
 const VERIFY_CONDITIONAL_TOPIC: soroban_sdk::Symbol = symbol_short!("vfy_cond");
@@ -64,12 +71,71 @@ mod keys {
     pub enum DataKey {
         Admin,
         Oracle(Address),
-        /// Attestation: (proof_sha256, claim_sha256) -> attesting oracle
+        /// Attestation: (proof_sha256, claim_sha256) -> AttestationRecord
         Attestation(BytesN<32>, BytesN<32>),
+        /// Incrementing generation counter for credential ids.
+        CredentialCount,
+        /// credential_id -> (proof_sha256, claim_sha256), the reverse of
+        /// `Attestation`, so a credential can be looked up by id.
+        CredentialHashes(u64),
+        /// Present (and true) once a dispute against this credential has
+        /// been upheld; absence means the credential is not disputed-invalid.
+        CredentialInvalidated(u64),
+        /// credential_id -> dispute_id of the currently open dispute against
+        /// it, if any. Cleared once that dispute resolves.
+        CredentialOpenDispute(u64),
+        /// credential_id -> Vec<dispute_id>, full dispute history.
+        CredentialDisputeHistory(u64),
+        /// Incrementing generation counter for dispute ids.
+        DisputeCount,
+        DisputeRecord(u64),
+        /// (dispute_id, voter) -> vote cast, used to prevent double-voting.
+        DisputeVote(u64, Address),
+        /// Number of concurring votes needed to resolve a dispute. Falls
+        /// back to DEFAULT_DISPUTE_THRESHOLD when unset.
+        DisputeThreshold,
     }
 }
 
 use keys::DataKey;
+
+/// A stored oracle attestation, now addressable by a stable `credential_id`
+/// in addition to the `(proof_hash, claim_hash)` pair used by `verify_claim`.
+#[contracttype]
+#[derive(Clone)]
+pub struct AttestationRecord {
+    pub credential_id: u64,
+    pub oracle: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DisputeStatus {
+    /// Open for voting.
+    Open,
+    /// Threshold of "invalid" votes reached; the credential is now treated
+    /// as invalid by `verify_claim`.
+    Upheld,
+    /// Threshold of "valid" votes reached; the credential remains valid.
+    Rejected,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct Dispute {
+    pub id: u64,
+    pub credential_id: u64,
+    pub initiator: Address,
+    pub reason: Bytes,
+    pub status: DisputeStatus,
+    /// Votes asserting the credential is invalid.
+    pub votes_for: u32,
+    /// Votes asserting the credential remains valid.
+    pub votes_against: u32,
+    pub created_at: u64,
+    /// Ledger timestamp of resolution, or 0 while still Open.
+    pub resolved_at: u64,
+}
 
 #[contract]
 pub struct ZkVerifierContract;
@@ -110,28 +176,53 @@ impl ZkVerifierContract {
     /// An oracle publishes an attestation that `proof` is valid for `claim`.
     ///
     /// The contract stores the SHA-256 digests of both byte strings so that
-    /// the full proof bytes are not stored on-chain.
-    pub fn attest(env: Env, oracle: Address, proof: Bytes, claim: Bytes) {
+    /// the full proof bytes are not stored on-chain. Returns the stable
+    /// `credential_id` for this `(proof, claim)` pair — a fresh id the first
+    /// time it is attested, or the existing id if it was attested before
+    /// (e.g. by a different oracle, or re-attested after a dispute).
+    pub fn attest(env: Env, oracle: Address, proof: Bytes, claim: Bytes) -> u64 {
         if proof.is_empty() {
             panic_with_error!(&env, VerifierError::EmptyProof);
         }
         if claim.is_empty() {
             panic_with_error!(&env, VerifierError::EmptyClaim);
         }
-        if !env
-            .storage()
-            .instance()
-            .get::<DataKey, bool>(&DataKey::Oracle(oracle.clone()))
-            .unwrap_or(false)
-        {
-            panic_with_error!(&env, VerifierError::OracleNotFound);
-        }
+        Self::require_registered_oracle(&env, &oracle);
         oracle.require_auth();
         let proof_hash: BytesN<32> = env.crypto().sha256(&proof).into();
         let claim_hash: BytesN<32> = env.crypto().sha256(&claim).into();
-        env.storage()
+
+        let attestation_key = DataKey::Attestation(proof_hash.clone(), claim_hash.clone());
+        let credential_id = match env
+            .storage()
             .instance()
-            .set(&DataKey::Attestation(proof_hash, claim_hash), &oracle);
+            .get::<DataKey, AttestationRecord>(&attestation_key)
+        {
+            Some(existing) => existing.credential_id,
+            None => {
+                let id = env
+                    .storage()
+                    .instance()
+                    .get::<DataKey, u64>(&DataKey::CredentialCount)
+                    .unwrap_or(0)
+                    + 1;
+                env.storage().instance().set(&DataKey::CredentialCount, &id);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::CredentialHashes(id), &(proof_hash, claim_hash));
+                id
+            }
+        };
+
+        env.storage().instance().set(
+            &attestation_key,
+            &AttestationRecord {
+                credential_id,
+                oracle,
+            },
+        );
+
+        credential_id
     }
 
     /// Verifies a zero-knowledge proof against a claim using oracle attestation.
@@ -152,8 +243,9 @@ impl ZkVerifierContract {
     /// its attestation records.
     ///
     /// Returns `false` (does not panic) when no matching attestation exists,
-    /// or when the attesting oracle is no longer registered — both are normal
-    /// "not verified" outcomes.
+    /// when the attesting oracle is no longer registered, or when the
+    /// credential has been invalidated by an upheld dispute (see
+    /// [`Self::vote_on_dispute`]) — all are normal "not verified" outcomes.
     ///
     /// Emits a `vfy_claim` event with `(result, claim_hash)` on every call
     /// that passes input validation.

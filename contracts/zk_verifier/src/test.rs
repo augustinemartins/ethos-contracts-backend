@@ -234,3 +234,257 @@ fn test_verify_claim_emits_event_on_false_result() {
     assert!(!result);
     assert_eq!(env.events().all().len(), 1);
 }
+
+// ── Credential dispute tests ──────────────────────────────────────────────────
+
+/// Registers `n` fresh oracles and returns them.
+fn register_oracles(env: &Env, client: &ZkVerifierContractClient<'static>, n: u32) -> Vec<Address> {
+    let mut oracles = Vec::new(env);
+    for _ in 0..n {
+        let oracle = Address::generate(env);
+        client.register_oracle(&oracle);
+        oracles.push_back(oracle);
+    }
+    oracles
+}
+
+/// attest() returns a stable credential_id, starting at 1.
+#[test]
+fn test_attest_returns_credential_id() {
+    let (env, _, client) = setup();
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+    let credential_id = client.attest(&oracle, &proof, &claim);
+    assert_eq!(credential_id, 1);
+
+    // Re-attesting the same (proof, claim) reuses the same credential id.
+    let credential_id_again = client.attest(&oracle, &proof, &claim);
+    assert_eq!(credential_id_again, 1);
+
+    // A distinct (proof, claim) pair gets a new id.
+    let other_claim = bytes!(&env, 0x1234);
+    let other_id = client.attest(&oracle, &proof, &other_claim);
+    assert_eq!(other_id, 2);
+}
+
+/// Disputing a credential id that was never attested must panic.
+#[test]
+#[should_panic(expected = "Error(Contract, #8)")]
+fn test_dispute_unknown_credential_panics() {
+    let (env, _, client) = setup();
+    let initiator = Address::generate(&env);
+    let reason = bytes!(&env, 0xaa);
+    client.initiate_credential_dispute(&999u64, &initiator, &reason);
+}
+
+/// An empty dispute reason must panic.
+#[test]
+#[should_panic(expected = "Error(Contract, #13)")]
+fn test_dispute_empty_reason_panics() {
+    let (env, _, client) = setup();
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+    let credential_id = client.attest(&oracle, &proof, &claim);
+
+    let initiator = Address::generate(&env);
+    let reason = bytes!(&env,);
+    client.initiate_credential_dispute(&credential_id, &initiator, &reason);
+}
+
+/// Filing a second dispute while one is still open must panic.
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")]
+fn test_duplicate_open_dispute_panics() {
+    let (env, _, client) = setup();
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+    let credential_id = client.attest(&oracle, &proof, &claim);
+
+    let initiator = Address::generate(&env);
+    let reason = bytes!(&env, 0xaa);
+    client.initiate_credential_dispute(&credential_id, &initiator, &reason);
+    client.initiate_credential_dispute(&credential_id, &initiator, &reason);
+}
+
+/// A non-oracle address must not be able to vote.
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_non_oracle_cannot_vote() {
+    let (env, _, client) = setup();
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+    let credential_id = client.attest(&oracle, &proof, &claim);
+
+    let initiator = Address::generate(&env);
+    let reason = bytes!(&env, 0xaa);
+    let dispute_id = client.initiate_credential_dispute(&credential_id, &initiator, &reason);
+
+    let rogue = Address::generate(&env);
+    client.vote_on_dispute(&dispute_id, &rogue, &true);
+}
+
+/// The same oracle voting twice on one dispute must panic.
+#[test]
+#[should_panic(expected = "Error(Contract, #11)")]
+fn test_double_vote_panics() {
+    let (env, _, client) = setup();
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+    let credential_id = client.attest(&oracle, &proof, &claim);
+
+    let initiator = Address::generate(&env);
+    let reason = bytes!(&env, 0xaa);
+    let dispute_id = client.initiate_credential_dispute(&credential_id, &initiator, &reason);
+
+    client.vote_on_dispute(&dispute_id, &oracle, &true);
+    client.vote_on_dispute(&dispute_id, &oracle, &false);
+}
+
+/// Voting on an already-resolved dispute must panic.
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")]
+fn test_vote_after_resolution_panics() {
+    let (env, _, client) = setup();
+    let oracles = register_oracles(&env, &client, 3);
+    let attester = oracles.get(0).unwrap();
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+    let credential_id = client.attest(&attester, &proof, &claim);
+
+    let initiator = Address::generate(&env);
+    let reason = bytes!(&env, 0xaa);
+    let dispute_id = client.initiate_credential_dispute(&credential_id, &initiator, &reason);
+
+    for oracle in oracles.iter() {
+        client.vote_on_dispute(&dispute_id, &oracle, &true);
+    }
+    assert_eq!(client.get_dispute(&dispute_id).status, DisputeStatus::Upheld);
+
+    // A fourth registered oracle tries to vote after resolution.
+    let late_oracle = Address::generate(&env);
+    client.register_oracle(&late_oracle);
+    client.vote_on_dispute(&dispute_id, &late_oracle, &true);
+}
+
+/// Reaching the "invalid" vote threshold upholds the dispute, invalidates
+/// the credential, and verify_claim must flip to false even though the
+/// original attesting oracle is still registered.
+#[test]
+fn test_dispute_upheld_invalidates_credential() {
+    let (env, _, client) = setup();
+    let oracles = register_oracles(&env, &client, 3);
+    let attester = oracles.get(0).unwrap();
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+    let credential_id = client.attest(&attester, &proof, &claim);
+    assert!(client.verify_claim(&proof, &claim));
+
+    let initiator = Address::generate(&env);
+    let reason = bytes!(&env, 0xaa);
+    let dispute_id = client.initiate_credential_dispute(&credential_id, &initiator, &reason);
+
+    for oracle in oracles.iter() {
+        client.vote_on_dispute(&dispute_id, &oracle, &true);
+    }
+
+    let dispute = client.get_dispute(&dispute_id);
+    assert_eq!(dispute.status, DisputeStatus::Upheld);
+    assert_eq!(dispute.votes_for, 3);
+    assert!(client.is_credential_invalidated(&credential_id));
+    // The attester was never revoked, but the dispute still invalidates it.
+    assert!(client.is_oracle(&attester));
+    assert!(!client.verify_claim(&proof, &claim));
+}
+
+/// Reaching the "valid" vote threshold rejects the dispute and leaves the
+/// credential honored by verify_claim.
+#[test]
+fn test_dispute_rejected_credential_stays_valid() {
+    let (env, _, client) = setup();
+    let oracles = register_oracles(&env, &client, 3);
+    let attester = oracles.get(0).unwrap();
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+    let credential_id = client.attest(&attester, &proof, &claim);
+
+    let initiator = Address::generate(&env);
+    let reason = bytes!(&env, 0xaa);
+    let dispute_id = client.initiate_credential_dispute(&credential_id, &initiator, &reason);
+
+    for oracle in oracles.iter() {
+        client.vote_on_dispute(&dispute_id, &oracle, &false);
+    }
+
+    let dispute = client.get_dispute(&dispute_id);
+    assert_eq!(dispute.status, DisputeStatus::Rejected);
+    assert!(!client.is_credential_invalidated(&credential_id));
+    assert!(client.verify_claim(&proof, &claim));
+}
+
+/// A resolved dispute clears the "open dispute" lock, and dispute history
+/// for the credential accumulates every filed dispute.
+#[test]
+fn test_credential_dispute_history_tracks_all_disputes() {
+    let (env, _, client) = setup();
+    let oracles = register_oracles(&env, &client, 3);
+    let attester = oracles.get(0).unwrap();
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+    let credential_id = client.attest(&attester, &proof, &claim);
+
+    let initiator = Address::generate(&env);
+    let reason = bytes!(&env, 0xaa);
+
+    let first = client.initiate_credential_dispute(&credential_id, &initiator, &reason);
+    for oracle in oracles.iter() {
+        client.vote_on_dispute(&first, &oracle, &false);
+    }
+
+    let second = client.initiate_credential_dispute(&credential_id, &initiator, &reason);
+
+    let history = client.get_credential_disputes(&credential_id);
+    assert_eq!(history.len(), 2);
+    assert_eq!(history.get(0).unwrap(), first);
+    assert_eq!(history.get(1).unwrap(), second);
+}
+
+/// Admin can lower the dispute threshold so fewer votes are needed to
+/// resolve; a non-default threshold of 1 resolves on the first vote.
+#[test]
+fn test_admin_configurable_dispute_threshold() {
+    let (env, _admin, client) = setup();
+    client.set_dispute_threshold(&1u32);
+    assert_eq!(client.dispute_threshold(), 1u32);
+
+    let oracle = Address::generate(&env);
+    client.register_oracle(&oracle);
+    let proof = bytes!(&env, 0xdeadbeef);
+    let claim = bytes!(&env, 0xcafebabe);
+    let credential_id = client.attest(&oracle, &proof, &claim);
+
+    let initiator = Address::generate(&env);
+    let reason = bytes!(&env, 0xaa);
+    let dispute_id = client.initiate_credential_dispute(&credential_id, &initiator, &reason);
+
+    client.vote_on_dispute(&dispute_id, &oracle, &true);
+    assert_eq!(client.get_dispute(&dispute_id).status, DisputeStatus::Upheld);
+}
+
+/// A zero threshold is rejected.
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn test_zero_threshold_rejected() {
+    let (_, _, client) = setup();
+    client.set_dispute_threshold(&0u32);
+}

@@ -39,10 +39,34 @@ pub fn revoke_oracle(env: Env, oracle: Address)
 pub fn is_oracle(env: Env, oracle: Address) -> bool
 
 /// An oracle publishes an attestation that `proof` is valid for `claim`.
-pub fn attest(env: Env, oracle: Address, proof: Bytes, claim: Bytes)
+/// Returns the attestation's stable credential_id.
+pub fn attest(env: Env, oracle: Address, proof: Bytes, claim: Bytes) -> u64
 
 /// Verifies a zero-knowledge proof against a claim using oracle attestation.
 pub fn verify_claim(env: Env, proof: Bytes, claim: Bytes) -> bool
+
+/// Files a dispute against a credential (an attestation, addressed by the
+/// id returned from `attest`). Returns the new dispute_id.
+pub fn initiate_credential_dispute(env: Env, credential_id: u64, initiator: Address, reason: Bytes) -> u64
+
+/// A registered oracle votes on an open dispute: `true` asserts the
+/// credential is invalid, `false` asserts it remains valid.
+pub fn vote_on_dispute(env: Env, dispute_id: u64, voter: Address, vote: bool)
+
+/// Returns the full record for a dispute.
+pub fn get_dispute(env: Env, dispute_id: u64) -> Dispute
+
+/// Returns every dispute id ever filed against a credential, oldest first.
+pub fn get_credential_disputes(env: Env, credential_id: u64) -> Vec<u64>
+
+/// Returns whether a credential has been invalidated by an upheld dispute.
+pub fn is_credential_invalidated(env: Env, credential_id: u64) -> bool
+
+/// Returns the number of concurring oracle votes needed to resolve a dispute.
+pub fn dispute_threshold(env: Env) -> u32
+
+/// Sets the number of concurring oracle votes needed to resolve a dispute. Admin only.
+pub fn set_dispute_threshold(env: Env, threshold: u32)
 ```
 
 ### Current Verification Logic
@@ -77,6 +101,38 @@ The `verify_claim` function:
 | **Oracle Trust Model** | Attestations stored but not used | Malicious oracles can bypass checks |
 | **Claim Authentication** | Stored as SHA-256 digest only | No binding between claim and proof |
 | **Replay Protection** | None | Same proof/claim can be reused indefinitely |
+
+---
+
+## Credential Dispute Resolution
+
+Oracle attestations are, in effect, credentials asserting that a `(proof,
+claim)` pair is valid. Trust in a single attesting oracle is not always
+enough — `attest` now assigns every attestation a stable `credential_id`, and
+that credential can be formally disputed:
+
+1. **Initiate**: Anyone may call `initiate_credential_dispute(credential_id,
+   initiator, reason)` to challenge a credential. Only one dispute may be
+   open per credential at a time. Returns a `dispute_id`.
+2. **Vote**: Registered oracles call `vote_on_dispute(dispute_id, voter,
+   vote)` — `vote = true` asserts the credential is invalid, `vote = false`
+   asserts it remains valid. Each oracle gets one vote per dispute.
+3. **Resolve**: Once either side reaches `dispute_threshold()` (default `3`,
+   configurable by the admin via `set_dispute_threshold`), the dispute
+   resolves automatically:
+   - **Upheld** (invalid votes win): the credential is marked invalidated.
+     `verify_claim` now returns `false` for it, even if the attesting oracle
+     is still registered.
+   - **Rejected** (valid votes win): the credential is unaffected; a new
+     dispute may be filed later if new evidence emerges.
+4. **History**: `get_credential_disputes(credential_id)` returns every
+   dispute ever filed against a credential, in order, so past challenges
+   remain auditable even after resolution.
+
+This is deliberately a lighter-weight trust mechanism than oracle
+registration itself — voting rights are tied to the existing oracle
+allowlist rather than a separate credential-dispute-specific role, so no new
+admin surface is introduced beyond the threshold setting.
 
 ---
 
@@ -319,8 +375,16 @@ fn test_oracle_attestation_flow() {
 | 3 | ProofTooLarge | Proof exceeds 4 KB |
 | 4 | ClaimTooLarge | Claim exceeds 1 KB |
 | 5 | AlreadyInitialized | Contract already initialized |
-| 6 | OracleNotFound | Oracle address not registered |
-| 7 | Unauthorized | Caller is not authorized |
+| 6 | NotInitialized | Contract has not been initialized |
+| 7 | OracleNotFound | Oracle address not registered (also used when a non-oracle attempts to vote) |
+| 8 | CredentialNotFound | No credential exists with the given id |
+| 9 | DisputeNotFound | No dispute exists with the given id |
+| 10 | DisputeNotOpen | The dispute has already been resolved |
+| 11 | AlreadyVoted | This oracle already voted on this dispute |
+| 12 | DisputeAlreadyOpen | A dispute is already open for this credential |
+| 13 | EmptyReason | Dispute reason bytes were empty |
+| 14 | ReasonTooLarge | Dispute reason exceeds MAX_REASON_SIZE (1 KB) |
+| 15 | InvalidThreshold | Dispute threshold must be greater than zero |
 
 ---
 
