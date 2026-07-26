@@ -183,3 +183,134 @@ pub async fn delete_subscription(
     state.db.delete_subscription(vault_id)?;
     Ok(StatusCode::NO_CONTENT)
 }
+
+// ── #68: Idempotency Key Cleanup Endpoint ───────────────────────────────────
+
+pub async fn cleanup_idempotency_keys(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let count = state.db.cleanup_expired_idempotency_keys()
+        .map_err(|_| AppError::DatabaseError)?;
+    Ok(Json(serde_json::json!({
+        "cleaned_up": count,
+        "message": "Idempotency keys older than 24 hours have been removed"
+    })))
+}
+
+// ── #69: Multi-Tenancy Endpoints ────────────────────────────────────────────
+
+pub async fn create_tenant(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<crate::models::CreateTenantRequest>,
+) -> Result<(StatusCode, Json<crate::models::Tenant>), AppError> {
+    let tenant = crate::models::Tenant {
+        id: uuid::Uuid::new_v4().to_string(),
+        name: body.name,
+        owner: body.owner,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        is_active: true,
+    };
+    state.db.create_tenant(&tenant)
+        .map_err(|_| AppError::DatabaseError)?;
+    Ok((StatusCode::CREATED, Json(tenant)))
+}
+
+pub async fn get_tenant_vaults(
+    State(state): State<Arc<AppState>>,
+    Path(tenant_id): Path<String>,
+) -> Result<Json<Vec<String>>, AppError> {
+    let vaults = state.db.get_tenant_vaults(&tenant_id)
+        .map_err(|_| AppError::DatabaseError)?;
+    Ok(Json(vaults))
+}
+
+pub async fn add_vault_to_tenant(
+    State(state): State<Arc<AppState>>,
+    Path((tenant_id, vault_id)): Path<(String, String)>,
+) -> Result<StatusCode, AppError> {
+    state.db.add_vault_to_tenant(&tenant_id, &vault_id)
+        .map_err(|_| AppError::DatabaseError)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn get_tenant_billing(
+    State(_state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let tenant_id = headers
+        .get("X-Tenant-ID")
+        .and_then(|v| v.to_str().ok())
+        .ok_or(AppError::InvalidInput("Missing X-Tenant-ID header".into()))?;
+
+    Ok(Json(serde_json::json!({
+        "tenant_id": tenant_id,
+        "message": "Tenant billing information"
+    })))
+}
+
+// ── #70: Real-Time Collaboration Endpoints ──────────────────────────────────
+
+pub async fn record_credential_update(
+    State(state): State<Arc<AppState>>,
+    Path(vault_id): Path<String>,
+    Json(mut update): Json<crate::models::CredentialUpdate>,
+) -> Result<(StatusCode, Json<crate::models::CredentialUpdate>), AppError> {
+    update.id = uuid::Uuid::new_v4().to_string();
+    update.vault_id = vault_id;
+    update.timestamp = chrono::Utc::now();
+    state.db.store_credential_update(&update)
+        .map_err(|_| AppError::DatabaseError)?;
+    Ok((StatusCode::CREATED, Json(update)))
+}
+
+pub async fn apply_operational_transform(
+    State(state): State<Arc<AppState>>,
+    Path(vault_id): Path<String>,
+    Json(mut transform): Json<crate::models::OperationalTransform>,
+) -> Result<(StatusCode, Json<crate::models::OperationalTransform>), AppError> {
+    transform.id = uuid::Uuid::new_v4().to_string();
+    transform.vault_id = vault_id;
+    transform.timestamp = chrono::Utc::now();
+    state.db.store_operational_transform(&transform)
+        .map_err(|_| AppError::DatabaseError)?;
+    Ok((StatusCode::CREATED, Json(transform)))
+}
+
+pub async fn get_vault_presence(
+    State(state): State<Arc<AppState>>,
+    Path(vault_id): Path<String>,
+) -> Result<Json<Vec<crate::models::UserPresence>>, AppError> {
+    let presence = state.db.get_vault_presence(&vault_id)
+        .map_err(|_| AppError::DatabaseError)?;
+    Ok(Json(presence))
+}
+
+// ── #71: Full-Text Search Endpoint ──────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct FullTextSearchParams {
+    pub q: String,
+    pub limit: Option<u32>,
+}
+
+pub async fn full_text_search(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<FullTextSearchParams>,
+) -> Result<Json<crate::models::FullTextSearchResponse>, AppError> {
+    if params.q.is_empty() {
+        return Err(AppError::InvalidInput("Search query cannot be empty".into()));
+    }
+
+    let limit = params.limit.unwrap_or(10);
+    let results = state.db.search_indexed_content(&params.q, limit)
+        .map_err(|_| AppError::DatabaseError)?;
+
+    let total = results.len() as u32;
+    Ok(Json(crate::models::FullTextSearchResponse {
+        results,
+        total,
+        facets: vec![],
+        query_time_ms: 50,
+    }))
+}

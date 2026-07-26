@@ -793,3 +793,131 @@ pub struct TwoFactorStatusResponse {
     pub phone: Option<String>,
     pub email: Option<String>,
 }
+
+// ── #69: Multi-Tenancy Support ──────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Tenant {
+    pub id: String,
+    pub name: String,
+    pub owner: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub is_active: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateTenantRequest {
+    pub name: String,
+    pub owner: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TenantBilling {
+    pub tenant_id: String,
+    pub monthly_charge: i128,
+    pub billing_cycle_start: DateTime<Utc>,
+    pub billing_cycle_end: DateTime<Utc>,
+    pub total_vaults: u32,
+    pub status: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TenantContext {
+    pub tenant_id: String,
+    pub user_id: String,
+}
+
+// ── #70: Real-Time Collaboration Features ───────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CredentialUpdate {
+    pub id: String,
+    pub vault_id: String,
+    pub user_id: String,
+    pub field: String,
+    pub old_value: serde_json::Value,
+    pub new_value: serde_json::Value,
+    pub timestamp: DateTime<Utc>,
+    pub operation_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperationalTransform {
+    pub id: String,
+    pub vault_id: String,
+    pub user_id: String,
+    pub operation: String,
+    pub position: u32,
+    pub content: String,
+    pub timestamp: DateTime<Utc>,
+    pub version: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConflictResolution {
+    pub conflict_id: String,
+    pub vault_id: String,
+    pub update1_id: String,
+    pub update2_id: String,
+    pub resolution_strategy: String,
+    pub resolved_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserPresence {
+    pub user_id: String,
+    pub vault_id: String,
+    pub status: String,
+    pub last_seen: DateTime<Utc>,
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollaborativeSession {
+    pub session_id: String,
+    pub vault_id: String,
+    pub created_at: DateTime<Utc>,
+    pub participants: Vec<String>,
+    pub is_active: bool,
+}
+
+// ── #71: Advanced Search with Full-Text Capabilities ──────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FullTextSearchQuery {
+    pub query: String,
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
+    pub filters: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchFacet {
+    pub name: String,
+    pub values: Vec<FacetValue>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FacetValue {
+    pub value: String,
+    pub count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FullTextSearchResult {
+    pub id: String,
+    pub vault_id: String,
+    pub title: String,
+    pub snippet: String,
+    pub relevance_score: f32,
+    pub matched_fields: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FullTextSearchResponse {
+    pub results: Vec<FullTextSearchResult>,
+    pub total: u32,
+    pub facets: Vec<SearchFacet>,
+    pub query_time_ms: u64,
+}

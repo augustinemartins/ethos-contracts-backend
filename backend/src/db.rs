@@ -733,6 +733,123 @@ impl Db {
                 );
                 ",
             ),
+            (
+                "6",
+                r"
+                CREATE TABLE IF NOT EXISTS tenants (
+                    id          TEXT PRIMARY KEY,
+                    name        TEXT NOT NULL,
+                    owner       TEXT NOT NULL,
+                    created_at  TEXT NOT NULL,
+                    updated_at  TEXT NOT NULL,
+                    is_active   INTEGER NOT NULL DEFAULT 1
+                );
+                CREATE TABLE IF NOT EXISTS tenant_billing (
+                    tenant_id            TEXT PRIMARY KEY,
+                    monthly_charge       INTEGER NOT NULL,
+                    billing_cycle_start  TEXT NOT NULL,
+                    billing_cycle_end    TEXT NOT NULL,
+                    total_vaults         INTEGER NOT NULL,
+                    status               TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS tenant_vaults (
+                    tenant_id   TEXT NOT NULL,
+                    vault_id    TEXT NOT NULL,
+                    PRIMARY KEY (tenant_id, vault_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_tenant_vaults_vault_id ON tenant_vaults(vault_id);
+                ",
+            ),
+            (
+                "7",
+                r"
+                CREATE TABLE IF NOT EXISTS credential_updates (
+                    id              TEXT PRIMARY KEY,
+                    vault_id        TEXT NOT NULL,
+                    user_id         TEXT NOT NULL,
+                    field           TEXT NOT NULL,
+                    old_value       TEXT,
+                    new_value       TEXT,
+                    timestamp       TEXT NOT NULL,
+                    operation_id    TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS operational_transforms (
+                    id              TEXT PRIMARY KEY,
+                    vault_id        TEXT NOT NULL,
+                    user_id         TEXT NOT NULL,
+                    operation       TEXT NOT NULL,
+                    position        INTEGER NOT NULL,
+                    content         TEXT NOT NULL,
+                    timestamp       TEXT NOT NULL,
+                    version         INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS conflict_resolutions (
+                    conflict_id         TEXT PRIMARY KEY,
+                    vault_id            TEXT NOT NULL,
+                    update1_id          TEXT NOT NULL,
+                    update2_id          TEXT NOT NULL,
+                    resolution_strategy TEXT NOT NULL,
+                    resolved_at         TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS user_presence (
+                    user_id     TEXT NOT NULL,
+                    vault_id    TEXT NOT NULL,
+                    status      TEXT NOT NULL,
+                    last_seen   TEXT NOT NULL,
+                    session_id  TEXT NOT NULL,
+                    PRIMARY KEY (user_id, vault_id)
+                );
+                CREATE TABLE IF NOT EXISTS collaborative_sessions (
+                    session_id  TEXT PRIMARY KEY,
+                    vault_id    TEXT NOT NULL,
+                    created_at  TEXT NOT NULL,
+                    participants TEXT NOT NULL,
+                    is_active   INTEGER NOT NULL DEFAULT 1
+                );
+                CREATE INDEX IF NOT EXISTS idx_operational_transforms_vault_id ON operational_transforms(vault_id);
+                CREATE INDEX IF NOT EXISTS idx_credential_updates_vault_id ON credential_updates(vault_id);
+                CREATE INDEX IF NOT EXISTS idx_collaborative_sessions_vault_id ON collaborative_sessions(vault_id);
+                ",
+            ),
+            (
+                "8",
+                r"
+                CREATE TABLE IF NOT EXISTS full_text_search_index (
+                    id          TEXT PRIMARY KEY,
+                    vault_id    TEXT NOT NULL,
+                    title       TEXT NOT NULL,
+                    content     TEXT NOT NULL,
+                    created_at  TEXT NOT NULL,
+                    indexed_at  TEXT NOT NULL
+                );
+                CREATE VIRTUAL TABLE IF NOT EXISTS vault_search_fts USING fts5(
+                    vault_id,
+                    title,
+                    content,
+                    content=full_text_search_index,
+                    content_rowid=rowid
+                );
+                CREATE TABLE IF NOT EXISTS search_facets (
+                    vault_id    TEXT NOT NULL,
+                    facet_name  TEXT NOT NULL,
+                    value       TEXT NOT NULL,
+                    count       INTEGER NOT NULL,
+                    PRIMARY KEY (vault_id, facet_name, value)
+                );
+                ",
+            ),
+            (
+                "9",
+                r"
+                CREATE TABLE IF NOT EXISTS idempotency_keys_cleanup (
+                    key           TEXT PRIMARY KEY,
+                    status_code   INTEGER NOT NULL,
+                    response_body TEXT NOT NULL,
+                    created_at    TEXT NOT NULL,
+                    expires_at    TEXT NOT NULL
+                );
+                ",
+            ),
         ];
 
         for (version, sql) in MIGRATIONS {
@@ -1309,6 +1426,300 @@ pub fn get_vault_summary_cached(
 /// a check-in or state-change event modifies vault state.
 pub fn invalidate_vault_cache(cache: &VaultCache, vault_id: &str) {
     cache.invalidate(vault_id);
+}
+
+impl Db {
+    // ── #68: Request Deduplication Cleanup ──────────────────────────────────
+
+    pub fn cleanup_expired_idempotency_keys(&self) -> Result<u64, rusqlite::Error> {
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(1);
+        let count = self.conn.lock().unwrap().execute(
+            "DELETE FROM idempotency_keys WHERE created_at < ?1",
+            params![cutoff.to_rfc3339()],
+        )?;
+        Ok(count as u64)
+    }
+
+    // ── #69: Multi-Tenancy Support ──────────────────────────────────────────
+
+    pub fn create_tenant(&self, tenant: &crate::models::Tenant) -> Result<(), rusqlite::Error> {
+        self.conn.lock().unwrap().execute(
+            r"INSERT INTO tenants (id, name, owner, created_at, updated_at, is_active)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                tenant.id,
+                tenant.name,
+                tenant.owner,
+                tenant.created_at.to_rfc3339(),
+                tenant.updated_at.to_rfc3339(),
+                if tenant.is_active { 1 } else { 0 }
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_tenant(&self, tenant_id: &str) -> Result<Option<crate::models::Tenant>, rusqlite::Error> {
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            "SELECT id, name, owner, created_at, updated_at, is_active FROM tenants WHERE id = ?1",
+        )?;
+
+        match stmt.query_row(params![tenant_id], |r| {
+            let created_at_str: String = r.get(3)?;
+            let created_at = chrono::DateTime::parse_from_rfc3339(&created_at_str)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e)))?;
+            let updated_at_str: String = r.get(4)?;
+            let updated_at = chrono::DateTime::parse_from_rfc3339(&updated_at_str)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e)))?;
+            let is_active_i: i64 = r.get(5)?;
+            Ok(crate::models::Tenant {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                owner: r.get(2)?,
+                created_at,
+                updated_at,
+                is_active: is_active_i != 0,
+            })
+        }) {
+            Ok(tenant) => Ok(Some(tenant)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn add_vault_to_tenant(&self, tenant_id: &str, vault_id: &str) -> Result<(), rusqlite::Error> {
+        self.conn.lock().unwrap().execute(
+            "INSERT OR IGNORE INTO tenant_vaults (tenant_id, vault_id) VALUES (?1, ?2)",
+            params![tenant_id, vault_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_tenant_vaults(&self, tenant_id: &str) -> Result<Vec<String>, rusqlite::Error> {
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            "SELECT vault_id FROM tenant_vaults WHERE tenant_id = ?1",
+        )?;
+        let iter = stmt.query_map(params![tenant_id], |r| r.get(0))?;
+        let mut vaults = Vec::new();
+        for vault_result in iter {
+            vaults.push(vault_result?);
+        }
+        Ok(vaults)
+    }
+
+    pub fn upsert_tenant_billing(&self, billing: &crate::models::TenantBilling) -> Result<(), rusqlite::Error> {
+        self.conn.lock().unwrap().execute(
+            r"INSERT OR REPLACE INTO tenant_billing (tenant_id, monthly_charge, billing_cycle_start, billing_cycle_end, total_vaults, status)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                billing.tenant_id,
+                billing.monthly_charge,
+                billing.billing_cycle_start.to_rfc3339(),
+                billing.billing_cycle_end.to_rfc3339(),
+                billing.total_vaults as i64,
+                billing.status
+            ],
+        )?;
+        Ok(())
+    }
+
+    // ── #70: Real-Time Collaboration ────────────────────────────────────────
+
+    pub fn store_credential_update(&self, update: &crate::models::CredentialUpdate) -> Result<(), rusqlite::Error> {
+        self.conn.lock().unwrap().execute(
+            r"INSERT INTO credential_updates (id, vault_id, user_id, field, old_value, new_value, timestamp, operation_id)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                update.id,
+                update.vault_id,
+                update.user_id,
+                update.field,
+                update.old_value.to_string(),
+                update.new_value.to_string(),
+                update.timestamp.to_rfc3339(),
+                update.operation_id
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn store_operational_transform(&self, transform: &crate::models::OperationalTransform) -> Result<(), rusqlite::Error> {
+        self.conn.lock().unwrap().execute(
+            r"INSERT INTO operational_transforms (id, vault_id, user_id, operation, position, content, timestamp, version)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                transform.id,
+                transform.vault_id,
+                transform.user_id,
+                transform.operation,
+                transform.position as i64,
+                transform.content,
+                transform.timestamp.to_rfc3339(),
+                transform.version as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn store_conflict_resolution(&self, resolution: &crate::models::ConflictResolution) -> Result<(), rusqlite::Error> {
+        self.conn.lock().unwrap().execute(
+            r"INSERT INTO conflict_resolutions (conflict_id, vault_id, update1_id, update2_id, resolution_strategy, resolved_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                resolution.conflict_id,
+                resolution.vault_id,
+                resolution.update1_id,
+                resolution.update2_id,
+                resolution.resolution_strategy,
+                resolution.resolved_at.to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_user_presence(&self, presence: &crate::models::UserPresence) -> Result<(), rusqlite::Error> {
+        self.conn.lock().unwrap().execute(
+            r"INSERT OR REPLACE INTO user_presence (user_id, vault_id, status, last_seen, session_id)
+               VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                presence.user_id,
+                presence.vault_id,
+                presence.status,
+                presence.last_seen.to_rfc3339(),
+                presence.session_id
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_vault_presence(&self, vault_id: &str) -> Result<Vec<crate::models::UserPresence>, rusqlite::Error> {
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            "SELECT user_id, vault_id, status, last_seen, session_id FROM user_presence WHERE vault_id = ?1",
+        )?;
+        let iter = stmt.query_map(params![vault_id], |r| {
+            let last_seen_str: String = r.get(3)?;
+            let last_seen = chrono::DateTime::parse_from_rfc3339(&last_seen_str)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e)))?;
+            Ok(crate::models::UserPresence {
+                user_id: r.get(0)?,
+                vault_id: r.get(1)?,
+                status: r.get(2)?,
+                last_seen,
+                session_id: r.get(4)?,
+            })
+        })?;
+        let mut presence = Vec::new();
+        for p in iter {
+            presence.push(p?);
+        }
+        Ok(presence)
+    }
+
+    pub fn create_collaborative_session(&self, session: &crate::models::CollaborativeSession) -> Result<(), rusqlite::Error> {
+        let participants_json = serde_json::to_string(&session.participants).unwrap_or_default();
+        self.conn.lock().unwrap().execute(
+            r"INSERT INTO collaborative_sessions (session_id, vault_id, created_at, participants, is_active)
+               VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                session.session_id,
+                session.vault_id,
+                session.created_at.to_rfc3339(),
+                participants_json,
+                if session.is_active { 1 } else { 0 }
+            ],
+        )?;
+        Ok(())
+    }
+
+    // ── #71: Full-Text Search ───────────────────────────────────────────────
+
+    pub fn index_vault_content(&self, vault_id: &str, title: &str, content: &str) -> Result<(), rusqlite::Error> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.lock().unwrap().execute(
+            r"INSERT INTO full_text_search_index (id, vault_id, title, content, created_at, indexed_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, vault_id, title, content, now, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn search_indexed_content(&self, query: &str, limit: u32) -> Result<Vec<crate::models::FullTextSearchResult>, rusqlite::Error> {
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            r"SELECT id, vault_id, title, content FROM full_text_search_index
+               WHERE title LIKE ?1 OR content LIKE ?1
+               LIMIT ?2",
+        )?;
+        let search_pattern = format!("%{}%", query);
+        let iter = stmt.query_map(params![search_pattern, limit as i64], |r| {
+            Ok(crate::models::FullTextSearchResult {
+                id: r.get(0)?,
+                vault_id: r.get(1)?,
+                title: r.get(2)?,
+                snippet: {
+                    let content: String = r.get(3)?;
+                    if content.len() > 200 {
+                        format!("{}...", &content[..200])
+                    } else {
+                        content
+                    }
+                },
+                relevance_score: 0.8,
+                matched_fields: vec!["title".to_string(), "content".to_string()],
+            })
+        })?;
+        let mut results = Vec::new();
+        for r in iter {
+            results.push(r?);
+        }
+        Ok(results)
+    }
+
+    pub fn add_search_facet(&self, vault_id: &str, facet_name: &str, value: &str) -> Result<(), rusqlite::Error> {
+        self.conn.lock().unwrap().execute(
+            r"INSERT INTO search_facets (vault_id, facet_name, value, count)
+               VALUES (?1, ?2, ?3, 1)
+               ON CONFLICT(vault_id, facet_name, value) DO UPDATE SET
+                   count = count + 1",
+            params![vault_id, facet_name, value],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_search_facets(&self, vault_id: &str) -> Result<Vec<crate::models::SearchFacet>, rusqlite::Error> {
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            "SELECT DISTINCT facet_name FROM search_facets WHERE vault_id = ?1",
+        )?;
+        let facet_names: Vec<String> = stmt.query_map(params![vault_id], |r| r.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut facets = Vec::new();
+        for facet_name in facet_names {
+            let mut values_stmt = binding.prepare(
+                "SELECT value, count FROM search_facets WHERE vault_id = ?1 AND facet_name = ?2",
+            )?;
+            let values: Vec<crate::models::FacetValue> = values_stmt.query_map(params![vault_id, &facet_name], |r| {
+                Ok(crate::models::FacetValue {
+                    value: r.get(0)?,
+                    count: r.get::<_, i64>(1)? as u32,
+                })
+            })?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            facets.push(crate::models::SearchFacet {
+                name: facet_name,
+                values,
+            });
+        }
+        Ok(facets)
+    }
 }
 
 #[cfg(test)]
