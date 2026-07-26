@@ -3,6 +3,7 @@ pub mod cache;
 pub mod consensus;
 pub mod contract_version_check;
 pub mod db;
+pub mod dependency_map;
 pub mod error;
 pub mod graphql;
 pub mod handlers;
