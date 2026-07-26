@@ -3,6 +3,7 @@ use std::sync::Arc;
 use axum::{
     extract::State,
     http::{HeaderValue, Method, StatusCode},
+    middleware,
     routing::{delete, get, post},
     Json, Router,
 };
@@ -10,6 +11,7 @@ use tower_http::cors::CorsLayer;
 use tracing_subscriber::EnvFilter;
 
 use ethos_protocol_backend::{
+    bulkhead::{self, BulkheadConfig, BulkheadRegistry},
     consensus::NodeCache,
     contract_version_check::{check_contract_version, parse_min_contract_version},
     db::{
@@ -91,6 +93,7 @@ async fn consensus_health_handler(
 
 pub fn build_router(state: AppState) -> Router {
     let retry_state = RetryPolicyState::new();
+    let bulkhead_registry = Arc::new(BulkheadRegistry::new(BulkheadConfig::default()));
 
     Router::new()
         // ── Health ──────────────────────────────────────────────────────────
@@ -99,6 +102,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/ready", get(ready_handler))
         // ── Retry policy admin routes ─────────────────────────────────────────
         .merge(retry_policy::router(retry_state))
+        // ── Bulkhead metrics admin route ────────────────────────────────────
+        .merge(bulkhead::router(bulkhead_registry.clone()))
         // ── Legacy reminder / subscription routes ────────────────────────────
         .route(
             "/api/vaults/:vault_id/reminder-preferences",
@@ -127,6 +132,11 @@ pub fn build_router(state: AppState) -> Router {
         // ── Streaming routes (#67) ───────────────────────────────────────────
         .route("/stream/vaults", get(stream_vaults))
         .route("/stream/events", get(stream_events))
+        // ── Bulkhead isolation: bounded per-endpoint concurrency + queueing ──
+        .layer(middleware::from_fn_with_state(
+            bulkhead_registry,
+            bulkhead::bulkhead_middleware,
+        ))
         .layer(build_cors_layer())
         .with_state(state)
 }

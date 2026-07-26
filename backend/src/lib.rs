@@ -1,4 +1,5 @@
 pub mod audit;
+pub mod bulkhead;
 pub mod cache;
 pub mod consensus;
 pub mod contract_version_check;
