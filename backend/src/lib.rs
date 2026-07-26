@@ -1,3 +1,4 @@
+pub mod acl;
 pub mod audit;
 pub mod cache;
 pub mod consensus;

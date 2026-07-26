@@ -10,6 +10,7 @@ use tower_http::cors::CorsLayer;
 use tracing_subscriber::EnvFilter;
 
 use ethos_protocol_backend::{
+    acl::{acl_audit_trail, create_acl_rule, delete_acl_rule, list_acl_rules, AclStore},
     consensus::NodeCache,
     contract_version_check::{check_contract_version, parse_min_contract_version},
     db::{
@@ -198,7 +199,17 @@ async fn main() {
         graphql_schema,
     };
 
-    let app = build_router(state);
+    // ── Dynamic ACL admin routes ─────────────────────────────────────────
+    // Kept on their own small router (own state) and merged in, since the
+    // ACL store is independent of AppState/Db.
+    let acl_store = AclStore::new();
+    let acl_router = Router::new()
+        .route("/admin/acl", post(create_acl_rule).get(list_acl_rules))
+        .route("/admin/acl/:id", delete(delete_acl_rule))
+        .route("/admin/acl/audit", get(acl_audit_trail))
+        .with_state(acl_store);
+
+    let app = build_router(state).merge(acl_router);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     tracing::info!("listening on {}", listener.local_addr().unwrap());
