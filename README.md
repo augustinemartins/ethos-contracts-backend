@@ -160,6 +160,7 @@ The script will display the target network and identity, then require you to typ
 - [Beneficiary Advanced Features](docs/beneficiary-advanced-features.md)
 - [Fallback Chains](docs/fallback-chains.md)
 - [Dead-Letter Queue](docs/dead-letter-queue.md)
+- [Batch Operations & Partial Failure Semantics](docs/batch-partial-failures.md)
 
 ## 🎓 Smart Contract API
 

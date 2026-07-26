@@ -10,6 +10,7 @@ use tower_http::cors::CorsLayer;
 use tracing_subscriber::EnvFilter;
 
 use ethos_protocol_backend::{
+    batch::batch_set_preferences,
     consensus::NodeCache,
     contract_version_check::{check_contract_version, parse_min_contract_version},
     db::{
@@ -140,6 +141,11 @@ pub fn build_router(state: AppState) -> Router {
         // ── Dead-letter queue admin routes ───────────────────────────────────
         .route("/admin/dlq", get(list_dlq_entries))
         .route("/admin/dlq/replay", post(replay_dlq_entries))
+        // ── Batch partial-failure routes ─────────────────────────────────────
+        .route(
+            "/api/vaults/batch/reminder-preferences",
+            post(batch_set_preferences),
+        )
         .layer(build_cors_layer())
         .with_state(state)
 }
