@@ -17,7 +17,7 @@ use ethos_protocol_backend::{
         create_vault_store, AppState, Db, PoolConfig,
     },
     graphql::{build_schema, graphql_handler, graphql_playground},
-    routes, scheduler,
+    retention, routes, scheduler, secret_rotation,
     streaming::{stream_events, stream_vaults},
     webhook::{delete_webhook, list_webhooks, register_webhook, WebhookState},
 };
@@ -53,6 +53,16 @@ async fn health_handler() -> Json<serde_json::Value> {
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
     }))
+}
+
+/// GET /api/encryption/keys — list all known encryption key versions (#101).
+async fn encryption_keys_handler(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    match state.db.list_encryption_key_versions() {
+        Ok(versions) => Ok(Json(serde_json::json!({ "keys": versions }))),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
 }
 
 async fn ready_handler(
@@ -122,6 +132,56 @@ pub fn build_router(state: AppState) -> Router {
         // ── Streaming routes (#67) ───────────────────────────────────────────
         .route("/stream/vaults", get(stream_vaults))
         .route("/stream/events", get(stream_events))
+        // ── #100: Data Retention Policies ────────────────────────────────────
+        .route(
+            "/api/retention/policies",
+            get(retention::list_policies),
+        )
+        .route(
+            "/api/retention/policies/:data_type",
+            get(retention::get_policy).put(retention::upsert_policy),
+        )
+        .route(
+            "/api/retention/purge/:data_type",
+            post(retention::trigger_purge),
+        )
+        .route(
+            "/api/retention/deletion-log",
+            get(retention::get_deletion_log),
+        )
+        .route(
+            "/api/retention/exceptions/:data_type",
+            get(retention::list_exceptions).post(retention::add_exception),
+        )
+        // ── #101: Encryption key version metadata ────────────────────────────
+        .route(
+            "/api/encryption/keys",
+            get(encryption_keys_handler),
+        )
+        .route(
+            "/api/secret-rotation/policies",
+            get(secret_rotation::list_policies),
+        )
+        .route(
+            "/api/secret-rotation/policies/:secret_type",
+            get(secret_rotation::get_policy).put(secret_rotation::upsert_policy),
+        )
+        .route(
+            "/api/secret-rotation/status",
+            get(secret_rotation::list_statuses),
+        )
+        .route(
+            "/api/secret-rotation/:secret_type/status",
+            get(secret_rotation::get_status),
+        )
+        .route(
+            "/api/secret-rotation/:secret_type/rotate",
+            post(secret_rotation::record_rotation),
+        )
+        .route(
+            "/api/secret-rotation/:secret_type/history",
+            get(secret_rotation::rotation_history),
+        )
         .layer(build_cors_layer())
         .with_state(state)
 }

@@ -11,9 +11,17 @@ use crate::{db::Db, models::Frequency};
 /// In production, replace `fetch_ttl_remaining` with a real Stellar RPC call
 /// and `send_reminder` with actual email/SMS/push dispatch.
 pub async fn run(db: Arc<Db>) {
+    // Seed default secret rotation policies on startup.
+    crate::secret_rotation::seed_default_policies(&db);
+
     let mut interval = tokio::time::interval(Duration::from_mins(1));
+    // Track when we last ran the daily/hourly tasks.
+    let mut last_daily_purge = chrono::DateTime::<Utc>::MIN_UTC;
+    let mut last_rotation_check = chrono::DateTime::<Utc>::MIN_UTC;
+
     loop {
         interval.tick().await;
+        let now = Utc::now();
 
         // 1) Existing reminder preferences scheduler.
         match db.all() {
@@ -88,6 +96,18 @@ pub async fn run(db: Arc<Db>) {
 
         // 2) TTL insurance scheduler.
         extend_ttl_for_inactive_owners(&db);
+
+        // 3) Data retention purge (runs at most once every 24 hours).
+        if now.signed_duration_since(last_daily_purge).num_hours() >= 24 {
+            crate::retention::run_purge_scheduler(&db);
+            last_daily_purge = now;
+        }
+
+        // 4) Secret rotation overdue check (runs at most once every hour).
+        if now.signed_duration_since(last_rotation_check).num_minutes() >= 60 {
+            crate::secret_rotation::run_rotation_scheduler(&db);
+            last_rotation_check = now;
+        }
     }
 }
 
