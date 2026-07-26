@@ -158,6 +158,8 @@ The script will display the target network and identity, then require you to typ
 - [Roadmap](docs/roadmap.md)
 - [Vesting Schedules](docs/vesting-schedules.md)
 - [Beneficiary Advanced Features](docs/beneficiary-advanced-features.md)
+- [Request Cost Estimation](docs/cost-estimation.md)
+- [API Request Replay](docs/request-replay.md)
 
 ## 🎓 Smart Contract API
 

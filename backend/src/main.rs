@@ -17,6 +17,17 @@ use ethos_protocol_backend::{
         create_vault_store, AppState, Db, PoolConfig,
     },
     graphql::{build_schema, graphql_handler, graphql_playground},
+    jobs::{create_job_handler, cancel_job_handler, get_job_handler, list_jobs_handler, create_job_store},
+    cost_estimation::estimate_cost_handler,
+    timeseries::{
+        create_timeseries_store,
+        ingest_handler, query_handler, compress_handler, set_retention_handler,
+        benchmark_handler,
+    },
+    replay::{
+        create_request_log_store,
+        replay_handler, batch_replay_handler, list_logs_handler, get_log_handler,
+    },
     routes, scheduler,
     streaming::{stream_events, stream_vaults},
     webhook::{delete_webhook, list_webhooks, register_webhook, WebhookState},
@@ -122,6 +133,22 @@ pub fn build_router(state: AppState) -> Router {
         // ── Streaming routes (#67) ───────────────────────────────────────────
         .route("/stream/vaults", get(stream_vaults))
         .route("/stream/events", get(stream_events))
+        // ── Time-Series routes (#75) ─────────────────────────────────────────
+        .route("/timeseries/ingest", post(ingest_handler))
+        .route("/timeseries/query", post(query_handler))
+        .route("/timeseries/:series/compress", post(compress_handler))
+        .route("/timeseries/:series/retention", post(set_retention_handler))
+        .route("/timeseries/:series/benchmark", post(benchmark_handler))
+        // ── Bulk Job routes (#74) ─────────────────────────────────────────────
+        .route("/jobs", post(create_job_handler).get(list_jobs_handler))
+        .route("/jobs/:job_id", get(get_job_handler).delete(cancel_job_handler))
+        // ── Cost Estimation routes (#72) ─────────────────────────────────────
+        .route("/estimate-cost", post(estimate_cost_handler))
+        // ── Request Replay routes (#73) ──────────────────────────────────────
+        .route("/replay", post(replay_handler))
+        .route("/replay/batch", post(batch_replay_handler))
+        .route("/replay/logs", get(list_logs_handler))
+        .route("/replay/logs/:log_id", get(get_log_handler))
         .layer(build_cors_layer())
         .with_state(state)
 }
@@ -196,6 +223,9 @@ async fn main() {
         consensus,
         webhook_state: Arc::new(WebhookState::new()),
         graphql_schema,
+        timeseries_store: create_timeseries_store(),
+        job_store: create_job_store(),
+        request_log_store: create_request_log_store(),
     };
 
     let app = build_router(state);

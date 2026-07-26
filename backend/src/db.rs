@@ -62,6 +62,12 @@ pub struct AppState {
     pub webhook_state: Arc<crate::webhook::WebhookState>,
     /// GraphQL schema for the /graphql endpoint (#66).
     pub graphql_schema: crate::graphql::EthosSchema,
+    /// Time-series engine for #75.
+    pub timeseries_store: crate::timeseries::TimeSeriesStore,
+    /// Bulk job queue for #74.
+    pub job_store: crate::jobs::JobStore,
+    /// API request replay log for #73.
+    pub request_log_store: crate::replay::RequestLogStore,
 }
 
 impl axum::extract::FromRef<AppState> for Arc<Db> {
@@ -85,6 +91,24 @@ impl axum::extract::FromRef<AppState> for Arc<crate::webhook::WebhookState> {
 impl axum::extract::FromRef<AppState> for crate::graphql::EthosSchema {
     fn from_ref(state: &AppState) -> crate::graphql::EthosSchema {
         state.graphql_schema.clone()
+    }
+}
+
+impl axum::extract::FromRef<AppState> for crate::timeseries::TimeSeriesStore {
+    fn from_ref(state: &AppState) -> crate::timeseries::TimeSeriesStore {
+        Arc::clone(&state.timeseries_store)
+    }
+}
+
+impl axum::extract::FromRef<AppState> for crate::jobs::JobStore {
+    fn from_ref(state: &AppState) -> crate::jobs::JobStore {
+        Arc::clone(&state.job_store)
+    }
+}
+
+impl axum::extract::FromRef<AppState> for crate::replay::RequestLogStore {
+    fn from_ref(state: &AppState) -> crate::replay::RequestLogStore {
+        Arc::clone(&state.request_log_store)
     }
 }
 
