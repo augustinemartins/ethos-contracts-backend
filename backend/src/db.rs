@@ -68,6 +68,8 @@ pub struct AppState {
     pub profiler_state: Arc<crate::profiler::ProfilerState>,
     /// Per-operation cost tracking and attribution state.
     pub cost_state: Arc<crate::cost_tracking::CostState>,
+    /// Graceful degradation / capability negotiation state.
+    pub degradation_state: Arc<crate::degradation::DegradationState>,
 }
 
 impl axum::extract::FromRef<AppState> for Arc<Db> {
@@ -109,6 +111,12 @@ impl axum::extract::FromRef<AppState> for Arc<crate::profiler::ProfilerState> {
 impl axum::extract::FromRef<AppState> for Arc<crate::cost_tracking::CostState> {
     fn from_ref(state: &AppState) -> Arc<crate::cost_tracking::CostState> {
         Arc::clone(&state.cost_state)
+    }
+}
+
+impl axum::extract::FromRef<AppState> for Arc<crate::degradation::DegradationState> {
+    fn from_ref(state: &AppState) -> Arc<crate::degradation::DegradationState> {
+        Arc::clone(&state.degradation_state)
     }
 }
 

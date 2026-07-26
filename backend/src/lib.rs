@@ -4,6 +4,7 @@ pub mod consensus;
 pub mod contract_version_check;
 pub mod cost_tracking;
 pub mod db;
+pub mod degradation;
 pub mod error;
 pub mod feature_flags;
 pub mod graphql;

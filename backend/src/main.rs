@@ -17,6 +17,10 @@ use ethos_protocol_backend::{
         create_vault_store, AppState, Db, PoolConfig,
     },
     cost_tracking::{allocate_cost, get_cost_report, record_cost_entry, CostState},
+    degradation::{
+        capability_fallback, list_capabilities, negotiate_capabilities, set_capability,
+        DegradationState,
+    },
     feature_flags::{evaluate_flag_handler, get_flag, list_flags, upsert_flag, FlagState},
     graphql::{build_schema, graphql_handler, graphql_playground},
     profiler::{get_flamegraph, get_regressions, list_samples, set_baseline, ProfilerState},
@@ -138,6 +142,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/admin/cost/entries", post(record_cost_entry))
         .route("/admin/cost/report", get(get_cost_report))
         .route("/admin/cost/allocate", post(allocate_cost))
+        // ── Graceful degradation / capability negotiation routes ────────────
+        .route("/admin/capabilities", post(set_capability).get(list_capabilities))
+        .route("/capabilities/negotiate", post(negotiate_capabilities))
+        .route("/capabilities/:name/fallback", get(capability_fallback))
         .layer(build_cors_layer())
         .with_state(state)
 }
@@ -215,6 +223,7 @@ async fn main() {
         flag_state: Arc::new(FlagState::new()),
         profiler_state: Arc::new(ProfilerState::new()),
         cost_state: Arc::new(CostState::new()),
+        degradation_state: Arc::new(DegradationState::new()),
     };
 
     let app = build_router(state);
