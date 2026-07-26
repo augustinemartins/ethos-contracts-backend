@@ -161,6 +161,7 @@ The script will display the target network and identity, then require you to typ
 - [Fallback Chains](docs/fallback-chains.md)
 - [Dead-Letter Queue](docs/dead-letter-queue.md)
 - [Batch Operations & Partial Failure Semantics](docs/batch-partial-failures.md)
+- [Health-Based Routing](docs/health-based-routing.md)
 
 ## 🎓 Smart Contract API
 

@@ -23,6 +23,7 @@ use ethos_protocol_backend::{
         FallbackState,
     },
     graphql::{build_schema, graphql_handler, graphql_playground},
+    health_routing::{list_health, routing_metrics, test_routing_decision, HealthRoutingState},
     routes, scheduler,
     streaming::{stream_events, stream_vaults},
     webhook::{delete_webhook, list_webhooks, register_webhook, WebhookState},
@@ -146,6 +147,10 @@ pub fn build_router(state: AppState) -> Router {
             "/api/vaults/batch/reminder-preferences",
             post(batch_set_preferences),
         )
+        // ── Health-aware routing admin routes ────────────────────────────────
+        .route("/admin/routing/health", get(list_health))
+        .route("/admin/routing/metrics", get(routing_metrics))
+        .route("/admin/routing/test", post(test_routing_decision))
         .layer(build_cors_layer())
         .with_state(state)
 }
@@ -211,6 +216,11 @@ async fn main() {
     let graphql_schema = build_schema(Arc::clone(&vault_store), Arc::clone(&event_store));
 
     let dlq_state = Arc::new(DlqState::new());
+    let health_routing_state = Arc::new(HealthRoutingState::new());
+    let webhook_state = Arc::new(WebhookState::with_reliability_state(
+        Arc::clone(&dlq_state),
+        Arc::clone(&health_routing_state),
+    ));
 
     let state = AppState {
         db,
@@ -220,10 +230,11 @@ async fn main() {
         share_store: create_share_store(),
         share_token_store: create_share_token_store(),
         consensus,
-        webhook_state: Arc::new(WebhookState::with_dlq(Arc::clone(&dlq_state))),
+        webhook_state,
         graphql_schema,
         fallback_state: Arc::new(FallbackState::new()),
         dlq_state,
+        health_routing_state,
     };
 
     let app = build_router(state);

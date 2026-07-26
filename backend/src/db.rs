@@ -66,6 +66,8 @@ pub struct AppState {
     pub fallback_state: Arc<crate::fallback::FallbackState>,
     /// Dead-letter queue for failed asynchronous deliveries.
     pub dlq_state: Arc<crate::dlq::DlqState>,
+    /// Health-aware routing weights for outbound delivery targets.
+    pub health_routing_state: Arc<crate::health_routing::HealthRoutingState>,
 }
 
 impl axum::extract::FromRef<AppState> for Arc<Db> {
@@ -101,6 +103,12 @@ impl axum::extract::FromRef<AppState> for Arc<crate::fallback::FallbackState> {
 impl axum::extract::FromRef<AppState> for Arc<crate::dlq::DlqState> {
     fn from_ref(state: &AppState) -> Arc<crate::dlq::DlqState> {
         Arc::clone(&state.dlq_state)
+    }
+}
+
+impl axum::extract::FromRef<AppState> for Arc<crate::health_routing::HealthRoutingState> {
+    fn from_ref(state: &AppState) -> Arc<crate::health_routing::HealthRoutingState> {
+        Arc::clone(&state.health_routing_state)
     }
 }
 

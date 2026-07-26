@@ -9,6 +9,7 @@ pub mod error;
 pub mod fallback;
 pub mod graphql;
 pub mod handlers;
+pub mod health_routing;
 pub mod metrics;
 pub mod models;
 pub mod notifications;
