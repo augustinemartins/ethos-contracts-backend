@@ -13,6 +13,10 @@ use ethos_protocol_backend::{
     acl::{acl_audit_trail, create_acl_rule, delete_acl_rule, list_acl_rules, AclStore},
     consensus::NodeCache,
     contract_version_check::{check_contract_version, parse_min_contract_version},
+    custom_metrics::{
+        aggregate_custom_metric, create_dashboard_share, get_shared_dashboard,
+        list_custom_metrics, list_dashboard_templates, record_custom_metric, CustomMetricsStore,
+    },
     db::{
         create_audit_store, create_event_store, create_share_store, create_share_token_store,
         create_vault_store, AppState, Db, PoolConfig,
@@ -209,7 +213,25 @@ async fn main() {
         .route("/admin/acl/audit", get(acl_audit_trail))
         .with_state(acl_store);
 
-    let app = build_router(state).merge(acl_router);
+    // ── Custom metrics + Grafana dashboard routes ────────────────────────
+    let custom_metrics_store = CustomMetricsStore::new();
+    let custom_metrics_router = Router::new()
+        .route(
+            "/metrics/custom",
+            post(record_custom_metric).get(list_custom_metrics),
+        )
+        .route(
+            "/metrics/custom/:name/aggregate",
+            get(aggregate_custom_metric),
+        )
+        .route("/dashboards/templates", get(list_dashboard_templates))
+        .route("/dashboards/share", post(create_dashboard_share))
+        .route("/dashboards/shared/:token", get(get_shared_dashboard))
+        .with_state(custom_metrics_store);
+
+    let app = build_router(state)
+        .merge(acl_router)
+        .merge(custom_metrics_router);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     tracing::info!("listening on {}", listener.local_addr().unwrap());

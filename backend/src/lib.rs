@@ -3,6 +3,7 @@ pub mod audit;
 pub mod cache;
 pub mod consensus;
 pub mod contract_version_check;
+pub mod custom_metrics;
 pub mod db;
 pub mod error;
 pub mod graphql;
