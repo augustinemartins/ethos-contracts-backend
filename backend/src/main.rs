@@ -16,6 +16,7 @@ use ethos_protocol_backend::{
         create_audit_store, create_event_store, create_share_store, create_share_token_store,
         create_vault_store, AppState, Db, PoolConfig,
     },
+    cost_tracking::{allocate_cost, get_cost_report, record_cost_entry, CostState},
     feature_flags::{evaluate_flag_handler, get_flag, list_flags, upsert_flag, FlagState},
     graphql::{build_schema, graphql_handler, graphql_playground},
     profiler::{get_flamegraph, get_regressions, list_samples, set_baseline, ProfilerState},
@@ -133,6 +134,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/admin/profiler/flamegraph", get(get_flamegraph))
         .route("/admin/profiler/baseline", post(set_baseline))
         .route("/admin/profiler/regressions", get(get_regressions))
+        // ── Cost tracking routes ─────────────────────────────────────────────
+        .route("/admin/cost/entries", post(record_cost_entry))
+        .route("/admin/cost/report", get(get_cost_report))
+        .route("/admin/cost/allocate", post(allocate_cost))
         .layer(build_cors_layer())
         .with_state(state)
 }
@@ -209,6 +214,7 @@ async fn main() {
         graphql_schema,
         flag_state: Arc::new(FlagState::new()),
         profiler_state: Arc::new(ProfilerState::new()),
+        cost_state: Arc::new(CostState::new()),
     };
 
     let app = build_router(state);

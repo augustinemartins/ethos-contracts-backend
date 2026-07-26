@@ -66,6 +66,8 @@ pub struct AppState {
     pub flag_state: Arc<crate::feature_flags::FlagState>,
     /// Continuous profiling / flame graph / regression detection state.
     pub profiler_state: Arc<crate::profiler::ProfilerState>,
+    /// Per-operation cost tracking and attribution state.
+    pub cost_state: Arc<crate::cost_tracking::CostState>,
 }
 
 impl axum::extract::FromRef<AppState> for Arc<Db> {
@@ -101,6 +103,12 @@ impl axum::extract::FromRef<AppState> for Arc<crate::feature_flags::FlagState> {
 impl axum::extract::FromRef<AppState> for Arc<crate::profiler::ProfilerState> {
     fn from_ref(state: &AppState) -> Arc<crate::profiler::ProfilerState> {
         Arc::clone(&state.profiler_state)
+    }
+}
+
+impl axum::extract::FromRef<AppState> for Arc<crate::cost_tracking::CostState> {
+    fn from_ref(state: &AppState) -> Arc<crate::cost_tracking::CostState> {
+        Arc::clone(&state.cost_state)
     }
 }
 
