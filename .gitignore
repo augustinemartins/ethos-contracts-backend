@@ -7,6 +7,12 @@ target/
 test_snapshots/
 *.proptest-regressions
 
+# Test / coverage artifacts
+*.profraw
+*.profdata
+coverage/
+*.tmp
+
 # Build artifacts
 *.wasm
 *.d
