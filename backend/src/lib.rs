@@ -1,5 +1,6 @@
 pub mod audit;
 pub mod cache;
+pub mod canary;
 pub mod consensus;
 pub mod contract_version_check;
 pub mod db;
