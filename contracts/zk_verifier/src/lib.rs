@@ -19,6 +19,11 @@ pub const DEFAULT_DISPUTE_THRESHOLD: u32 = 3;
 /// to bound persistent-storage growth. See docs/zk-verifier.md, "Credential
 /// Retention Policy".
 pub const MAX_CREDENTIAL_SNAPSHOTS: u32 = 1000;
+/// Maximum number of hops a credential's parent chain may have. Enforced by
+/// [`ZkVerifierContract::create_derived_credential`] when recursively
+/// validating a parent's ancestry, so that chain walks (and the gas they
+/// cost) stay bounded. See docs/zk-verifier.md, "Credential Hierarchies".
+pub const MAX_CREDENTIAL_CHAIN_DEPTH: u32 = 32;
 
 const VERIFY_CLAIM_TOPIC: soroban_sdk::Symbol = symbol_short!("vfy_claim");
 const VERIFY_CONDITIONAL_TOPIC: soroban_sdk::Symbol = symbol_short!("vfy_cond");
@@ -115,6 +120,12 @@ mod keys {
         /// pre-existing credentials are unaffected until an admin opts them
         /// into a stricter level via `set_credential_privacy`.
         CredentialPrivacy(u64),
+        /// child credential_id -> parent credential_id. Absence means the
+        /// credential is a root — either created via `attest`, or a
+        /// derived credential that has no recorded parent. Set once, at the
+        /// first time a credential_id is associated with a parent via
+        /// `create_derived_credential`, and never reassigned thereafter.
+        CredentialParent(u64),
     }
 }
 
@@ -270,30 +281,93 @@ impl ZkVerifierContract {
         let proof_hash: BytesN<32> = env.crypto().sha256(&proof).into();
         let claim_hash: BytesN<32> = env.crypto().sha256(&claim).into();
 
-        let attestation_key = DataKey::Attestation(proof_hash.clone(), claim_hash.clone());
-        let credential_id = match env
-            .storage()
-            .instance()
-            .get::<DataKey, AttestationRecord>(&attestation_key)
-        {
-            Some(existing) => existing.credential_id,
-            None => {
-                let id = env
-                    .storage()
-                    .instance()
-                    .get::<DataKey, u64>(&DataKey::CredentialCount)
-                    .unwrap_or(0)
-                    + 1;
-                env.storage().instance().set(&DataKey::CredentialCount, &id);
-                env.storage()
-                    .instance()
-                    .set(&DataKey::CredentialHashes(id), &(proof_hash, claim_hash));
-                id
-            }
-        };
+        let credential_id = Self::mint_or_reuse_credential_id(&env, &proof_hash, &claim_hash);
 
         env.storage().instance().set(
-            &attestation_key,
+            &DataKey::Attestation(proof_hash, claim_hash),
+            &AttestationRecord {
+                credential_id,
+                oracle: oracle.clone(),
+            },
+        );
+
+        let invalidated = Self::is_credential_invalidated(env.clone(), credential_id);
+        Self::record_credential_snapshot(&env, credential_id, oracle, invalidated);
+
+        credential_id
+    }
+
+    /// Attests `(proof, claim)` as a credential *derived from* `parent_id`
+    /// — e.g. a certificate issued on the basis of a degree, which was
+    /// itself issued on the basis of a transcript. Otherwise behaves
+    /// exactly like [`Self::attest`]: it dedups on `(proof, claim)`, reuses
+    /// the existing credential_id if this exact pair was attested before,
+    /// and requires a currently-registered `oracle` to authorize the call.
+    ///
+    /// Before minting or re-attesting the derived credential, this walks
+    /// `parent_id`'s *entire* ancestor chain — not just its immediate state
+    /// — and panics with `ParentCredentialInvalid` if any credential in
+    /// that chain (`parent_id` itself, its parent, its grandparent, and so
+    /// on) has been invalidated by an upheld dispute. A derived credential
+    /// is only as trustworthy as everything it was built on, so a
+    /// compromised ancestor anywhere in the chain blocks new issuance, not
+    /// just a directly invalidated parent.
+    ///
+    /// Panics with `CredentialNotFound` if `parent_id` was never attested,
+    /// with `CredentialChainTooDeep` if `parent_id`'s chain already spans
+    /// more than `MAX_CREDENTIAL_CHAIN_DEPTH` hops, with
+    /// `SelfReferentialParent` if the derived credential would be its own
+    /// parent (i.e. `proof`/`claim` hash to the same credential_id as
+    /// `parent_id`), and with `ParentAlreadySet` if this exact `(proof,
+    /// claim)` pair was already derived from a *different* parent — a
+    /// credential's place in the hierarchy is fixed at its first creation
+    /// and cannot be changed by re-deriving it.
+    pub fn create_derived_credential(
+        env: Env,
+        oracle: Address,
+        parent_id: u64,
+        proof: Bytes,
+        claim: Bytes,
+    ) -> u64 {
+        if proof.is_empty() {
+            panic_with_error!(&env, VerifierError::EmptyProof);
+        }
+        if claim.is_empty() {
+            panic_with_error!(&env, VerifierError::EmptyClaim);
+        }
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::CredentialHashes(parent_id))
+        {
+            panic_with_error!(&env, VerifierError::CredentialNotFound);
+        }
+        Self::validate_credential_chain(&env, parent_id);
+
+        Self::require_registered_oracle(&env, &oracle);
+        oracle.require_auth();
+
+        let proof_hash: BytesN<32> = env.crypto().sha256(&proof).into();
+        let claim_hash: BytesN<32> = env.crypto().sha256(&claim).into();
+        let credential_id = Self::mint_or_reuse_credential_id(&env, &proof_hash, &claim_hash);
+
+        if credential_id == parent_id {
+            panic_with_error!(&env, VerifierError::SelfReferentialParent);
+        }
+
+        match Self::load_parent(&env, credential_id) {
+            Some(existing_parent) if existing_parent != parent_id => {
+                panic_with_error!(&env, VerifierError::ParentAlreadySet);
+            }
+            _ => {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::CredentialParent(credential_id), &parent_id);
+            }
+        }
+
+        env.storage().instance().set(
+            &DataKey::Attestation(proof_hash, claim_hash),
             &AttestationRecord {
                 credential_id,
                 oracle: oracle.clone(),
