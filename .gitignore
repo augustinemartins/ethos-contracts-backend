@@ -1,24 +1,33 @@
 target/
 
-# Test snapshots
+# Test snapshots and fuzz artifacts
 **/__snapshots__/
 *.snap
 *.snap.new
 test_snapshots/
 *.proptest-regressions
-insta.yaml
+contracts/*/fuzz/corpus/
+contracts/*/fuzz/artifacts/
+fuzz/corpus/
+fuzz/artifacts/
+
+# Test / coverage artifacts
+*.profraw
+*.profdata
+coverage/
+*.tmp
 
 # Build artifacts
 *.wasm
 *.d
 *.o
 *.a
-*.rlib
 
 # Environment files
 .env
 .env.local
 .env.*.local
+.env.production
 
 # Local Stellar CLI identity/config store
 .soroban/
@@ -41,36 +50,39 @@ desktop.ini
 node_modules/
 dist/
 .cache/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-.pnpm-debug.log*
+.parcel-cache/
+.turbo/
+*.tsbuildinfo
 
 # Logs
 *.log
 logs/
-*.log.*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
-# Fuzz artifacts
-contracts/*/fuzz/corpus/
-contracts/*/fuzz/artifacts/
-fuzz/corpus/
-fuzz/artifacts/
-
-# Coverage reports
+# Coverage and profiling
 lcov.info
 coverage/
+*.profraw
+*.profdata
 tarpaulin-report.html
-cobertura.xml
 
-# Benchmark artifacts
-criterion/
-
-# Temporary files
+# Temporary and generated files
 *.tmp
-*.temp
 *.bak
 *.orig
+*.rej
+.tmp/
 
-# Kiro agent internal files
-.kiro/
+# Benchmark results (keep code, not output data)
+criterion/
+benches/results/
+
+# Secrets and keys (never committed)
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+private/
