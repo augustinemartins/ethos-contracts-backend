@@ -19,6 +19,7 @@ pub mod load_shedding;
 pub mod metrics;
 pub mod profiler;
 pub mod models;
+pub mod multilevel_cache;
 pub mod notifications;
 pub mod predictive_scaling;
 pub mod priority;
