@@ -160,6 +160,8 @@ The script will display the target network and identity, then require you to typ
 - [Beneficiary Advanced Features](docs/beneficiary-advanced-features.md)
 - [Request Cost Estimation](docs/cost-estimation.md)
 - [API Request Replay](docs/request-replay.md)
+- [Bulk Operation Queuing](docs/bulk-operation-queuing.md)
+- [Time-Series Data Optimizations](docs/timeseries-optimizations.md)
 
 ## 🎓 Smart Contract API
 
