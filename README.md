@@ -146,22 +146,39 @@ The script will display the target network and identity, then require you to typ
 
 ## 📖 Documentation
 
+### Learning Resources
+- [FAQ and Common Issues](docs/faq.md)
+- [Video Tutorials](docs/video-tutorials.md)
+- [Interactive Playground](docs/playground.md)
+- [Architecture Diagrams and Visual Guides](docs/architecture-diagrams.md)
+
+### Core Concepts
 - [Architecture Overview](docs/architecture.md)
 - [TTL & State Archival Logic](docs/ttl-logic.md)
 - [Vault Hibernation](docs/hibernation.md)
 - [Passkey Integration](docs/passkeys.md)
+
+### Beneficiary Features
 - [Beneficiary Conditional Acceptance](docs/beneficiary-conditional-acceptance.md)
 - [Beneficiary Conflict Resolution](docs/beneficiary-conflict-resolution.md)
-- [Withdrawal Features](docs/withdrawal-features.md)
-- [Threat Model & Security](docs/security.md)
-- [Security Policy & Vulnerability Disclosure](SECURITY.md)
-- [Roadmap](docs/roadmap.md)
-- [Vesting Schedules](docs/vesting-schedules.md)
 - [Beneficiary Advanced Features](docs/beneficiary-advanced-features.md)
-- [Request Cost Estimation](docs/cost-estimation.md)
-- [API Request Replay](docs/request-replay.md)
-- [Bulk Operation Queuing](docs/bulk-operation-queuing.md)
-- [Time-Series Data Optimizations](docs/timeseries-optimizations.md)
+- [Vesting Schedules](docs/vesting-schedules.md)
+
+### Operations
+- [Withdrawal Features](docs/withdrawal-features.md)
+- [Deployment Guide](docs/deployment-guide.md)
+- [Monitoring Guide](docs/monitoring-guide.md)
+- [Disaster Recovery Runbook](docs/disaster-recovery-runbook.md)
+
+### Security
+- [Threat Model & Security](docs/security.md)
+- [Security Audit Checklist](docs/security-audit-checklist.md)
+- [Security Policy & Vulnerability Disclosure](SECURITY.md)
+
+### Reference
+- [API Reference](docs/api-reference.md)
+- [OpenAPI Specification](docs/openapi.yaml)
+- [Roadmap](docs/roadmap.md)
 
 ## 🎓 Smart Contract API
 
