@@ -158,6 +158,10 @@ The script will display the target network and identity, then require you to typ
 - [Roadmap](docs/roadmap.md)
 - [Vesting Schedules](docs/vesting-schedules.md)
 - [Beneficiary Advanced Features](docs/beneficiary-advanced-features.md)
+- [Multi-Level Caching Strategy](docs/cache-strategy.md)
+- [Cache Invalidation Event System](docs/cache-invalidation.md)
+- [Predictive Cache Warming](docs/cache-warming.md)
+- [Database Migration Validation Testing](docs/migration-testing.md)
 
 ## 🎓 Smart Contract API
 

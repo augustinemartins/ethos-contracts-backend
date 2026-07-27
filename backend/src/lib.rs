@@ -1,5 +1,7 @@
 pub mod audit;
 pub mod cache;
+pub mod cache_invalidation;
+pub mod cache_warming;
 pub mod consensus;
 pub mod contract_version_check;
 pub mod db;
@@ -7,7 +9,9 @@ pub mod error;
 pub mod graphql;
 pub mod handlers;
 pub mod metrics;
+pub mod migration_testing;
 pub mod models;
+pub mod multilevel_cache;
 pub mod notifications;
 pub mod routes;
 pub mod scheduler;

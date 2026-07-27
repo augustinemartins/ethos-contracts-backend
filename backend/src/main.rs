@@ -10,6 +10,9 @@ use tower_http::cors::CorsLayer;
 use tracing_subscriber::EnvFilter;
 
 use ethos_protocol_backend::{
+    cache::VaultCache,
+    cache_invalidation::CacheInvalidator,
+    cache_warming::CacheWarmer,
     consensus::NodeCache,
     contract_version_check::{check_contract_version, parse_min_contract_version},
     db::{
@@ -17,6 +20,7 @@ use ethos_protocol_backend::{
         create_vault_store, AppState, Db, PoolConfig,
     },
     graphql::{build_schema, graphql_handler, graphql_playground},
+    multilevel_cache::MultiLevelCache,
     routes, scheduler,
     streaming::{stream_events, stream_vaults},
     webhook::{delete_webhook, list_webhooks, register_webhook, WebhookState},
@@ -122,6 +126,10 @@ pub fn build_router(state: AppState) -> Router {
         // ── Streaming routes (#67) ───────────────────────────────────────────
         .route("/stream/vaults", get(stream_vaults))
         .route("/stream/events", get(stream_events))
+        // ── Admin / Cache routes (#87, #85, #86) ──────────────────────────────
+        .route("/admin/warm-cache", post(routes::warm_cache))
+        .route("/admin/cache-stats", get(routes::cache_stats))
+        .route("/admin/cache-invalidate", post(routes::cache_invalidate))
         .layer(build_cors_layer())
         .with_state(state)
 }
@@ -186,6 +194,11 @@ async fn main() {
     let event_store = create_event_store();
     let graphql_schema = build_schema(Arc::clone(&vault_store), Arc::clone(&event_store));
 
+    let cache = Arc::new(VaultCache::new());
+    let cache_warmer = Arc::new(CacheWarmer::new());
+    let cache_invalidator = Arc::new(CacheInvalidator::new(Arc::clone(&cache)));
+    let multilevel_cache = Arc::new(MultiLevelCache::new());
+
     let state = AppState {
         db,
         vault_store,
@@ -196,6 +209,10 @@ async fn main() {
         consensus,
         webhook_state: Arc::new(WebhookState::new()),
         graphql_schema,
+        cache,
+        cache_warmer,
+        cache_invalidator,
+        multilevel_cache,
     };
 
     let app = build_router(state);

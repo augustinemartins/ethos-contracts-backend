@@ -13,12 +13,16 @@ use tower::ServiceExt;
 use tower_http::cors::CorsLayer;
 
 use ethos_protocol_backend::{
+    cache::VaultCache,
+    cache_invalidation::CacheInvalidator,
+    cache_warming::CacheWarmer,
     consensus::{CacheBackend, ConflictStrategy, InMemoryBackend, NodeCache},
     db::{
         create_audit_store, create_event_store, create_share_store, create_share_token_store,
         create_vault_store, Db, PoolConfig,
     },
     graphql::build_schema,
+    multilevel_cache::MultiLevelCache,
     routes,
     webhook::WebhookState,
     AppState,
@@ -35,6 +39,10 @@ fn test_state(db: Arc<Db>) -> AppState {
     let vault_store = create_vault_store();
     let event_store = create_event_store();
     let graphql_schema = build_schema(Arc::clone(&vault_store), Arc::clone(&event_store));
+    let cache = Arc::new(VaultCache::new());
+    let cache_warmer = Arc::new(CacheWarmer::new());
+    let cache_invalidator = Arc::new(CacheInvalidator::new(Arc::clone(&cache)));
+    let multilevel_cache = Arc::new(MultiLevelCache::new());
     AppState {
         db,
         vault_store,
@@ -45,6 +53,10 @@ fn test_state(db: Arc<Db>) -> AppState {
         consensus,
         webhook_state: Arc::new(WebhookState::new()),
         graphql_schema,
+        cache,
+        cache_warmer,
+        cache_invalidator,
+        multilevel_cache,
     }
 }
 
@@ -314,6 +326,13 @@ async fn test_consensus_health_detects_and_resolves_divergence() {
         consensus,
         webhook_state: Arc::new(WebhookState::new()),
         graphql_schema: build_schema(create_vault_store(), create_event_store()),
+        cache: Arc::new(VaultCache::new()),
+        cache_warmer: Arc::new(CacheWarmer::new()),
+        cache_invalidator: {
+            let c = Arc::new(VaultCache::new());
+            Arc::new(CacheInvalidator::new(c))
+        },
+        multilevel_cache: Arc::new(MultiLevelCache::new()),
     };
     db.migrate().unwrap();
 

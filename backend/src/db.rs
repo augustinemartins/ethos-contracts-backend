@@ -62,6 +62,14 @@ pub struct AppState {
     pub webhook_state: Arc<crate::webhook::WebhookState>,
     /// GraphQL schema for the /graphql endpoint (#66).
     pub graphql_schema: crate::graphql::EthosSchema,
+    /// Cache for vault data (#87, #85).
+    pub cache: Arc<crate::cache::VaultCache>,
+    /// Predictive cache warming (#87).
+    pub cache_warmer: Arc<crate::cache_warming::CacheWarmer>,
+    /// Event-driven cache invalidation (#86).
+    pub cache_invalidator: Arc<crate::cache_invalidation::CacheInvalidator>,
+    /// Multi-level cache (L1 in-memory + L2 persistent) (#85).
+    pub multilevel_cache: Arc<crate::multilevel_cache::MultiLevelCache>,
 }
 
 impl axum::extract::FromRef<AppState> for Arc<Db> {
