@@ -11,9 +11,13 @@ use soroban_sdk::{
 };
 
 pub mod composition_rules;
+pub mod credential_lifecycle;
 mod oracle;
 pub mod ranking;
+pub mod slice_composition_optimizer;
+pub mod slice_failover;
 pub mod slice_performance;
+pub mod template_inheritance;
 mod types;
 use types::{
     ArchivedVaultInfo, AuditEntry, BackupCode, BeneficiaryCommitment, BeneficiaryEntry,
@@ -340,6 +344,14 @@ pub enum ContractError {
     PasskeyInEscrow = 113,
     // Issue #44: composition rule not found
     RuleNotFound = 114,
+    // Issue #34: credential lifecycle state machine
+    InvalidCredentialState = 115,
+    // Issue #35: slice failover mechanism
+    InvalidSlice = 116,
+    FailoverAlreadyActive = 117,
+    // Issue #37: template inheritance
+    TemplateNotFound = 118,
+    InheritanceCycleDetected = 119,
 }
 
 #[contract]
