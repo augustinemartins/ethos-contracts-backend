@@ -62,14 +62,16 @@ pub struct AppState {
     pub webhook_state: Arc<crate::webhook::WebhookState>,
     /// GraphQL schema for the /graphql endpoint (#66).
     pub graphql_schema: crate::graphql::EthosSchema,
-    /// Feature flag storage and evaluation state.
-    pub flag_state: Arc<crate::feature_flags::FlagState>,
-    /// Continuous profiling / flame graph / regression detection state.
-    pub profiler_state: Arc<crate::profiler::ProfilerState>,
-    /// Per-operation cost tracking and attribution state.
-    pub cost_state: Arc<crate::cost_tracking::CostState>,
-    /// Graceful degradation / capability negotiation state.
-    pub degradation_state: Arc<crate::degradation::DegradationState>,
+    /// Prometheus-style counters exposed at `/metrics`.
+    pub metrics: Arc<crate::metrics::Metrics>,
+    /// Per-priority concurrency enforcement (#129).
+    pub priority_enforcer: Arc<crate::priority::PriorityEnforcer>,
+    /// Adaptive overload protection (#128).
+    pub load_shedder: Arc<crate::load_shedding::LoadShedder>,
+    /// Adaptive batch sizing for background batch jobs (#131).
+    pub batcher: Arc<crate::batching::AdaptiveBatcher>,
+    /// Traffic forecasting and replica recommendations (#130).
+    pub scaler: Arc<crate::predictive_scaling::PredictiveScaler>,
 }
 
 impl axum::extract::FromRef<AppState> for Arc<Db> {

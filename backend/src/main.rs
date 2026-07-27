@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     extract::State,
@@ -10,6 +11,7 @@ use tower_http::cors::CorsLayer;
 use tracing_subscriber::EnvFilter;
 
 use ethos_protocol_backend::{
+    batching::{AdaptiveBatcher, BatchConfig},
     consensus::NodeCache,
     contract_version_check::{check_contract_version, parse_min_contract_version},
     db::{
@@ -23,7 +25,12 @@ use ethos_protocol_backend::{
     },
     feature_flags::{evaluate_flag_handler, get_flag, list_flags, upsert_flag, FlagState},
     graphql::{build_schema, graphql_handler, graphql_playground},
-    profiler::{get_flamegraph, get_regressions, list_samples, set_baseline, ProfilerState},
+    load_shedding::{admission_middleware, LoadMonitor, LoadShedder, SheddingConfig},
+    metrics::Metrics,
+    predictive_scaling::{
+        self, ForecastModel, LoggingAutoscalerClient, PredictiveScaler, ScalingConfig,
+    },
+    priority::{PriorityConfig, PriorityEnforcer},
     routes, scheduler,
     streaming::{stream_events, stream_vaults},
     webhook::{delete_webhook, list_webhooks, register_webhook, WebhookState},
@@ -75,6 +82,17 @@ async fn ready_handler(
     }
 }
 
+/// Prometheus text-format metrics for scraping, combining base counters
+/// with load shedding (#128), adaptive batching (#131) and predictive
+/// scaling (#130) metrics.
+async fn metrics_handler(State(state): State<AppState>) -> String {
+    let mut out = state.metrics.render();
+    out.push_str(&state.load_shedder.render_prometheus());
+    out.push_str(&state.batcher.render_prometheus());
+    out.push_str(&state.scaler.render_prometheus());
+    out
+}
+
 async fn consensus_health_handler(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -101,6 +119,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(health_handler))
         .route("/health/consensus", get(consensus_health_handler))
         .route("/ready", get(ready_handler))
+        .route("/metrics", get(metrics_handler))
         // ── Legacy reminder / subscription routes ────────────────────────────
         .route(
             "/api/vaults/:vault_id/reminder-preferences",
@@ -129,23 +148,11 @@ pub fn build_router(state: AppState) -> Router {
         // ── Streaming routes (#67) ───────────────────────────────────────────
         .route("/stream/vaults", get(stream_vaults))
         .route("/stream/events", get(stream_events))
-        // ── Feature flag admin routes ────────────────────────────────────────
-        .route("/admin/flags", post(upsert_flag).get(list_flags))
-        .route("/admin/flags/:key", get(get_flag))
-        .route("/admin/flags/:key/evaluate", post(evaluate_flag_handler))
-        // ── Continuous profiling routes ──────────────────────────────────────
-        .route("/admin/profiler/samples", get(list_samples))
-        .route("/admin/profiler/flamegraph", get(get_flamegraph))
-        .route("/admin/profiler/baseline", post(set_baseline))
-        .route("/admin/profiler/regressions", get(get_regressions))
-        // ── Cost tracking routes ─────────────────────────────────────────────
-        .route("/admin/cost/entries", post(record_cost_entry))
-        .route("/admin/cost/report", get(get_cost_report))
-        .route("/admin/cost/allocate", post(allocate_cost))
-        // ── Graceful degradation / capability negotiation routes ────────────
-        .route("/admin/capabilities", post(set_capability).get(list_capabilities))
-        .route("/capabilities/negotiate", post(negotiate_capabilities))
-        .route("/capabilities/:name/fallback", get(capability_fallback))
+        // ── Request prioritization / load shedding (#128, #129) ──────────────
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            admission_middleware,
+        ))
         .layer(build_cors_layer())
         .with_state(state)
 }
@@ -210,6 +217,25 @@ async fn main() {
     let event_store = create_event_store();
     let graphql_schema = build_schema(Arc::clone(&vault_store), Arc::clone(&event_store));
 
+    // ── Request prioritization / load shedding / batching / scaling ──────────
+    // (#128, #129, #130, #131)
+    let metrics = Metrics::new();
+    let priority_enforcer = Arc::new(PriorityEnforcer::new(PriorityConfig::from_env()));
+    let load_shedder = Arc::new(LoadShedder::new(LoadMonitor::new(), SheddingConfig::from_env()));
+    let batcher = Arc::new(AdaptiveBatcher::new(BatchConfig::from_env()));
+    let scaler = Arc::new(PredictiveScaler::new(
+        288, // 24h of history at a 5-minute sampling interval
+        ForecastModel::default(),
+        ScalingConfig::from_env(),
+        Box::new(LoggingAutoscalerClient),
+    ));
+
+    let scaling_metrics = Arc::clone(&metrics);
+    let scaling_scaler = Arc::clone(&scaler);
+    tokio::spawn(async move {
+        predictive_scaling::run(scaling_scaler, scaling_metrics, Duration::from_secs(300)).await;
+    });
+
     let state = AppState {
         db,
         vault_store,
@@ -220,10 +246,11 @@ async fn main() {
         consensus,
         webhook_state: Arc::new(WebhookState::new()),
         graphql_schema,
-        flag_state: Arc::new(FlagState::new()),
-        profiler_state: Arc::new(ProfilerState::new()),
-        cost_state: Arc::new(CostState::new()),
-        degradation_state: Arc::new(DegradationState::new()),
+        metrics,
+        priority_enforcer,
+        load_shedder,
+        batcher,
+        scaler,
     };
 
     let app = build_router(state);
