@@ -13,6 +13,7 @@ use tower::ServiceExt;
 use tower_http::cors::CorsLayer;
 
 use ethos_protocol_backend::{
+    cache_metrics::CacheMetrics,
     consensus::{CacheBackend, ConflictStrategy, InMemoryBackend, NodeCache},
     db::{
         create_audit_store, create_event_store, create_share_store, create_share_token_store,
@@ -45,6 +46,7 @@ fn test_state(db: Arc<Db>) -> AppState {
         consensus,
         webhook_state: Arc::new(WebhookState::new()),
         graphql_schema,
+        cache_metrics: CacheMetrics::new(1_000),
     }
 }
 
@@ -314,6 +316,7 @@ async fn test_consensus_health_detects_and_resolves_divergence() {
         consensus,
         webhook_state: Arc::new(WebhookState::new()),
         graphql_schema: build_schema(create_vault_store(), create_event_store()),
+        cache_metrics: CacheMetrics::new(1_000),
     };
     db.migrate().unwrap();
 

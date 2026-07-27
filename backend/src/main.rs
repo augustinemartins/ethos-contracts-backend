@@ -10,6 +10,7 @@ use tower_http::cors::CorsLayer;
 use tracing_subscriber::EnvFilter;
 
 use ethos_protocol_backend::{
+    cache_metrics::{cache_stats_handler, CacheMetrics},
     consensus::NodeCache,
     contract_version_check::{check_contract_version, parse_min_contract_version},
     db::{
@@ -122,6 +123,8 @@ pub fn build_router(state: AppState) -> Router {
         // ── Streaming routes (#67) ───────────────────────────────────────────
         .route("/stream/vaults", get(stream_vaults))
         .route("/stream/events", get(stream_events))
+        // ── Cache metrics endpoint (#94) ─────────────────────────────────────
+        .route("/api/cache/stats", get(cache_stats_handler))
         .layer(build_cors_layer())
         .with_state(state)
 }
@@ -196,6 +199,7 @@ async fn main() {
         consensus,
         webhook_state: Arc::new(WebhookState::new()),
         graphql_schema,
+        cache_metrics: CacheMetrics::new(10_000),
     };
 
     let app = build_router(state);

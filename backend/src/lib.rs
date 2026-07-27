@@ -1,5 +1,8 @@
 pub mod audit;
 pub mod cache;
+pub mod cache_metrics;
+pub mod cache_partition;
+pub mod cache_recovery;
 pub mod consensus;
 pub mod contract_version_check;
 pub mod db;
@@ -9,6 +12,7 @@ pub mod handlers;
 pub mod metrics;
 pub mod models;
 pub mod notifications;
+pub mod rate_limit;
 pub mod routes;
 pub mod scheduler;
 pub mod streaming;
