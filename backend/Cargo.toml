@@ -24,7 +24,7 @@ log = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "cors"] }
+tower-http = { version = "0.6", features = ["trace", "cors", "decompression-gzip", "decompression-deflate"] }
 
 env_logger = "0.11"
 thiserror = "1"
@@ -35,6 +35,9 @@ rusqlite = { version = "0.33", features = ["bundled"] }
 
 # Push notifications (FCM via HTTP v1 API)
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# Compression / decompression (gzip, deflate) for request body decompression (#132)
+flate2 = "1"
 
 # GraphQL API alternative to REST (#66)
 async-graphql = { version = "7", features = ["chrono", "uuid"] }

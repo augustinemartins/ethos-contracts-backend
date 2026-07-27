@@ -1,39 +1,90 @@
 target/
 
-# Test snapshots
+# ── Test snapshots & regression data ─────────────────────────────────────────
 **/__snapshots__/
 *.snap
 *.snap.new
 test_snapshots/
 *.proptest-regressions
+insta.yaml
 
-# Build artifacts
+# ── Build artifacts ───────────────────────────────────────────────────────────
 *.wasm
 *.d
+*.rlib
+*.rmeta
+*.pdb
+*.exp
+*.lib
+*.so
+*.dylib
+*.dll
+*.a
 
-# Environment files
+# ── Benchmark output ──────────────────────────────────────────────────────────
+criterion/
+
+# ── Environment files ─────────────────────────────────────────────────────────
 .env
 .env.local
 .env.*.local
 
-# Local Stellar CLI identity/config store
+# ── Local Stellar / Soroban CLI stores ────────────────────────────────────────
 .soroban/
+.stellar/
 
-# Editor / IDE
+# ── Editor / IDE ──────────────────────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
+*.iml
+.project
+.classpath
 
-# OS
+# ── OS files ──────────────────────────────────────────────────────────────────
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
 Thumbs.db
 
-# Node (frontend/backend tooling)
+# ── Node (frontend / backend tooling) ────────────────────────────────────────
 node_modules/
 dist/
 .cache/
+.parcel-cache/
+.next/
+.nuxt/
+.output/
+.turbo/
+*.tsbuildinfo
 
-# Logs
+# ── Logs ──────────────────────────────────────────────────────────────────────
 *.log
+logs/
+
+# ── Coverage reports ─────────────────────────────────────────────────────────
+lcov.info
+coverage/
+tarpaulin-report.html
+cobertura.xml
+
+# ── Profiling / flamegraph output ────────────────────────────────────────────
+perf.data
+perf.data.old
+flamegraph.svg
+*.prof
+
+# ── Local secrets / keys ──────────────────────────────────────────────────────
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+
+# ── Docker volumes / overrides (local dev only) ───────────────────────────────
+docker-compose.local.yml
