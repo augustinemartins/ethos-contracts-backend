@@ -62,6 +62,16 @@ pub struct AppState {
     pub webhook_state: Arc<crate::webhook::WebhookState>,
     /// GraphQL schema for the /graphql endpoint (#66).
     pub graphql_schema: crate::graphql::EthosSchema,
+    /// Prometheus-style counters exposed at `/metrics`.
+    pub metrics: Arc<crate::metrics::Metrics>,
+    /// Per-priority concurrency enforcement (#129).
+    pub priority_enforcer: Arc<crate::priority::PriorityEnforcer>,
+    /// Adaptive overload protection (#128).
+    pub load_shedder: Arc<crate::load_shedding::LoadShedder>,
+    /// Adaptive batch sizing for background batch jobs (#131).
+    pub batcher: Arc<crate::batching::AdaptiveBatcher>,
+    /// Traffic forecasting and replica recommendations (#130).
+    pub scaler: Arc<crate::predictive_scaling::PredictiveScaler>,
 }
 
 impl axum::extract::FromRef<AppState> for Arc<Db> {
@@ -85,6 +95,30 @@ impl axum::extract::FromRef<AppState> for Arc<crate::webhook::WebhookState> {
 impl axum::extract::FromRef<AppState> for crate::graphql::EthosSchema {
     fn from_ref(state: &AppState) -> crate::graphql::EthosSchema {
         state.graphql_schema.clone()
+    }
+}
+
+impl axum::extract::FromRef<AppState> for Arc<crate::feature_flags::FlagState> {
+    fn from_ref(state: &AppState) -> Arc<crate::feature_flags::FlagState> {
+        Arc::clone(&state.flag_state)
+    }
+}
+
+impl axum::extract::FromRef<AppState> for Arc<crate::profiler::ProfilerState> {
+    fn from_ref(state: &AppState) -> Arc<crate::profiler::ProfilerState> {
+        Arc::clone(&state.profiler_state)
+    }
+}
+
+impl axum::extract::FromRef<AppState> for Arc<crate::cost_tracking::CostState> {
+    fn from_ref(state: &AppState) -> Arc<crate::cost_tracking::CostState> {
+        Arc::clone(&state.cost_state)
+    }
+}
+
+impl axum::extract::FromRef<AppState> for Arc<crate::degradation::DegradationState> {
+    fn from_ref(state: &AppState) -> Arc<crate::degradation::DegradationState> {
+        Arc::clone(&state.degradation_state)
     }
 }
 
