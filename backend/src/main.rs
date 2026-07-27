@@ -10,6 +10,11 @@ use tower_http::cors::CorsLayer;
 use tracing_subscriber::EnvFilter;
 
 use ethos_protocol_backend::{
+    captcha::{
+        get_trusted_users_handler, post_add_trusted_user_handler, post_challenge_handler,
+        post_verify_handler,
+    },
+    compliance::compliance_report_handler,
     consensus::NodeCache,
     contract_version_check::{check_contract_version, parse_min_contract_version},
     db::{
@@ -17,6 +22,10 @@ use ethos_protocol_backend::{
         create_vault_store, AppState, Db, PoolConfig,
     },
     graphql::{build_schema, graphql_handler, graphql_playground},
+    ip_reputation::{
+        delete_block_rule_handler, get_block_rules_handler, get_ip_reputation_handler,
+        get_reputation_config_handler, post_block_ip_handler, post_check_handler,
+    },
     routes, scheduler,
     streaming::{stream_events, stream_vaults},
     webhook::{delete_webhook, list_webhooks, register_webhook, WebhookState},
@@ -122,6 +131,28 @@ pub fn build_router(state: AppState) -> Router {
         // ── Streaming routes (#67) ───────────────────────────────────────────
         .route("/stream/vaults", get(stream_vaults))
         .route("/stream/events", get(stream_events))
+        // ── IP Reputation routes (#96) ───────────────────────────────────────
+        .route("/admin/ip-reputation", get(get_ip_reputation_handler))
+        .route("/admin/ip-reputation/block", post(post_block_ip_handler))
+        .route("/admin/ip-reputation/rules", get(get_block_rules_handler))
+        .route(
+            "/admin/ip-reputation/rules/:id",
+            delete(delete_block_rule_handler),
+        )
+        .route(
+            "/admin/ip-reputation/config",
+            get(get_reputation_config_handler),
+        )
+        .route("/ip-reputation/check", post(post_check_handler))
+        // ── CAPTCHA routes (#97) ─────────────────────────────────────────────
+        .route("/captcha/challenge", post(post_challenge_handler))
+        .route("/captcha/verify", post(post_verify_handler))
+        .route(
+            "/admin/captcha/trusted-users",
+            get(get_trusted_users_handler).post(post_add_trusted_user_handler),
+        )
+        // ── Compliance routes (#99) ──────────────────────────────────────────
+        .route("/admin/compliance-report", get(compliance_report_handler))
         .layer(build_cors_layer())
         .with_state(state)
 }

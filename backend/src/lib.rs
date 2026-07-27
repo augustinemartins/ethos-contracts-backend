@@ -1,11 +1,14 @@
 pub mod audit;
 pub mod cache;
+pub mod captcha;
+pub mod compliance;
 pub mod consensus;
 pub mod contract_version_check;
 pub mod db;
 pub mod error;
 pub mod graphql;
 pub mod handlers;
+pub mod ip_reputation;
 pub mod metrics;
 pub mod models;
 pub mod notifications;

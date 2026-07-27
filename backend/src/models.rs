@@ -921,3 +921,236 @@ pub struct FullTextSearchResponse {
     pub facets: Vec<SearchFacet>,
     pub query_time_ms: u64,
 }
+
+// ── CAPTCHA / Suspicious-Activity models (#97) ───────────────────────────────
+
+/// An issued CAPTCHA challenge, stored server-side until verified or expired.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaptchaChallenge {
+    /// Unique challenge identifier (UUID v4).
+    pub id: String,
+    /// Opaque server-generated token bound to this challenge.
+    pub token: String,
+    /// Wall-clock expiry; challenges are invalid after this instant.
+    pub expires_at: DateTime<Utc>,
+    /// reCAPTCHA site key sent to the client so it can render the widget.
+    pub site_key: String,
+}
+
+/// Request body for `POST /captcha/verify`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CaptchaVerifyRequest {
+    /// The `CaptchaChallenge.id` issued by `/captcha/challenge`.
+    pub challenge_id: String,
+    /// The g-recaptcha-response token submitted by the user's browser.
+    pub captcha_token: String,
+    /// Caller's own session / bearer token (used to mint a new session on
+    /// successful verification).
+    pub user_token: String,
+}
+
+/// Response body for `POST /captcha/verify`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaptchaVerifyResponse {
+    /// Whether the CAPTCHA was successfully verified.
+    pub verified: bool,
+    /// New short-lived session token issued on success (`None` on failure).
+    pub session_token: Option<String>,
+    /// Human-readable status message.
+    pub message: String,
+}
+
+/// A user/IP combination that has been explicitly trusted and is exempt from
+/// CAPTCHA challenges until `trusted_until`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustedUser {
+    /// Application-level user identifier.
+    pub user_id: String,
+    /// IP address or CIDR block that is trusted.
+    pub ip: String,
+    /// After this instant the trust entry is no longer valid.
+    pub trusted_until: DateTime<Utc>,
+}
+
+/// A detected suspicious-activity event used by the rate-based CAPTCHA trigger.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuspiciousActivityEvent {
+    /// Source IP address.
+    pub ip: String,
+    /// Optionally identifies the authenticated user behind the request.
+    pub user_id: Option<String>,
+    /// Category of event (e.g. `"login_attempt"`, `"vault_create"`).
+    pub event_type: String,
+    /// Number of events observed within `window_start..now`.
+    pub count: u32,
+    /// Start of the observation window.
+    pub window_start: DateTime<Utc>,
+}
+
+/// Request body for `POST /admin/captcha/trusted-users`.
+#[derive(Debug, Deserialize)]
+pub struct AddTrustedUserRequest {
+    pub user_id: String,
+    pub ip: String,
+    /// Seconds from now until the trust entry expires (default: 86 400 = 1 day).
+    pub trust_duration_secs: Option<u64>,
+}
+
+// ── IP Reputation models (#96) ────────────────────────────────────────────────
+
+/// Risk level derived from an IP's abuse confidence score.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RiskLevel {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+/// Reputation score for a single IP address, optionally sourced from AbuseIPDB.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpReputationScore {
+    /// The IP address that was checked.
+    pub ip: String,
+    /// Abuse confidence score in the range `0.0..=100.0`.
+    pub score: f64,
+    /// Derived risk classification.
+    pub risk_level: RiskLevel,
+    /// Whether the IP is currently matched by a local block rule.
+    pub is_blocked: bool,
+    /// Wall-clock instant at which the check was last performed.
+    pub last_checked: DateTime<Utc>,
+    /// Data source (e.g. `"abuseipdb"`, `"stub"`, `"disabled"`).
+    pub source: String,
+    /// Raw response payload from the upstream provider (or a stub object).
+    pub details: serde_json::Value,
+}
+
+/// A manually configured IP block rule stored in the in-memory rule list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpBlockRule {
+    /// UUID v4 identifier for this rule.
+    pub id: String,
+    /// Exact IP address or `/24` subnet prefix (e.g. `"192.168.1"`).
+    pub ip_pattern: String,
+    /// Human-readable reason for the block.
+    pub reason: String,
+    /// When this rule was created.
+    pub created_at: DateTime<Utc>,
+    /// Optional expiry; `None` means the rule never expires.
+    pub expires_at: Option<DateTime<Utc>>,
+    /// Identity of the admin who created the rule (derived from the Bearer token).
+    pub created_by: String,
+}
+
+/// Request body for `POST /admin/ip-reputation/block`.
+#[derive(Debug, Deserialize)]
+pub struct IpBlockRequest {
+    /// Exact IP or `/24` prefix to block.
+    pub ip_pattern: String,
+    /// Reason for the block (required).
+    pub reason: String,
+    /// If provided, the rule expires after this many hours.
+    pub expires_in_hours: Option<u32>,
+}
+
+/// Global configuration for the IP reputation subsystem.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpReputationConfig {
+    /// When `false`, all reputation checks return a stub `Low` score without
+    /// calling any external API.
+    pub check_enabled: bool,
+    /// Abuse confidence score threshold above which an IP is considered `High`
+    /// risk. Defaults to `50`.
+    pub block_threshold: u8,
+    /// Maximum age (in days) of data to consider when querying AbuseIPDB.
+    pub max_age_days: u32,
+}
+
+impl Default for IpReputationConfig {
+    fn default() -> Self {
+        Self {
+            check_enabled: true,
+            block_threshold: 50,
+            max_age_days: 90,
+        }
+    }
+}
+
+/// Request body for `POST /ip-reputation/check`.
+#[derive(Debug, Deserialize)]
+pub struct IpReputationCheckRequest {
+    /// Optional explicit IP to check. Falls back to `X-Forwarded-For` /
+    /// `X-Real-IP` headers when absent.
+    pub ip: Option<String>,
+}
+
+// ── Compliance Audit Report models (#99) ─────────────────────────────────────
+
+/// Pass/fail/warning status for a single compliance check.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ComplianceStatus {
+    Pass,
+    Fail,
+    Warning,
+    NotApplicable,
+}
+
+impl std::fmt::Display for ComplianceStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ComplianceStatus::Pass => write!(f, "pass"),
+            ComplianceStatus::Fail => write!(f, "fail"),
+            ComplianceStatus::Warning => write!(f, "warning"),
+            ComplianceStatus::NotApplicable => write!(f, "not_applicable"),
+        }
+    }
+}
+
+/// A single evaluated compliance control.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComplianceCheck {
+    /// Dot-separated identifier, e.g. `"gdpr.data_minimisation"`.
+    pub id: String,
+    /// Human-readable control name.
+    pub name: String,
+    /// Compliance framework this check belongs to (`"GDPR"`, `"SOC2"`,
+    /// `"ISO27001"`).
+    pub framework: String,
+    /// Evaluation result.
+    pub status: ComplianceStatus,
+    /// Explanation of what was checked and what was found.
+    pub description: String,
+    /// Actionable guidance when `status` is `Fail` or `Warning`; empty when
+    /// `Pass` or `NotApplicable`.
+    pub remediation: String,
+}
+
+/// A complete compliance audit report for the current deployment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComplianceAuditReport {
+    /// ISO-8601 timestamp of report generation.
+    pub generated_at: DateTime<Utc>,
+    /// Total number of checks evaluated.
+    pub total_checks: usize,
+    /// Number of checks that passed.
+    pub passed: usize,
+    /// Number of checks that failed.
+    pub failed: usize,
+    /// Number of checks with warnings.
+    pub warnings: usize,
+    /// Number of checks marked not applicable.
+    pub not_applicable: usize,
+    /// Individual check results.
+    pub checks: Vec<ComplianceCheck>,
+    /// Placeholder for a PDF export (see `generate_pdf_stub`).
+    pub pdf_stub: serde_json::Value,
+}
+
+/// Outer wrapper returned by `GET /admin/compliance-report`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComplianceReportResponse {
+    pub report: ComplianceAuditReport,
+}
