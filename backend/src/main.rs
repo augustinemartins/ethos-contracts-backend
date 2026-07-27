@@ -18,6 +18,12 @@ use ethos_protocol_backend::{
         create_audit_store, create_event_store, create_share_store, create_share_token_store,
         create_vault_store, AppState, Db, PoolConfig,
     },
+    cost_tracking::{allocate_cost, get_cost_report, record_cost_entry, CostState},
+    degradation::{
+        capability_fallback, list_capabilities, negotiate_capabilities, set_capability,
+        DegradationState,
+    },
+    feature_flags::{evaluate_flag_handler, get_flag, list_flags, upsert_flag, FlagState},
     graphql::{build_schema, graphql_handler, graphql_playground},
     load_shedding::{admission_middleware, LoadMonitor, LoadShedder, SheddingConfig},
     metrics::Metrics,

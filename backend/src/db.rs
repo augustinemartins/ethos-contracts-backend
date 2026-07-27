@@ -98,6 +98,30 @@ impl axum::extract::FromRef<AppState> for crate::graphql::EthosSchema {
     }
 }
 
+impl axum::extract::FromRef<AppState> for Arc<crate::feature_flags::FlagState> {
+    fn from_ref(state: &AppState) -> Arc<crate::feature_flags::FlagState> {
+        Arc::clone(&state.flag_state)
+    }
+}
+
+impl axum::extract::FromRef<AppState> for Arc<crate::profiler::ProfilerState> {
+    fn from_ref(state: &AppState) -> Arc<crate::profiler::ProfilerState> {
+        Arc::clone(&state.profiler_state)
+    }
+}
+
+impl axum::extract::FromRef<AppState> for Arc<crate::cost_tracking::CostState> {
+    fn from_ref(state: &AppState) -> Arc<crate::cost_tracking::CostState> {
+        Arc::clone(&state.cost_state)
+    }
+}
+
+impl axum::extract::FromRef<AppState> for Arc<crate::degradation::DegradationState> {
+    fn from_ref(state: &AppState) -> Arc<crate::degradation::DegradationState> {
+        Arc::clone(&state.degradation_state)
+    }
+}
+
 pub fn search_vaults(store: &VaultStore, query: &SearchQuery) -> SearchResult {
     let vaults = store.lock().unwrap();
     let page = query.page.unwrap_or(1);
