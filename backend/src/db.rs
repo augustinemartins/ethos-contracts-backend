@@ -2396,6 +2396,41 @@ impl Db {
     }
 }
 
+// ── Consistency pragma helpers (#83) ─────────────────────────────────────────
+
+impl Db {
+    /// Expose an `MutexGuard<Connection>` so that callers outside this module
+    /// (e.g. `consistency.rs`) can execute one-off queries without going through
+    /// individual `Db` methods.
+    pub fn conn_lock(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
+        self.conn.lock().unwrap()
+    }
+
+    /// Run SQLite's `PRAGMA foreign_key_check` and return one descriptive
+    /// string per violation.  Returns an empty `Vec` if the database is
+    /// clean.
+    pub fn run_consistency_pragma(&self) -> Result<Vec<String>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("PRAGMA foreign_key_check")?;
+        let rows = stmt.query_map([], |r| {
+            // Columns: table, rowid, parent, fkid
+            let table: String = r.get(0)?;
+            let rowid: i64 = r.get(1)?;
+            let parent: String = r.get(2)?;
+            let fkid: i64 = r.get(3)?;
+            Ok(format!(
+                "table={table} rowid={rowid} parent={parent} fkid={fkid}"
+            ))
+        })?;
+
+        let mut violations = Vec::new();
+        for row in rows {
+            violations.push(row?);
+        }
+        Ok(violations)
+    }
+}
+
 #[cfg(test)]
 mod tests {
 

@@ -6,6 +6,7 @@ pub mod cache;
 pub mod chaos;
 pub mod circuit_breaker;
 pub mod consensus;
+pub mod consistency;
 pub mod contract_version_check;
 pub mod cost_tracking;
 pub mod db;
