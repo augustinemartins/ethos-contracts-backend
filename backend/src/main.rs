@@ -244,7 +244,7 @@ async fn main() {
         share_store: create_share_store(),
         share_token_store: create_share_token_store(),
         consensus,
-        webhook_state: Arc::new(WebhookState::new()),
+        webhook_state,
         graphql_schema,
         metrics,
         priority_enforcer,
