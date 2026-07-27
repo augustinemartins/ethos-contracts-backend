@@ -92,13 +92,29 @@ pub fn create_webhook_store() -> WebhookStore {
 pub struct WebhookState {
     pub store: WebhookStore,
     pub http_client: Client,
+    /// Dead-letter queue that exhausted deliveries are routed into.
+    pub dlq_state: Arc<crate::dlq::DlqState>,
+    /// Health-aware routing weights, keyed by webhook URL.
+    pub health_routing_state: Arc<crate::health_routing::HealthRoutingState>,
 }
 
 impl WebhookState {
     pub fn new() -> Self {
+        Self::with_reliability_state(
+            Arc::new(crate::dlq::DlqState::new()),
+            Arc::new(crate::health_routing::HealthRoutingState::new()),
+        )
+    }
+
+    pub fn with_reliability_state(
+        dlq_state: Arc<crate::dlq::DlqState>,
+        health_routing_state: Arc<crate::health_routing::HealthRoutingState>,
+    ) -> Self {
         Self {
             store: create_webhook_store(),
             http_client: Client::new(),
+            dlq_state,
+            health_routing_state,
         }
     }
 }
@@ -210,11 +226,23 @@ pub fn deliver_event(
     };
 
     for registration in registrations {
+        // Health-aware routing (#4): skip endpoints that have been failing
+        // consistently rather than continuing to hammer them.
+        if !crate::health_routing::should_route(&state.health_routing_state, &registration.url) {
+            tracing::warn!(
+                webhook_id = %registration.id,
+                url = %registration.url,
+                "skipping delivery — endpoint is routed as unhealthy"
+            );
+            continue;
+        }
+
         let client = state.http_client.clone();
         let payload_clone = payload.clone();
+        let state_clone = Arc::clone(&state);
 
         tokio::spawn(async move {
-            attempt_delivery(&client, &registration, &payload_clone).await;
+            attempt_delivery(&client, &registration, &payload_clone, &state_clone).await;
         });
     }
 }
@@ -228,6 +256,7 @@ async fn attempt_delivery(
     client: &Client,
     registration: &WebhookRegistration,
     payload: &WebhookPayload,
+    state: &WebhookState,
 ) {
     let body = match serde_json::to_string(payload) {
         Ok(b) => b,
@@ -264,6 +293,11 @@ async fn attempt_delivery(
                     attempt,
                     "Webhook delivery succeeded"
                 );
+                crate::health_routing::record_outcome(
+                    &state.health_routing_state,
+                    &registration.url,
+                    true,
+                );
                 return;
             }
             Ok(resp) => {
@@ -273,12 +307,22 @@ async fn attempt_delivery(
                     attempt,
                     "Webhook delivery failed — will retry"
                 );
+                crate::health_routing::record_outcome(
+                    &state.health_routing_state,
+                    &registration.url,
+                    false,
+                );
             }
             Err(e) => {
                 tracing::warn!(
                     webhook_id = %registration.id,
                     attempt,
                     "Webhook delivery error: {e} — will retry"
+                );
+                crate::health_routing::record_outcome(
+                    &state.health_routing_state,
+                    &registration.url,
+                    false,
                 );
             }
         }
@@ -287,6 +331,17 @@ async fn attempt_delivery(
     tracing::error!(
         webhook_id = %registration.id,
         "Webhook delivery exhausted all retries — dropping"
+    );
+
+    // Dead-letter the payload (#2) instead of discarding it so it can be
+    // inspected and replayed once the endpoint recovers.
+    crate::dlq::route_to_dlq(
+        &state.dlq_state,
+        format!("webhook:{}", registration.id),
+        Some(registration.url.clone()),
+        serde_json::to_value(payload).unwrap_or(serde_json::Value::Null),
+        "exhausted all delivery retries",
+        MAX_RETRIES + 1,
     );
 }
 

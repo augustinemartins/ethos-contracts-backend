@@ -1,24 +1,26 @@
 target/
 
-# ── Test snapshots & regression data ─────────────────────────────────────────
+# Test snapshots and fuzz artifacts
 **/__snapshots__/
 *.snap
 *.snap.new
 test_snapshots/
 *.proptest-regressions
-insta.yaml
+contracts/*/fuzz/corpus/
+contracts/*/fuzz/artifacts/
+fuzz/corpus/
+fuzz/artifacts/
+
+# Test / coverage artifacts
+*.profraw
+*.profdata
+coverage/
+*.tmp
 
 # ── Build artifacts ───────────────────────────────────────────────────────────
 *.wasm
 *.d
-*.rlib
-*.rmeta
-*.pdb
-*.exp
-*.lib
-*.so
-*.dylib
-*.dll
+*.o
 *.a
 
 # ── Benchmark output ──────────────────────────────────────────────────────────
@@ -28,6 +30,7 @@ criterion/
 .env
 .env.local
 .env.*.local
+.env.production
 
 # ── Local Stellar / Soroban CLI stores ────────────────────────────────────────
 .soroban/
@@ -40,8 +43,7 @@ criterion/
 *.swo
 *~
 *.iml
-.project
-.classpath
+.editorconfig.local
 
 # ── OS files ──────────────────────────────────────────────────────────────────
 .DS_Store
@@ -51,40 +53,45 @@ criterion/
 .Trashes
 ehthumbs.db
 Thumbs.db
+desktop.ini
 
 # ── Node (frontend / backend tooling) ────────────────────────────────────────
 node_modules/
 dist/
 .cache/
 .parcel-cache/
-.next/
-.nuxt/
-.output/
 .turbo/
 *.tsbuildinfo
 
 # ── Logs ──────────────────────────────────────────────────────────────────────
 *.log
 logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
-# ── Coverage reports ─────────────────────────────────────────────────────────
+# Coverage and profiling
 lcov.info
 coverage/
+*.profraw
+*.profdata
 tarpaulin-report.html
-cobertura.xml
 
-# ── Profiling / flamegraph output ────────────────────────────────────────────
-perf.data
-perf.data.old
-flamegraph.svg
-*.prof
+# Temporary and generated files
+*.tmp
+*.bak
+*.orig
+*.rej
+.tmp/
 
-# ── Local secrets / keys ──────────────────────────────────────────────────────
+# Benchmark results (keep code, not output data)
+criterion/
+benches/results/
+
+# Secrets and keys (never committed)
 *.pem
 *.key
 *.p12
 *.pfx
 secrets/
-
-# ── Docker volumes / overrides (local dev only) ───────────────────────────────
-docker-compose.local.yml
+private/
