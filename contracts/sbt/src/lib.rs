@@ -17,6 +17,8 @@ const DELEGATE_TOPIC: soroban_sdk::Symbol = symbol_short!("sbt_dlg");
 const REVOKE_DELEGATE_TOPIC: soroban_sdk::Symbol = symbol_short!("sbt_rdlg");
 const METADATA_COMPRESSED_TOPIC: soroban_sdk::Symbol = symbol_short!("sbt_mcmp");
 const FRACTIONAL_CREATED_TOPIC: soroban_sdk::Symbol = symbol_short!("frac_crt");
+const ESCROW_CREATED_TOPIC: soroban_sdk::Symbol = symbol_short!("esc_crt");
+const ESCROW_RELEASED_TOPIC: soroban_sdk::Symbol = symbol_short!("esc_rel");
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -60,6 +62,14 @@ pub enum SbtError {
     InvalidFractionSum = 18,
     /// Holder not found in fractional ownership.
     HolderNotFound = 19,
+    /// SBT is not in escrow.
+    NotInEscrow = 20,
+    /// SBT is already in escrow with another agent.
+    AlreadyInEscrow = 21,
+    /// Escrow conditions not met.
+    EscrowConditionsNotMet = 22,
+    /// Only escrow agent can perform this action.
+    NotEscrowAgent = 23,
     /// Holder count and fraction count must match.
     MismatchedOwnershipArrays = 24,
 }
@@ -82,6 +92,12 @@ pub enum DataKey {
     FractionalOwnership(u64),
     /// Ownership history for fractional SBTs (issue #45).
     OwnershipHistory(u64),
+    /// SBT escrow records (issue #46).
+    Escrow(u64),
+    /// Escrow counter for generating unique escrow IDs.
+    NextEscrowId,
+    /// Escrow history for auditing.
+    EscrowHistory(u64),
 }
 
 /// A bridge record linking an SBT to a token on a standard (transferable) NFT
@@ -148,6 +164,26 @@ pub enum OwnershipAction {
     Created,
     Updated,
     Removed,
+}
+
+/// SBT held in escrow pending condition satisfaction.
+#[contracttype]
+#[derive(Clone)]
+pub struct EscrowRecord {
+    pub escrow_id: u64,
+    pub sbt_id: u64,
+    pub escrow_agent: Address,
+    pub conditions: Bytes,
+    pub created_at: u64,
+    pub released: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EscrowStatus {
+    Active,
+    Released,
+    Disputed,
 }
 
 /// A condition gating one leg of a conditional batch transfer.
@@ -357,6 +393,85 @@ impl SbtContract {
         env.storage()
             .instance()
             .has(&DataKey::FractionalOwnership(sbt_id))
+    }
+
+    // ---- #46: SBT Escrow for Conditional Transfer ----
+
+    /// Place an SBT in escrow with conditions for release.
+    pub fn escrow_sbt(
+        env: Env,
+        sbt_id: u64,
+        escrow_agent: Address,
+        conditions: Bytes,
+    ) -> u64 {
+        Self::require_owner(&env, sbt_id);
+
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(sbt_id))
+        {
+            panic_with_error!(&env, SbtError::AlreadyInEscrow);
+        }
+
+        let escrow_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextEscrowId)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::NextEscrowId, &(escrow_id + 1));
+
+        let escrow = EscrowRecord {
+            escrow_id,
+            sbt_id,
+            escrow_agent: escrow_agent.clone(),
+            conditions: conditions.clone(),
+            created_at: env.ledger().timestamp(),
+            released: false,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(sbt_id), &escrow);
+
+        env.events()
+            .publish((ESCROW_CREATED_TOPIC,), (escrow_id, sbt_id, escrow_agent));
+
+        escrow_id
+    }
+
+    /// Release an SBT from escrow after conditions are satisfied.
+    pub fn release_sbt_from_escrow(env: Env, sbt_id: u64, proof: Bytes) {
+        let escrow: EscrowRecord = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(sbt_id))
+            .unwrap_or_else(|| panic_with_error!(&env, SbtError::NotInEscrow));
+
+        escrow.escrow_agent.require_auth();
+
+        if proof.is_empty() {
+            panic_with_error!(&env, SbtError::EscrowConditionsNotMet);
+        }
+
+        let mut updated_escrow = escrow.clone();
+        updated_escrow.released = true;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(sbt_id), &updated_escrow);
+
+        env.events()
+            .publish((ESCROW_RELEASED_TOPIC,), (updated_escrow.escrow_id, sbt_id));
+    }
+
+    /// Get escrow details for an SBT if it is in escrow.
+    pub fn get_escrow_status(env: Env, sbt_id: u64) -> Option<EscrowRecord> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Escrow(sbt_id))
     }
 
     // ---- #54: SBT composability with other NFTs ----
