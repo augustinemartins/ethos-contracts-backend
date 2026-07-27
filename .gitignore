@@ -6,10 +6,14 @@ target/
 *.snap.new
 test_snapshots/
 *.proptest-regressions
+insta.yaml
 
 # Build artifacts
 *.wasm
 *.d
+*.o
+*.a
+*.rlib
 
 # Environment files
 .env
@@ -25,15 +29,48 @@ test_snapshots/
 *.swp
 *.swo
 *~
+*.iml
+.editorconfig.local
 
 # OS
 .DS_Store
 Thumbs.db
+desktop.ini
 
 # Node (frontend/backend tooling)
 node_modules/
 dist/
 .cache/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
 
 # Logs
 *.log
+logs/
+*.log.*
+
+# Fuzz artifacts
+contracts/*/fuzz/corpus/
+contracts/*/fuzz/artifacts/
+fuzz/corpus/
+fuzz/artifacts/
+
+# Coverage reports
+lcov.info
+coverage/
+tarpaulin-report.html
+cobertura.xml
+
+# Benchmark artifacts
+criterion/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.orig
+
+# Kiro agent internal files
+.kiro/
