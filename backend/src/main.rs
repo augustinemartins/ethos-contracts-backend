@@ -4,6 +4,7 @@ use std::time::Duration;
 use axum::{
     extract::State,
     http::{HeaderValue, Method, StatusCode},
+    middleware,
     routing::{delete, get, post},
     Json, Router,
 };
@@ -37,6 +38,7 @@ use ethos_protocol_backend::{
     priority::{PriorityConfig, PriorityEnforcer},
     routes, scheduler,
     streaming::{stream_events, stream_vaults},
+    timeout_policy::{self, TimeoutState},
     webhook::{delete_webhook, list_webhooks, register_webhook, WebhookState},
 };
 
@@ -128,6 +130,10 @@ async fn consensus_health_handler(
 }
 
 pub fn build_router(state: AppState) -> Router {
+    let retry_state = RetryPolicyState::new();
+    let bulkhead_registry = Arc::new(BulkheadRegistry::new(BulkheadConfig::default()));
+    let timeout_state = TimeoutState::new();
+
     Router::new()
         // ── Health ──────────────────────────────────────────────────────────
         .route("/health", get(health_handler))
