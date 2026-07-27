@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     extract::State,
@@ -10,20 +11,26 @@ use tower_http::cors::CorsLayer;
 use tracing_subscriber::EnvFilter;
 
 use ethos_protocol_backend::{
-    batch::batch_set_preferences,
+    batching::{AdaptiveBatcher, BatchConfig},
     consensus::NodeCache,
     contract_version_check::{check_contract_version, parse_min_contract_version},
     db::{
         create_audit_store, create_event_store, create_share_store, create_share_token_store,
         create_vault_store, AppState, Db, PoolConfig,
     },
-    dlq::{list_dlq_entries, replay_dlq_entries, DlqState},
-    fallback::{
-        get_fallback_chain, list_fallback_chains, register_fallback_chain, test_fallback_chain,
-        FallbackState,
+    cost_tracking::{allocate_cost, get_cost_report, record_cost_entry, CostState},
+    degradation::{
+        capability_fallback, list_capabilities, negotiate_capabilities, set_capability,
+        DegradationState,
     },
+    feature_flags::{evaluate_flag_handler, get_flag, list_flags, upsert_flag, FlagState},
     graphql::{build_schema, graphql_handler, graphql_playground},
-    health_routing::{list_health, routing_metrics, test_routing_decision, HealthRoutingState},
+    load_shedding::{admission_middleware, LoadMonitor, LoadShedder, SheddingConfig},
+    metrics::Metrics,
+    predictive_scaling::{
+        self, ForecastModel, LoggingAutoscalerClient, PredictiveScaler, ScalingConfig,
+    },
+    priority::{PriorityConfig, PriorityEnforcer},
     routes, scheduler,
     streaming::{stream_events, stream_vaults},
     webhook::{delete_webhook, list_webhooks, register_webhook, WebhookState},
@@ -75,6 +82,17 @@ async fn ready_handler(
     }
 }
 
+/// Prometheus text-format metrics for scraping, combining base counters
+/// with load shedding (#128), adaptive batching (#131) and predictive
+/// scaling (#130) metrics.
+async fn metrics_handler(State(state): State<AppState>) -> String {
+    let mut out = state.metrics.render();
+    out.push_str(&state.load_shedder.render_prometheus());
+    out.push_str(&state.batcher.render_prometheus());
+    out.push_str(&state.scaler.render_prometheus());
+    out
+}
+
 async fn consensus_health_handler(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -101,6 +119,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(health_handler))
         .route("/health/consensus", get(consensus_health_handler))
         .route("/ready", get(ready_handler))
+        .route("/metrics", get(metrics_handler))
         // ── Legacy reminder / subscription routes ────────────────────────────
         .route(
             "/api/vaults/:vault_id/reminder-preferences",
@@ -129,28 +148,11 @@ pub fn build_router(state: AppState) -> Router {
         // ── Streaming routes (#67) ───────────────────────────────────────────
         .route("/stream/vaults", get(stream_vaults))
         .route("/stream/events", get(stream_events))
-        // ── Fallback chain admin routes ──────────────────────────────────────
-        .route(
-            "/admin/fallback-chains",
-            post(register_fallback_chain).get(list_fallback_chains),
-        )
-        .route("/admin/fallback-chains/:id", get(get_fallback_chain))
-        .route(
-            "/admin/fallback-chains/:id/test",
-            post(test_fallback_chain),
-        )
-        // ── Dead-letter queue admin routes ───────────────────────────────────
-        .route("/admin/dlq", get(list_dlq_entries))
-        .route("/admin/dlq/replay", post(replay_dlq_entries))
-        // ── Batch partial-failure routes ─────────────────────────────────────
-        .route(
-            "/api/vaults/batch/reminder-preferences",
-            post(batch_set_preferences),
-        )
-        // ── Health-aware routing admin routes ────────────────────────────────
-        .route("/admin/routing/health", get(list_health))
-        .route("/admin/routing/metrics", get(routing_metrics))
-        .route("/admin/routing/test", post(test_routing_decision))
+        // ── Request prioritization / load shedding (#128, #129) ──────────────
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            admission_middleware,
+        ))
         .layer(build_cors_layer())
         .with_state(state)
 }
@@ -215,12 +217,24 @@ async fn main() {
     let event_store = create_event_store();
     let graphql_schema = build_schema(Arc::clone(&vault_store), Arc::clone(&event_store));
 
-    let dlq_state = Arc::new(DlqState::new());
-    let health_routing_state = Arc::new(HealthRoutingState::new());
-    let webhook_state = Arc::new(WebhookState::with_reliability_state(
-        Arc::clone(&dlq_state),
-        Arc::clone(&health_routing_state),
+    // ── Request prioritization / load shedding / batching / scaling ──────────
+    // (#128, #129, #130, #131)
+    let metrics = Metrics::new();
+    let priority_enforcer = Arc::new(PriorityEnforcer::new(PriorityConfig::from_env()));
+    let load_shedder = Arc::new(LoadShedder::new(LoadMonitor::new(), SheddingConfig::from_env()));
+    let batcher = Arc::new(AdaptiveBatcher::new(BatchConfig::from_env()));
+    let scaler = Arc::new(PredictiveScaler::new(
+        288, // 24h of history at a 5-minute sampling interval
+        ForecastModel::default(),
+        ScalingConfig::from_env(),
+        Box::new(LoggingAutoscalerClient),
     ));
+
+    let scaling_metrics = Arc::clone(&metrics);
+    let scaling_scaler = Arc::clone(&scaler);
+    tokio::spawn(async move {
+        predictive_scaling::run(scaling_scaler, scaling_metrics, Duration::from_secs(300)).await;
+    });
 
     let state = AppState {
         db,
@@ -232,9 +246,11 @@ async fn main() {
         consensus,
         webhook_state,
         graphql_schema,
-        fallback_state: Arc::new(FallbackState::new()),
-        dlq_state,
-        health_routing_state,
+        metrics,
+        priority_enforcer,
+        load_shedder,
+        batcher,
+        scaler,
     };
 
     let app = build_router(state);

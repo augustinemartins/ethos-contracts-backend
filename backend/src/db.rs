@@ -62,12 +62,16 @@ pub struct AppState {
     pub webhook_state: Arc<crate::webhook::WebhookState>,
     /// GraphQL schema for the /graphql endpoint (#66).
     pub graphql_schema: crate::graphql::EthosSchema,
-    /// Fallback chain registry for graceful degradation.
-    pub fallback_state: Arc<crate::fallback::FallbackState>,
-    /// Dead-letter queue for failed asynchronous deliveries.
-    pub dlq_state: Arc<crate::dlq::DlqState>,
-    /// Health-aware routing weights for outbound delivery targets.
-    pub health_routing_state: Arc<crate::health_routing::HealthRoutingState>,
+    /// Prometheus-style counters exposed at `/metrics`.
+    pub metrics: Arc<crate::metrics::Metrics>,
+    /// Per-priority concurrency enforcement (#129).
+    pub priority_enforcer: Arc<crate::priority::PriorityEnforcer>,
+    /// Adaptive overload protection (#128).
+    pub load_shedder: Arc<crate::load_shedding::LoadShedder>,
+    /// Adaptive batch sizing for background batch jobs (#131).
+    pub batcher: Arc<crate::batching::AdaptiveBatcher>,
+    /// Traffic forecasting and replica recommendations (#130).
+    pub scaler: Arc<crate::predictive_scaling::PredictiveScaler>,
 }
 
 impl axum::extract::FromRef<AppState> for Arc<Db> {
@@ -94,21 +98,27 @@ impl axum::extract::FromRef<AppState> for crate::graphql::EthosSchema {
     }
 }
 
-impl axum::extract::FromRef<AppState> for Arc<crate::fallback::FallbackState> {
-    fn from_ref(state: &AppState) -> Arc<crate::fallback::FallbackState> {
-        Arc::clone(&state.fallback_state)
+impl axum::extract::FromRef<AppState> for Arc<crate::feature_flags::FlagState> {
+    fn from_ref(state: &AppState) -> Arc<crate::feature_flags::FlagState> {
+        Arc::clone(&state.flag_state)
     }
 }
 
-impl axum::extract::FromRef<AppState> for Arc<crate::dlq::DlqState> {
-    fn from_ref(state: &AppState) -> Arc<crate::dlq::DlqState> {
-        Arc::clone(&state.dlq_state)
+impl axum::extract::FromRef<AppState> for Arc<crate::profiler::ProfilerState> {
+    fn from_ref(state: &AppState) -> Arc<crate::profiler::ProfilerState> {
+        Arc::clone(&state.profiler_state)
     }
 }
 
-impl axum::extract::FromRef<AppState> for Arc<crate::health_routing::HealthRoutingState> {
-    fn from_ref(state: &AppState) -> Arc<crate::health_routing::HealthRoutingState> {
-        Arc::clone(&state.health_routing_state)
+impl axum::extract::FromRef<AppState> for Arc<crate::cost_tracking::CostState> {
+    fn from_ref(state: &AppState) -> Arc<crate::cost_tracking::CostState> {
+        Arc::clone(&state.cost_state)
+    }
+}
+
+impl axum::extract::FromRef<AppState> for Arc<crate::degradation::DegradationState> {
+    fn from_ref(state: &AppState) -> Arc<crate::degradation::DegradationState> {
+        Arc::clone(&state.degradation_state)
     }
 }
 
