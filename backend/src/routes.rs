@@ -314,3 +314,50 @@ pub async fn full_text_search(
         query_time_ms: 50,
     }))
 }
+
+// ── #80: Query Cache Stats Endpoint ─────────────────────────────────────────
+
+/// GET /admin/query-cache/stats
+pub async fn get_query_cache_stats(
+    State(state): State<Arc<AppState>>,
+) -> Json<crate::query_cache::CacheStats> {
+    Json(state.query_cache.stats())
+}
+
+// ── #81: Backup Validation Endpoint ─────────────────────────────────────────
+
+/// POST /admin/validate-backup
+///
+/// Body: `{"backup_id": "...", "data_base64": "..."}`
+pub async fn validate_backup(
+    State(_state): State<Arc<AppState>>,
+    Json(body): Json<crate::models::BackupValidateRequest>,
+) -> Result<Json<crate::backup_validation::BackupValidationResult>, AppError> {
+    // Decode the base64-encoded backup payload.
+    use base64::Engine as _;
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(&body.data_base64)
+        .map_err(|e| AppError::InvalidInput(format!("invalid base64 data: {e}")))?;
+
+    let result = crate::backup_validation::BackupValidator::validate_backup(&body.backup_id, &data);
+    Ok(Json(result))
+}
+
+// ── #82: Deadlock Stats Endpoint ─────────────────────────────────────────────
+
+/// GET /admin/deadlock/stats
+pub async fn get_deadlock_stats(
+    State(state): State<Arc<AppState>>,
+) -> Json<crate::deadlock::DeadlockStats> {
+    Json(state.deadlock_detector.stats())
+}
+
+// ── #83: Consistency Verification Endpoint ───────────────────────────────────
+
+/// POST /admin/verify-consistency
+pub async fn verify_consistency(
+    State(state): State<Arc<AppState>>,
+) -> Json<crate::consistency::ConsistencyReport> {
+    let report = crate::consistency::ConsistencyChecker::run_all_checks(&state.db);
+    Json(report)
+}

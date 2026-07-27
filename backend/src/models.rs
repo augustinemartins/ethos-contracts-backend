@@ -921,3 +921,14 @@ pub struct FullTextSearchResponse {
     pub facets: Vec<SearchFacet>,
     pub query_time_ms: u64,
 }
+
+// ── #81: Backup Validation models ────────────────────────────────────────────
+
+/// Request body for `POST /admin/validate-backup`.
+#[derive(Debug, Deserialize)]
+pub struct BackupValidateRequest {
+    /// Caller-supplied identifier for this backup snapshot.
+    pub backup_id: String,
+    /// The raw SQLite backup bytes, base64-encoded.
+    pub data_base64: String,
+}

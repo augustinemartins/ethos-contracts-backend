@@ -45,6 +45,8 @@ fn test_state(db: Arc<Db>) -> AppState {
         consensus,
         webhook_state: Arc::new(WebhookState::new()),
         graphql_schema,
+        query_cache: Arc::new(ethos_protocol_backend::query_cache::QueryCache::new()),
+        deadlock_detector: Arc::new(ethos_protocol_backend::deadlock::DeadlockDetector::new()),
     }
 }
 
@@ -314,6 +316,8 @@ async fn test_consensus_health_detects_and_resolves_divergence() {
         consensus,
         webhook_state: Arc::new(WebhookState::new()),
         graphql_schema: build_schema(create_vault_store(), create_event_store()),
+        query_cache: Arc::new(ethos_protocol_backend::query_cache::QueryCache::new()),
+        deadlock_detector: Arc::new(ethos_protocol_backend::deadlock::DeadlockDetector::new()),
     };
     db.migrate().unwrap();
 

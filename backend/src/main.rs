@@ -16,7 +16,9 @@ use ethos_protocol_backend::{
         create_audit_store, create_event_store, create_share_store, create_share_token_store,
         create_vault_store, AppState, Db, PoolConfig,
     },
+    deadlock::DeadlockDetector,
     graphql::{build_schema, graphql_handler, graphql_playground},
+    query_cache::QueryCache,
     routes, scheduler,
     streaming::{stream_events, stream_vaults},
     webhook::{delete_webhook, list_webhooks, register_webhook, WebhookState},
@@ -122,6 +124,14 @@ pub fn build_router(state: AppState) -> Router {
         // ── Streaming routes (#67) ───────────────────────────────────────────
         .route("/stream/vaults", get(stream_vaults))
         .route("/stream/events", get(stream_events))
+        // ── Admin: query cache stats (#80) ───────────────────────────────────
+        .route("/admin/query-cache/stats", get(routes::get_query_cache_stats))
+        // ── Admin: backup validation (#81) ───────────────────────────────────
+        .route("/admin/validate-backup", post(routes::validate_backup))
+        // ── Admin: deadlock stats (#82) ──────────────────────────────────────
+        .route("/admin/deadlock/stats", get(routes::get_deadlock_stats))
+        // ── Admin: consistency verification (#83) ────────────────────────────
+        .route("/admin/verify-consistency", post(routes::verify_consistency))
         .layer(build_cors_layer())
         .with_state(state)
 }
@@ -196,6 +206,8 @@ async fn main() {
         consensus,
         webhook_state: Arc::new(WebhookState::new()),
         graphql_schema,
+        query_cache: Arc::new(QueryCache::new()),
+        deadlock_detector: Arc::new(DeadlockDetector::new()),
     };
 
     let app = build_router(state);
