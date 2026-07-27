@@ -24,6 +24,7 @@ pub mod priority;
 pub mod routes;
 pub mod saga;
 pub mod scheduler;
+pub mod secret_rotation;
 pub mod streaming;
 pub mod templates;
 pub mod timeout_adaptation;
