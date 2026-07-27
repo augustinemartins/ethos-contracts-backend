@@ -13,20 +13,42 @@ use tower::ServiceExt;
 use tower_http::cors::CorsLayer;
 
 use ethos_protocol_backend::{
-    cache::VaultCache,
-    cache_invalidation::CacheInvalidator,
-    cache_warming::CacheWarmer,
+    batching::{AdaptiveBatcher, BatchConfig},
     consensus::{CacheBackend, ConflictStrategy, InMemoryBackend, NodeCache},
     db::{
         create_audit_store, create_event_store, create_share_store, create_share_token_store,
         create_vault_store, Db, PoolConfig,
     },
     graphql::build_schema,
-    multilevel_cache::MultiLevelCache,
+    load_shedding::{LoadMonitor, LoadShedder, SheddingConfig},
+    metrics::Metrics,
+    predictive_scaling::{ForecastModel, LoggingAutoscalerClient, PredictiveScaler, ScalingConfig},
+    priority::{PriorityConfig, PriorityEnforcer},
     routes,
     webhook::WebhookState,
     AppState,
 };
+
+fn test_scaling_state() -> (
+    Arc<Metrics>,
+    Arc<PriorityEnforcer>,
+    Arc<LoadShedder>,
+    Arc<AdaptiveBatcher>,
+    Arc<PredictiveScaler>,
+) {
+    (
+        Metrics::new(),
+        Arc::new(PriorityEnforcer::new(PriorityConfig::default())),
+        Arc::new(LoadShedder::new(LoadMonitor::new(), SheddingConfig::default())),
+        Arc::new(AdaptiveBatcher::new(BatchConfig::default())),
+        Arc::new(PredictiveScaler::new(
+            10,
+            ForecastModel::default(),
+            ScalingConfig::default(),
+            Box::new(LoggingAutoscalerClient),
+        )),
+    )
+}
 
 fn test_state(db: Arc<Db>) -> AppState {
     db.migrate().unwrap();
@@ -39,10 +61,7 @@ fn test_state(db: Arc<Db>) -> AppState {
     let vault_store = create_vault_store();
     let event_store = create_event_store();
     let graphql_schema = build_schema(Arc::clone(&vault_store), Arc::clone(&event_store));
-    let cache = Arc::new(VaultCache::new());
-    let cache_warmer = Arc::new(CacheWarmer::new());
-    let cache_invalidator = Arc::new(CacheInvalidator::new(Arc::clone(&cache)));
-    let multilevel_cache = Arc::new(MultiLevelCache::new());
+    let (metrics, priority_enforcer, load_shedder, batcher, scaler) = test_scaling_state();
     AppState {
         db,
         vault_store,
@@ -53,10 +72,11 @@ fn test_state(db: Arc<Db>) -> AppState {
         consensus,
         webhook_state: Arc::new(WebhookState::new()),
         graphql_schema,
-        cache,
-        cache_warmer,
-        cache_invalidator,
-        multilevel_cache,
+        metrics,
+        priority_enforcer,
+        load_shedder,
+        batcher,
+        scaler,
     }
 }
 
@@ -316,6 +336,7 @@ async fn test_consensus_health_detects_and_resolves_divergence() {
         version: 1,
     });
 
+    let (metrics, priority_enforcer, load_shedder, batcher, scaler) = test_scaling_state();
     let state = AppState {
         db: Arc::clone(&db),
         vault_store: create_vault_store(),
@@ -326,13 +347,11 @@ async fn test_consensus_health_detects_and_resolves_divergence() {
         consensus,
         webhook_state: Arc::new(WebhookState::new()),
         graphql_schema: build_schema(create_vault_store(), create_event_store()),
-        cache: Arc::new(VaultCache::new()),
-        cache_warmer: Arc::new(CacheWarmer::new()),
-        cache_invalidator: {
-            let c = Arc::new(VaultCache::new());
-            Arc::new(CacheInvalidator::new(c))
-        },
-        multilevel_cache: Arc::new(MultiLevelCache::new()),
+        metrics,
+        priority_enforcer,
+        load_shedder,
+        batcher,
+        scaler,
     };
     db.migrate().unwrap();
 

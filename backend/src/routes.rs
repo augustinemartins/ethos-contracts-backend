@@ -315,83 +315,49 @@ pub async fn full_text_search(
     }))
 }
 
-// ── #87: Cache Warming Endpoint ──────────────────────────────────────────────
+// ── #80: Query Cache Stats Endpoint ─────────────────────────────────────────
 
-/// POST /admin/warm-cache — Trigger predictive cache warming.
-pub async fn warm_cache(
+/// GET /admin/query-cache/stats
+pub async fn get_query_cache_stats(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let cache = &state.cache;
-    let vault_store = &state.vault_store;
-    let warmer = &state.cache_warmer;
-
-    let result = warmer.warm_cache(cache, vault_store).await;
-    let stats = warmer.get_stats();
-
-    Ok(Json(serde_json::json!({
-        "warmed_count": result.warmed_count,
-        "failed_count": result.failed_count,
-        "skipped_count": result.skipped_count,
-        "vault_ids": result.vault_ids,
-        "prediction_stats": {
-            "total_prefetches": stats.total_prefetches,
-            "successful_prefetches": stats.successful_prefetches,
-            "avg_confidence": stats.avg_confidence,
-        }
-    })))
+) -> Json<crate::query_cache::CacheStats> {
+    Json(state.query_cache.stats())
 }
 
-// ── #85: Multi-Level Cache Stats Endpoint ────────────────────────────────────
+// ── #81: Backup Validation Endpoint ─────────────────────────────────────────
 
-/// GET /admin/cache-stats — Return per-level cache statistics.
-pub async fn cache_stats(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let stats = state.multilevel_cache.get_stats();
+/// POST /admin/validate-backup
+///
+/// Body: `{"backup_id": "...", "data_base64": "..."}`
+pub async fn validate_backup(
+    State(_state): State<Arc<AppState>>,
+    Json(body): Json<crate::models::BackupValidateRequest>,
+) -> Result<Json<crate::backup_validation::BackupValidationResult>, AppError> {
+    // Decode the base64-encoded backup payload.
+    use base64::Engine as _;
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(&body.data_base64)
+        .map_err(|e| AppError::InvalidInput(format!("invalid base64 data: {e}")))?;
 
-    Ok(Json(serde_json::json!({
-        "l1": {
-            "hits": stats.l1.hits,
-            "misses": stats.l1.misses,
-            "insertions": stats.l1.insertions,
-            "evictions": stats.l1.evictions,
-            "live_entries": stats.l1_live_entries,
-        },
-        "l2": {
-            "hits": stats.l2.hits,
-            "misses": stats.l2.misses,
-            "insertions": stats.l2.insertions,
-            "promotions": stats.l2.promotions,
-            "live_entries": stats.l2_live_entries,
-        },
-        "warming": {
-            "total_accesses": state.cache_warmer.get_stats().total_accesses,
-            "total_prefetches": state.cache_warmer.get_stats().total_prefetches,
-            "successful_prefetches": state.cache_warmer.get_stats().successful_prefetches,
-            "avg_confidence": state.cache_warmer.get_stats().avg_confidence,
-        },
-        "invalidation": {
-            "total_events": state.cache_invalidator.get_stats().total_events,
-            "total_invalidations": state.cache_invalidator.get_stats().total_invalidations,
-            "cascade_invalidations": state.cache_invalidator.get_stats().cascade_invalidations,
-            "global_flushes": state.cache_invalidator.get_stats().global_flushes,
-        }
-    })))
+    let result = crate::backup_validation::BackupValidator::validate_backup(&body.backup_id, &data);
+    Ok(Json(result))
 }
 
-// ── #86: Cache Invalidation Endpoint ─────────────────────────────────────────
+// ── #82: Deadlock Stats Endpoint ─────────────────────────────────────────────
 
-/// POST /admin/cache-invalidate — Flush the entire cache (global flush).
-pub async fn cache_invalidate(
+/// GET /admin/deadlock/stats
+pub async fn get_deadlock_stats(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    use crate::cache_invalidation::CacheEvent;
+) -> Json<crate::deadlock::DeadlockStats> {
+    Json(state.deadlock_detector.stats())
+}
 
-    state.cache_invalidator.handle_event(CacheEvent::GlobalFlush);
-    state.multilevel_cache.invalidate_all();
+// ── #83: Consistency Verification Endpoint ───────────────────────────────────
 
-    Ok(Json(serde_json::json!({
-        "status": "ok",
-        "message": "All cache levels flushed"
-    })))
+/// POST /admin/verify-consistency
+pub async fn verify_consistency(
+    State(state): State<Arc<AppState>>,
+) -> Json<crate::consistency::ConsistencyReport> {
+    let report = crate::consistency::ConsistencyChecker::run_all_checks(&state.db);
+    Json(report)
 }
