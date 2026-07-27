@@ -14,6 +14,10 @@ use ethos_protocol_backend::{
     batching::{AdaptiveBatcher, BatchConfig},
     consensus::NodeCache,
     contract_version_check::{check_contract_version, parse_min_contract_version},
+    custom_metrics::{
+        aggregate_custom_metric, create_dashboard_share, get_shared_dashboard,
+        list_custom_metrics, list_dashboard_templates, record_custom_metric, CustomMetricsStore,
+    },
     db::{
         create_audit_store, create_event_store, create_share_store, create_share_token_store,
         create_vault_store, AppState, Db, PoolConfig,
@@ -253,7 +257,52 @@ async fn main() {
         scaler,
     };
 
-    let app = build_router(state);
+    // ── Dynamic ACL admin routes ─────────────────────────────────────────
+    // Kept on their own small router (own state) and merged in, since the
+    // ACL store is independent of AppState/Db.
+    let acl_store = AclStore::new();
+    let acl_router = Router::new()
+        .route("/admin/acl", post(create_acl_rule).get(list_acl_rules))
+        .route("/admin/acl/:id", delete(delete_acl_rule))
+        .route("/admin/acl/audit", get(acl_audit_trail))
+        .with_state(acl_store);
+
+    // ── Custom metrics + Grafana dashboard routes ────────────────────────
+    let custom_metrics_store = CustomMetricsStore::new();
+    let custom_metrics_router = Router::new()
+        .route(
+            "/metrics/custom",
+            post(record_custom_metric).get(list_custom_metrics),
+        )
+        .route(
+            "/metrics/custom/:name/aggregate",
+            get(aggregate_custom_metric),
+        )
+        .route("/dashboards/templates", get(list_dashboard_templates))
+        .route("/dashboards/share", post(create_dashboard_share))
+        .route("/dashboards/shared/:token", get(get_shared_dashboard))
+        .with_state(custom_metrics_store);
+
+    // ── Anomaly detection routes ──────────────────────────────────────────
+    let anomaly_store = AnomalyStore::new();
+    let anomaly_router = Router::new()
+        .route("/anomaly/observe", post(observe_metric))
+        .route("/anomaly/alerts", get(list_alerts))
+        .route("/anomaly/baseline/:metric", get(get_baseline))
+        .with_state(anomaly_store);
+
+    // ── Structured log parsing / search routes ───────────────────────────
+    let log_store = LogStore::new();
+    let log_router = Router::new()
+        .route("/logs/ingest", post(ingest_logs))
+        .route("/logs/search", get(search_logs))
+        .with_state(log_store);
+
+    let app = build_router(state)
+        .merge(acl_router)
+        .merge(custom_metrics_router)
+        .merge(anomaly_router)
+        .merge(log_router);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     tracing::info!("listening on {}", listener.local_addr().unwrap());
