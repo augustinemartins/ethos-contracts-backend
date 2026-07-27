@@ -17,22 +17,26 @@ fuzz/artifacts/
 coverage/
 *.tmp
 
-# Build artifacts
+# ── Build artifacts ───────────────────────────────────────────────────────────
 *.wasm
 *.d
 *.o
 *.a
 
-# Environment files
+# ── Benchmark output ──────────────────────────────────────────────────────────
+criterion/
+
+# ── Environment files ─────────────────────────────────────────────────────────
 .env
 .env.local
 .env.*.local
 .env.production
 
-# Local Stellar CLI identity/config store
+# ── Local Stellar / Soroban CLI stores ────────────────────────────────────────
 .soroban/
+.stellar/
 
-# Editor / IDE
+# ── Editor / IDE ──────────────────────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
@@ -41,12 +45,17 @@ coverage/
 *.iml
 .editorconfig.local
 
-# OS
+# ── OS files ──────────────────────────────────────────────────────────────────
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
 Thumbs.db
 desktop.ini
 
-# Node (frontend/backend tooling)
+# ── Node (frontend / backend tooling) ────────────────────────────────────────
 node_modules/
 dist/
 .cache/
@@ -54,7 +63,7 @@ dist/
 .turbo/
 *.tsbuildinfo
 
-# Logs
+# ── Logs ──────────────────────────────────────────────────────────────────────
 *.log
 logs/
 npm-debug.log*

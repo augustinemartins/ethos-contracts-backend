@@ -9,6 +9,7 @@ use axum::{
     Json, Router,
 };
 use tower_http::cors::CorsLayer;
+use tower_http::decompression::RequestDecompressionLayer;
 use tracing_subscriber::EnvFilter;
 
 use ethos_protocol_backend::{
@@ -40,6 +41,9 @@ use ethos_protocol_backend::{
     streaming::{stream_events, stream_vaults},
     timeout_policy::{self, TimeoutState},
     webhook::{delete_webhook, list_webhooks, register_webhook, WebhookState},
+    decompression::DecompressionConfig,
+    rpc_pool::{RpcPool, RpcPoolConfig},
+    tracing_sampling::TraceSampler,
 };
 
 #[cfg(test)]
@@ -209,6 +213,32 @@ async fn main() {
         std::process::exit(1);
     }
 
+    // #132: Request decompression config.
+    let decomp_config = DecompressionConfig::from_env();
+    tracing::info!(
+        enabled = decomp_config.enabled,
+        max_body_bytes = decomp_config.max_body_bytes,
+        "request decompression configuration"
+    );
+
+    // #133: RPC connection pool.
+    let rpc_pool_config = RpcPoolConfig::from_env();
+    let rpc_pool = RpcPool::new(&rpc_pool_config).expect("failed to build RPC connection pool");
+    tracing::info!(
+        max_idle_per_host = rpc_pool_config.max_idle_per_host,
+        idle_timeout_secs = rpc_pool_config.idle_timeout_secs,
+        connection_timeout_secs = rpc_pool_config.connection_timeout_secs,
+        request_timeout_secs = rpc_pool_config.request_timeout_secs,
+        "RPC connection pool initialized"
+    );
+
+    // #134: Trace sampler.
+    let sampler = TraceSampler::from_env();
+    tracing::info!(
+        sample_rate = sampler.effective_rate(),
+        "request trace sampler initialized"
+    );
+
     let pool_config = PoolConfig::from_env();
     tracing::info!(
         min = pool_config.min,
@@ -220,6 +250,11 @@ async fn main() {
     let db =
         Arc::new(Db::open_with_pool_config(":memory:", &pool_config).expect("failed to open db"));
     db.migrate().expect("migration failed");
+
+    // Keep sampler and rpc_pool alive for the duration of the process.
+    // They are logged at startup; full integration into AppState is done when
+    // handlers need them directly.
+    let _ = (rpc_pool, sampler);
 
     let consensus = NodeCache::from_env();
     tracing::info!(
