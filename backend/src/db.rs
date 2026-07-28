@@ -62,8 +62,16 @@ pub struct AppState {
     pub webhook_state: Arc<crate::webhook::WebhookState>,
     /// GraphQL schema for the /graphql endpoint (#66).
     pub graphql_schema: crate::graphql::EthosSchema,
-    /// Cache metrics collector (#94).
-    pub cache_metrics: Arc<crate::cache_metrics::CacheMetrics>,
+    /// Prometheus-style counters exposed at `/metrics`.
+    pub metrics: Arc<crate::metrics::Metrics>,
+    /// Per-priority concurrency enforcement (#129).
+    pub priority_enforcer: Arc<crate::priority::PriorityEnforcer>,
+    /// Adaptive overload protection (#128).
+    pub load_shedder: Arc<crate::load_shedding::LoadShedder>,
+    /// Adaptive batch sizing for background batch jobs (#131).
+    pub batcher: Arc<crate::batching::AdaptiveBatcher>,
+    /// Traffic forecasting and replica recommendations (#130).
+    pub scaler: Arc<crate::predictive_scaling::PredictiveScaler>,
 }
 
 impl axum::extract::FromRef<AppState> for Arc<Db> {
@@ -90,9 +98,27 @@ impl axum::extract::FromRef<AppState> for crate::graphql::EthosSchema {
     }
 }
 
-impl axum::extract::FromRef<AppState> for Arc<crate::cache_metrics::CacheMetrics> {
-    fn from_ref(state: &AppState) -> Arc<crate::cache_metrics::CacheMetrics> {
-        Arc::clone(&state.cache_metrics)
+impl axum::extract::FromRef<AppState> for Arc<crate::feature_flags::FlagState> {
+    fn from_ref(state: &AppState) -> Arc<crate::feature_flags::FlagState> {
+        Arc::clone(&state.flag_state)
+    }
+}
+
+impl axum::extract::FromRef<AppState> for Arc<crate::profiler::ProfilerState> {
+    fn from_ref(state: &AppState) -> Arc<crate::profiler::ProfilerState> {
+        Arc::clone(&state.profiler_state)
+    }
+}
+
+impl axum::extract::FromRef<AppState> for Arc<crate::cost_tracking::CostState> {
+    fn from_ref(state: &AppState) -> Arc<crate::cost_tracking::CostState> {
+        Arc::clone(&state.cost_state)
+    }
+}
+
+impl axum::extract::FromRef<AppState> for Arc<crate::degradation::DegradationState> {
+    fn from_ref(state: &AppState) -> Arc<crate::degradation::DegradationState> {
+        Arc::clone(&state.degradation_state)
     }
 }
 
@@ -856,6 +882,72 @@ impl Db {
                     created_at    TEXT NOT NULL,
                     expires_at    TEXT NOT NULL
                 );
+                ",
+            ),
+            (
+                "10",
+                r"
+                CREATE TABLE IF NOT EXISTS data_retention_policies (
+                    data_type        TEXT PRIMARY KEY,
+                    retention_days   INTEGER NOT NULL,
+                    enabled          INTEGER NOT NULL DEFAULT 1,
+                    description      TEXT NOT NULL DEFAULT '',
+                    created_at       TEXT NOT NULL,
+                    updated_at       TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS retention_deletion_log (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    data_type    TEXT NOT NULL,
+                    deleted_rows INTEGER NOT NULL,
+                    purged_at    TEXT NOT NULL,
+                    actor        TEXT NOT NULL DEFAULT 'system',
+                    details      TEXT
+                );
+                CREATE TABLE IF NOT EXISTS retention_exceptions (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    data_type    TEXT NOT NULL,
+                    record_id    TEXT NOT NULL,
+                    reason       TEXT NOT NULL,
+                    expires_at   TEXT,
+                    created_at   TEXT NOT NULL,
+                    created_by   TEXT NOT NULL DEFAULT 'system'
+                );
+                ",
+            ),
+            (
+                "11",
+                r"
+                -- #101: Encryption key version metadata
+                CREATE TABLE IF NOT EXISTS encryption_key_versions (
+                    version     INTEGER PRIMARY KEY,
+                    status      TEXT NOT NULL DEFAULT 'active',
+                    created_at  TEXT NOT NULL,
+                    rotated_at  TEXT
+                );
+
+                -- #103: Secret rotation policies and logs
+                CREATE TABLE IF NOT EXISTS secret_rotation_policies (
+                    secret_type             TEXT PRIMARY KEY,
+                    rotation_interval_days  INTEGER NOT NULL,
+                    grace_period_hours      INTEGER NOT NULL DEFAULT 24,
+                    auto_rotate             INTEGER NOT NULL DEFAULT 0,
+                    notify_channels         TEXT NOT NULL DEFAULT '[]',
+                    created_at              TEXT NOT NULL,
+                    updated_at              TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS secret_rotation_logs (
+                    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                    secret_type           TEXT NOT NULL,
+                    rotated_at            TEXT NOT NULL,
+                    actor                 TEXT NOT NULL DEFAULT 'system',
+                    grace_period_active   INTEGER NOT NULL DEFAULT 0,
+                    grace_period_ends_at  TEXT,
+                    notes                 TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_secret_rotation_logs_type
+                    ON secret_rotation_logs(secret_type);
+                CREATE INDEX IF NOT EXISTS idx_secret_rotation_logs_at
+                    ON secret_rotation_logs(rotated_at);
                 ",
             ),
         ];
@@ -1727,6 +1819,615 @@ impl Db {
             });
         }
         Ok(facets)
+    }
+
+    // ── #100: Data Retention Policies ───────────────────────────────────────
+
+    /// Insert or replace a retention policy for a given data type.
+    pub fn upsert_retention_policy(
+        &self,
+        policy: &crate::models::DataRetentionPolicy,
+    ) -> Result<(), rusqlite::Error> {
+        self.conn.lock().unwrap().execute(
+            r"INSERT INTO data_retention_policies
+                (data_type, retention_days, enabled, description, created_at, updated_at)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+              ON CONFLICT(data_type) DO UPDATE SET
+                retention_days = excluded.retention_days,
+                enabled        = excluded.enabled,
+                description    = excluded.description,
+                updated_at     = excluded.updated_at",
+            params![
+                policy.data_type,
+                policy.retention_days as i64,
+                if policy.enabled { 1i64 } else { 0i64 },
+                policy.description,
+                policy.created_at.to_rfc3339(),
+                policy.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Retrieve a single retention policy by data type.
+    pub fn get_retention_policy(
+        &self,
+        data_type: &str,
+    ) -> Result<Option<crate::models::DataRetentionPolicy>, rusqlite::Error> {
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            r"SELECT data_type, retention_days, enabled, description, created_at, updated_at
+               FROM data_retention_policies WHERE data_type = ?1",
+        )?;
+        match stmt.query_row(params![data_type], |r| {
+            Self::row_to_retention_policy(r)
+        }) {
+            Ok(p) => Ok(Some(p)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// List all configured retention policies.
+    pub fn list_retention_policies(
+        &self,
+    ) -> Result<Vec<crate::models::DataRetentionPolicy>, rusqlite::Error> {
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            r"SELECT data_type, retention_days, enabled, description, created_at, updated_at
+               FROM data_retention_policies ORDER BY data_type",
+        )?;
+        let iter = stmt.query_map([], |r| Self::row_to_retention_policy(r))?;
+        let mut out = Vec::new();
+        for item in iter {
+            out.push(item?);
+        }
+        Ok(out)
+    }
+
+    fn row_to_retention_policy(
+        r: &rusqlite::Row<'_>,
+    ) -> Result<crate::models::DataRetentionPolicy, rusqlite::Error> {
+        let created_at = Self::parse_rfc3339_col(r, 4)?;
+        let updated_at = Self::parse_rfc3339_col(r, 5)?;
+        let enabled_i: i64 = r.get(2)?;
+        Ok(crate::models::DataRetentionPolicy {
+            data_type: r.get(0)?,
+            retention_days: r.get::<_, i64>(1)? as u32,
+            enabled: enabled_i != 0,
+            description: r.get(3)?,
+            created_at,
+            updated_at,
+        })
+    }
+
+    /// Purge records older than `retention_days` for the given `table` using
+    /// its `timestamp_col`. Returns the number of rows deleted.
+    /// Skips any record whose ID appears in the retention_exceptions table.
+    pub fn purge_by_retention_policy(
+        &self,
+        data_type: &str,
+        table: &str,
+        id_col: &str,
+        timestamp_col: &str,
+        retention_days: u32,
+        actor: &str,
+    ) -> Result<u64, rusqlite::Error> {
+        let cutoff = (chrono::Utc::now()
+            - chrono::Duration::days(i64::from(retention_days)))
+        .to_rfc3339();
+
+        // Build a DELETE that honours active exceptions.
+        let sql = format!(
+            "DELETE FROM {table} WHERE {timestamp_col} < ?1 \
+             AND {id_col} NOT IN ( \
+               SELECT record_id FROM retention_exceptions \
+               WHERE data_type = ?2 \
+               AND (expires_at IS NULL OR expires_at > ?3) \
+             )"
+        );
+        let now = chrono::Utc::now().to_rfc3339();
+        let deleted = self
+            .conn
+            .lock()
+            .unwrap()
+            .execute(&sql, params![cutoff, data_type, now])?;
+
+        // Write an audit entry in the deletion log.
+        let details = serde_json::json!({
+            "table": table,
+            "cutoff": cutoff,
+            "retention_days": retention_days,
+        });
+        self.conn.lock().unwrap().execute(
+            r"INSERT INTO retention_deletion_log (data_type, deleted_rows, purged_at, actor, details)
+               VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                data_type,
+                deleted as i64,
+                chrono::Utc::now().to_rfc3339(),
+                actor,
+                details.to_string(),
+            ],
+        )?;
+
+        Ok(deleted as u64)
+    }
+
+    /// Add a retention exception for a specific record.
+    pub fn add_retention_exception(
+        &self,
+        exc: &crate::models::RetentionException,
+    ) -> Result<(), rusqlite::Error> {
+        self.conn.lock().unwrap().execute(
+            r"INSERT INTO retention_exceptions
+                (data_type, record_id, reason, expires_at, created_at, created_by)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                exc.data_type,
+                exc.record_id,
+                exc.reason,
+                exc.expires_at.map(|d| d.to_rfc3339()),
+                exc.created_at.to_rfc3339(),
+                exc.created_by,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// List all active (non-expired) retention exceptions for a data type.
+    pub fn list_retention_exceptions(
+        &self,
+        data_type: &str,
+    ) -> Result<Vec<crate::models::RetentionException>, rusqlite::Error> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            r"SELECT id, data_type, record_id, reason, expires_at, created_at, created_by
+               FROM retention_exceptions
+               WHERE data_type = ?1 AND (expires_at IS NULL OR expires_at > ?2)
+               ORDER BY created_at DESC",
+        )?;
+        let iter = stmt.query_map(params![data_type, now], |r| {
+            let expires_at: Option<String> = r.get(4)?;
+            let expires_at_dt = expires_at.and_then(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+            });
+            let created_at = Self::parse_rfc3339_col(r, 5)?;
+            Ok(crate::models::RetentionException {
+                id: r.get(0)?,
+                data_type: r.get(1)?,
+                record_id: r.get(2)?,
+                reason: r.get(3)?,
+                expires_at: expires_at_dt,
+                created_at,
+                created_by: r.get(6)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for item in iter {
+            out.push(item?);
+        }
+        Ok(out)
+    }
+
+    /// Retrieve the deletion audit trail for a data type (most-recent first).
+    pub fn list_retention_deletion_log(
+        &self,
+        data_type: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<crate::models::RetentionDeletionLog>, rusqlite::Error> {
+        let binding = self.conn.lock().unwrap();
+        let (sql, param): (String, Option<String>) = if let Some(dt) = data_type {
+            (
+                format!(
+                    "SELECT id, data_type, deleted_rows, purged_at, actor, details \
+                     FROM retention_deletion_log WHERE data_type = ?1 \
+                     ORDER BY purged_at DESC LIMIT {limit}"
+                ),
+                Some(dt.to_string()),
+            )
+        } else {
+            (
+                format!(
+                    "SELECT id, data_type, deleted_rows, purged_at, actor, details \
+                     FROM retention_deletion_log ORDER BY purged_at DESC LIMIT {limit}"
+                ),
+                None,
+            )
+        };
+
+        let mut stmt = binding.prepare(&sql)?;
+        let iter = if let Some(ref p) = param {
+            stmt.query_map(params![p], |r| Self::row_to_deletion_log(r))?
+        } else {
+            stmt.query_map([], |r| Self::row_to_deletion_log(r))?
+        };
+
+        let mut out = Vec::new();
+        for item in iter {
+            out.push(item?);
+        }
+        Ok(out)
+    }
+
+    fn row_to_deletion_log(
+        r: &rusqlite::Row<'_>,
+    ) -> Result<crate::models::RetentionDeletionLog, rusqlite::Error> {
+        let purged_at = Self::parse_rfc3339_col(r, 3)?;
+        let details_str: Option<String> = r.get(5)?;
+        let details = details_str.and_then(|s| serde_json::from_str(&s).ok());
+        Ok(crate::models::RetentionDeletionLog {
+            id: r.get(0)?,
+            data_type: r.get(1)?,
+            deleted_rows: r.get::<_, i64>(2)? as u64,
+            purged_at,
+            actor: r.get(4)?,
+            details,
+        })
+    }
+
+    // ── #101: Encryption key version metadata ────────────────────────────────
+
+    /// Record a new encryption key version as active, retiring the previous one.
+    pub fn insert_encryption_key_version(
+        &self,
+        version: u32,
+    ) -> Result<(), rusqlite::Error> {
+        let now = chrono::Utc::now().to_rfc3339();
+        // Mark any previously active key as 'retiring'.
+        self.conn.lock().unwrap().execute(
+            "UPDATE encryption_key_versions SET status = 'retiring' WHERE status = 'active'",
+            [],
+        )?;
+        self.conn.lock().unwrap().execute(
+            r"INSERT OR IGNORE INTO encryption_key_versions (version, status, created_at)
+               VALUES (?1, 'active', ?2)",
+            params![version as i64, now],
+        )?;
+        Ok(())
+    }
+
+    /// List all known key versions ordered by version number.
+    pub fn list_encryption_key_versions(
+        &self,
+    ) -> Result<Vec<crate::models::EncryptionKeyInfo>, rusqlite::Error> {
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            r"SELECT version, status, created_at, rotated_at
+               FROM encryption_key_versions ORDER BY version DESC",
+        )?;
+        let iter = stmt.query_map([], |r| {
+            use crate::models::EncryptionKeyStatus;
+            let status_str: String = r.get(1)?;
+            let status = match status_str.as_str() {
+                "active" => EncryptionKeyStatus::Active,
+                "retiring" => EncryptionKeyStatus::Retiring,
+                _ => EncryptionKeyStatus::Retired,
+            };
+            let created_at = Self::parse_rfc3339_col(r, 2)?;
+            let rotated_at_str: Option<String> = r.get(3)?;
+            let rotated_at = rotated_at_str.and_then(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+            });
+            Ok(crate::models::EncryptionKeyInfo {
+                version: r.get::<_, i64>(0)? as u32,
+                status,
+                created_at,
+                rotated_at,
+            })
+        })?;
+        let mut out = Vec::new();
+        for item in iter {
+            out.push(item?);
+        }
+        Ok(out)
+    }
+
+    /// Mark a key version as fully retired.
+    pub fn retire_encryption_key_version(
+        &self,
+        version: u32,
+    ) -> Result<(), rusqlite::Error> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.lock().unwrap().execute(
+            "UPDATE encryption_key_versions SET status = 'retired', rotated_at = ?1 WHERE version = ?2",
+            params![now, version as i64],
+        )?;
+        Ok(())
+    }
+
+    // ── #103: Secret Rotation Policies ──────────────────────────────────────
+
+    /// Insert or replace a secret rotation policy.
+    pub fn upsert_secret_rotation_policy(
+        &self,
+        policy: &crate::models::SecretRotationPolicy,
+    ) -> Result<(), rusqlite::Error> {
+        let secret_type = serde_json::to_string(&policy.secret_type).unwrap();
+        let channels_json = serde_json::to_string(&policy.notify_channels).unwrap();
+        self.conn.lock().unwrap().execute(
+            r"INSERT INTO secret_rotation_policies
+                (secret_type, rotation_interval_days, grace_period_hours, auto_rotate,
+                 notify_channels, created_at, updated_at)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+              ON CONFLICT(secret_type) DO UPDATE SET
+                rotation_interval_days = excluded.rotation_interval_days,
+                grace_period_hours     = excluded.grace_period_hours,
+                auto_rotate            = excluded.auto_rotate,
+                notify_channels        = excluded.notify_channels,
+                updated_at             = excluded.updated_at",
+            params![
+                secret_type,
+                policy.rotation_interval_days as i64,
+                policy.grace_period_hours as i64,
+                if policy.auto_rotate { 1i64 } else { 0i64 },
+                channels_json,
+                policy.created_at.to_rfc3339(),
+                policy.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Retrieve a rotation policy for a specific secret type.
+    pub fn get_secret_rotation_policy(
+        &self,
+        secret_type: &crate::models::SecretType,
+    ) -> Result<Option<crate::models::SecretRotationPolicy>, rusqlite::Error> {
+        let secret_type_str = serde_json::to_string(secret_type).unwrap();
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            r"SELECT secret_type, rotation_interval_days, grace_period_hours, auto_rotate,
+                     notify_channels, created_at, updated_at
+               FROM secret_rotation_policies WHERE secret_type = ?1",
+        )?;
+        match stmt.query_row(params![secret_type_str], |r| {
+            Self::row_to_rotation_policy(r)
+        }) {
+            Ok(p) => Ok(Some(p)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// List all secret rotation policies.
+    pub fn list_secret_rotation_policies(
+        &self,
+    ) -> Result<Vec<crate::models::SecretRotationPolicy>, rusqlite::Error> {
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            r"SELECT secret_type, rotation_interval_days, grace_period_hours, auto_rotate,
+                     notify_channels, created_at, updated_at
+               FROM secret_rotation_policies ORDER BY secret_type",
+        )?;
+        let iter = stmt.query_map([], |r| Self::row_to_rotation_policy(r))?;
+        let mut out = Vec::new();
+        for item in iter {
+            out.push(item?);
+        }
+        Ok(out)
+    }
+
+    fn row_to_rotation_policy(
+        r: &rusqlite::Row<'_>,
+    ) -> Result<crate::models::SecretRotationPolicy, rusqlite::Error> {
+        let secret_type_str: String = r.get(0)?;
+        let secret_type: crate::models::SecretType =
+            serde_json::from_str(&secret_type_str).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+        let auto_rotate_i: i64 = r.get(3)?;
+        let channels_str: String = r.get(4)?;
+        let notify_channels: Vec<String> =
+            serde_json::from_str(&channels_str).unwrap_or_default();
+        let created_at = Self::parse_rfc3339_col(r, 5)?;
+        let updated_at = Self::parse_rfc3339_col(r, 6)?;
+        Ok(crate::models::SecretRotationPolicy {
+            secret_type,
+            rotation_interval_days: r.get::<_, i64>(1)? as u32,
+            grace_period_hours: r.get::<_, i64>(2)? as u32,
+            auto_rotate: auto_rotate_i != 0,
+            notify_channels,
+            created_at,
+            updated_at,
+        })
+    }
+
+    /// Record a rotation event for a secret.
+    pub fn log_secret_rotation(
+        &self,
+        log: &crate::models::SecretRotationLog,
+    ) -> Result<(), rusqlite::Error> {
+        let secret_type_str = serde_json::to_string(&log.secret_type).unwrap();
+        self.conn.lock().unwrap().execute(
+            r"INSERT INTO secret_rotation_logs
+                (secret_type, rotated_at, actor, grace_period_active, grace_period_ends_at, notes)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                secret_type_str,
+                log.rotated_at.to_rfc3339(),
+                log.actor,
+                if log.grace_period_active { 1i64 } else { 0i64 },
+                log.grace_period_ends_at.map(|d| d.to_rfc3339()),
+                log.notes,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get the most recent rotation log entry for a secret type.
+    pub fn get_last_secret_rotation(
+        &self,
+        secret_type: &crate::models::SecretType,
+    ) -> Result<Option<crate::models::SecretRotationLog>, rusqlite::Error> {
+        let secret_type_str = serde_json::to_string(secret_type).unwrap();
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            r"SELECT id, secret_type, rotated_at, actor, grace_period_active, grace_period_ends_at, notes
+               FROM secret_rotation_logs WHERE secret_type = ?1
+               ORDER BY rotated_at DESC LIMIT 1",
+        )?;
+        match stmt.query_row(params![secret_type_str], |r| {
+            Self::row_to_rotation_log(r)
+        }) {
+            Ok(l) => Ok(Some(l)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// List rotation history for a secret type, most recent first.
+    pub fn list_secret_rotation_logs(
+        &self,
+        secret_type: &crate::models::SecretType,
+        limit: u32,
+    ) -> Result<Vec<crate::models::SecretRotationLog>, rusqlite::Error> {
+        let secret_type_str = serde_json::to_string(secret_type).unwrap();
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            r"SELECT id, secret_type, rotated_at, actor, grace_period_active, grace_period_ends_at, notes
+               FROM secret_rotation_logs WHERE secret_type = ?1
+               ORDER BY rotated_at DESC LIMIT ?2",
+        )?;
+        let iter = stmt.query_map(params![secret_type_str, limit as i64], |r| {
+            Self::row_to_rotation_log(r)
+        })?;
+        let mut out = Vec::new();
+        for item in iter {
+            out.push(item?);
+        }
+        Ok(out)
+    }
+
+    fn row_to_rotation_log(
+        r: &rusqlite::Row<'_>,
+    ) -> Result<crate::models::SecretRotationLog, rusqlite::Error> {
+        let secret_type_str: String = r.get(1)?;
+        let secret_type: crate::models::SecretType =
+            serde_json::from_str(&secret_type_str).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+        let rotated_at = Self::parse_rfc3339_col(r, 2)?;
+        let grace_period_active_i: i64 = r.get(4)?;
+        let grace_period_ends_at_str: Option<String> = r.get(5)?;
+        let grace_period_ends_at = grace_period_ends_at_str.and_then(|s| {
+            chrono::DateTime::parse_from_rfc3339(&s)
+                .ok()
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+        });
+        Ok(crate::models::SecretRotationLog {
+            id: r.get(0)?,
+            secret_type,
+            rotated_at,
+            actor: r.get(3)?,
+            grace_period_active: grace_period_active_i != 0,
+            grace_period_ends_at,
+            notes: r.get(6)?,
+        })
+    }
+
+    /// Build a rotation status summary for a given secret type.
+    pub fn get_secret_rotation_status(
+        &self,
+        secret_type: &crate::models::SecretType,
+    ) -> Result<crate::models::SecretRotationStatus, rusqlite::Error> {
+        use chrono::Duration;
+        let policy = self.get_secret_rotation_policy(secret_type)?;
+        let last = self.get_last_secret_rotation(secret_type)?;
+        let now = chrono::Utc::now();
+
+        let (next_due, is_overdue) = if let (Some(ref p), Some(ref l)) = (&policy, &last) {
+            let next = l.rotated_at + Duration::days(i64::from(p.rotation_interval_days));
+            (Some(next), next < now)
+        } else if let Some(ref p) = policy {
+            // Never rotated — overdue immediately if interval > 0.
+            let overdue = p.rotation_interval_days > 0;
+            (None, overdue)
+        } else {
+            (None, false)
+        };
+
+        let (grace_active, grace_ends) = if let Some(ref l) = last {
+            (l.grace_period_active && l.grace_period_ends_at.is_some_and(|d| d > now),
+             l.grace_period_ends_at)
+        } else {
+            (false, None)
+        };
+
+        Ok(crate::models::SecretRotationStatus {
+            secret_type: secret_type.clone(),
+            last_rotated_at: last.as_ref().map(|l| l.rotated_at),
+            next_rotation_due: next_due,
+            is_overdue,
+            grace_period_active: grace_active,
+            grace_period_ends_at: grace_ends,
+        })
+    }
+
+    // ── Shared RFC-3339 parse helper ─────────────────────────────────────────
+
+    fn parse_rfc3339_col(
+        r: &rusqlite::Row<'_>,
+        col: usize,
+    ) -> Result<chrono::DateTime<chrono::Utc>, rusqlite::Error> {
+        let s: String = r.get(col)?;
+        chrono::DateTime::parse_from_rfc3339(&s)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    col,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })
+    }
+}
+
+// ── Consistency pragma helpers (#83) ─────────────────────────────────────────
+
+impl Db {
+    /// Expose an `MutexGuard<Connection>` so that callers outside this module
+    /// (e.g. `consistency.rs`) can execute one-off queries without going through
+    /// individual `Db` methods.
+    pub fn conn_lock(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
+        self.conn.lock().unwrap()
+    }
+
+    /// Run SQLite's `PRAGMA foreign_key_check` and return one descriptive
+    /// string per violation.  Returns an empty `Vec` if the database is
+    /// clean.
+    pub fn run_consistency_pragma(&self) -> Result<Vec<String>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("PRAGMA foreign_key_check")?;
+        let rows = stmt.query_map([], |r| {
+            // Columns: table, rowid, parent, fkid
+            let table: String = r.get(0)?;
+            let rowid: i64 = r.get(1)?;
+            let parent: String = r.get(2)?;
+            let fkid: i64 = r.get(3)?;
+            Ok(format!(
+                "table={table} rowid={rowid} parent={parent} fkid={fkid}"
+            ))
+        })?;
+
+        let mut violations = Vec::new();
+        for row in rows {
+            violations.push(row?);
+        }
+        Ok(violations)
     }
 }
 
