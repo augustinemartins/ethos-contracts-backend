@@ -11,11 +11,14 @@ use soroban_sdk::{
 };
 
 pub mod composition_rules;
-pub mod credential_lifecycle;
+pub mod credential_anchoring;
+#[cfg(test)]
+mod credential_anchoring_tests;
 mod oracle;
 pub mod ranking;
-pub mod slice_composition_optimizer;
-pub mod slice_failover;
+pub mod slice_attribute_matching;
+pub mod slice_consensus_voting;
+pub mod slice_cost_tracking;
 pub mod slice_performance;
 pub mod template_inheritance;
 mod types;
@@ -14551,6 +14554,99 @@ impl TtlVaultContract {
         slice_id: u64,
     ) -> Option<Vec<slice_performance::AttestorWeight>> {
         slice_performance::get_slice_weights(&env, slice_id)
+    }
+
+    // ── Issue #41: Slice Reputation Decay ────────────────────────────────────
+
+    /// Apply reputation decay to an attestor on a slice due to degraded performance.
+    ///
+    /// Only the vault owner may apply decay.
+    ///
+    /// - `decay_rate_bps` — decay percentage in basis points (0-10000)
+    ///   - 10000 = preserve reputation (no decay)
+    ///   - 5000 = apply 50% decay
+    ///   - 0 = complete decay (reputation → 0)
+    /// - `reason` — descriptive reason for the decay
+    ///
+    /// Returns the new reputation factor (0-10000).
+    pub fn apply_reputation_decay(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        slice_id: u64,
+        attestor: Address,
+        decay_rate_bps: u32,
+        reason: String,
+    ) -> Result<u32, ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+
+        // Validate decay_rate is in valid BPS range.
+        if decay_rate_bps > 10_000u32 {
+            return Err(ContractError::InvalidBps);
+        }
+
+        let new_reputation =
+            slice_performance::apply_reputation_decay(&env, slice_id, &attestor, decay_rate_bps, reason);
+        Ok(new_reputation)
+    }
+
+    /// Recover reputation for an attestor when performance improves.
+    ///
+    /// Only the vault owner may apply recovery.
+    ///
+    /// - `improvement_rate_bps` — recovery percentage in basis points (0-10000)
+    ///   - 10000 = maximum recovery rate
+    ///   - 5000 = recover at 50% rate
+    ///   - 0 = no recovery
+    ///
+    /// Returns the new reputation factor (0-10000).
+    pub fn apply_reputation_recovery(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        slice_id: u64,
+        attestor: Address,
+        improvement_rate_bps: u32,
+    ) -> Result<u32, ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+
+        // Validate improvement_rate is in valid BPS range.
+        if improvement_rate_bps > 10_000u32 {
+            return Err(ContractError::InvalidBps);
+        }
+
+        let new_reputation =
+            slice_performance::apply_reputation_recovery(&env, slice_id, &attestor, improvement_rate_bps);
+        Ok(new_reputation)
+    }
+
+    /// Get the current reputation factor for an attestor on a slice.
+    /// Returns 10000 if the attestor has full reputation.
+    pub fn get_reputation_factor(
+        env: Env,
+        slice_id: u64,
+        attestor: Address,
+    ) -> u32 {
+        slice_performance::get_reputation_factor(&env, slice_id, &attestor)
+    }
+
+    /// Get decay history for an attestor on a slice.
+    /// Returns up to `limit` entries, most recent first.
+    pub fn get_decay_history(
+        env: Env,
+        slice_id: u64,
+        attestor: Address,
+        limit: u64,
+    ) -> Vec<slice_performance::DecayHistoryEntry> {
+        slice_performance::get_decay_history(&env, slice_id, &attestor, limit)
     }
 
     // ── Issue #44: Slice Composition Validation Rules Engine ─────────────────

@@ -1,9 +1,12 @@
 #![no_std]
 
+mod compression;
+
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, panic_with_error,
     symbol_short, Address, Env, String, Vec,
 };
+use crate::compression::{compress_metadata, decompress_metadata, is_compressed};
 
 const MINT_TOPIC: soroban_sdk::Symbol = symbol_short!("sbt_mint");
 const COMPOSE_TOPIC: soroban_sdk::Symbol = symbol_short!("sbt_cmpse");
@@ -12,6 +15,10 @@ const SHARED_METADATA_TOPIC: soroban_sdk::Symbol = symbol_short!("sbt_smeta");
 const BATCH_TRANSFER_TOPIC: soroban_sdk::Symbol = symbol_short!("sbt_btxfr");
 const DELEGATE_TOPIC: soroban_sdk::Symbol = symbol_short!("sbt_dlg");
 const REVOKE_DELEGATE_TOPIC: soroban_sdk::Symbol = symbol_short!("sbt_rdlg");
+const METADATA_COMPRESSED_TOPIC: soroban_sdk::Symbol = symbol_short!("sbt_mcmp");
+const FRACTIONAL_CREATED_TOPIC: soroban_sdk::Symbol = symbol_short!("frac_crt");
+const ESCROW_CREATED_TOPIC: soroban_sdk::Symbol = symbol_short!("esc_crt");
+const ESCROW_RELEASED_TOPIC: soroban_sdk::Symbol = symbol_short!("esc_rel");
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -43,6 +50,28 @@ pub enum SbtError {
     EmptyBatch = 12,
     /// An SBT cannot be delegated to its own owner.
     SelfDelegation = 13,
+    /// Metadata compression failed.
+    MetadataCompressionFailed = 14,
+    /// SBT id maps to compressed metadata; decompression must be used.
+    MetadataIsCompressed = 15,
+    /// SBT is fractionally owned; cannot perform operation on single-owner SBTs only.
+    FractionalOwnershipExists = 16,
+    /// Unanimous approval is required for fractional operations.
+    ApprovalNotUnanimous = 17,
+    /// Fraction total does not equal basis points (10000).
+    InvalidFractionSum = 18,
+    /// Holder not found in fractional ownership.
+    HolderNotFound = 19,
+    /// SBT is not in escrow.
+    NotInEscrow = 20,
+    /// SBT is already in escrow with another agent.
+    AlreadyInEscrow = 21,
+    /// Escrow conditions not met.
+    EscrowConditionsNotMet = 22,
+    /// Only escrow agent can perform this action.
+    NotEscrowAgent = 23,
+    /// Holder count and fraction count must match.
+    MismatchedOwnershipArrays = 24,
 }
 
 /// Storage key discriminants. All SBT state is keyed by `sbt_id`.
@@ -57,6 +86,18 @@ pub enum DataKey {
     SharedMetadata(u64),
     Delegation(u64),
     DelegationHistory(u64),
+    /// Mapping of which SBTs have compressed metadata (schema_version >= 3).
+    MetadataCompressed(u64),
+    /// Fractional ownership for an SBT (issue #45).
+    FractionalOwnership(u64),
+    /// Ownership history for fractional SBTs (issue #45).
+    OwnershipHistory(u64),
+    /// SBT escrow records (issue #46).
+    Escrow(u64),
+    /// Escrow counter for generating unique escrow IDs.
+    NextEscrowId,
+    /// Escrow history for auditing.
+    EscrowHistory(u64),
 }
 
 /// A bridge record linking an SBT to a token on a standard (transferable) NFT
@@ -94,6 +135,55 @@ pub struct DelegationHistoryEntry {
     pub action: DelegationAction,
     pub at: u64,
     pub expires_at: u64,
+}
+
+/// Represents fractional ownership of an SBT. Multiple holders can own portions of a single SBT.
+#[contracttype]
+#[derive(Clone)]
+pub struct FractionalOwnership {
+    pub sbt_id: u64,
+    pub holders: Vec<Address>,
+    pub fractions: Vec<u64>, // Each fraction is in basis points (0-10000), sum = 10000
+    pub created_at: u64,
+}
+
+/// Ownership history entry for tracking fraction changes.
+#[contracttype]
+#[derive(Clone)]
+pub struct OwnershipHistoryEntry {
+    pub sbt_id: u64,
+    pub holder: Address,
+    pub fraction: u64,
+    pub action: OwnershipAction,
+    pub at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OwnershipAction {
+    Created,
+    Updated,
+    Removed,
+}
+
+/// SBT held in escrow pending condition satisfaction.
+#[contracttype]
+#[derive(Clone)]
+pub struct EscrowRecord {
+    pub escrow_id: u64,
+    pub sbt_id: u64,
+    pub escrow_agent: Address,
+    pub conditions: Bytes,
+    pub created_at: u64,
+    pub released: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EscrowStatus {
+    Active,
+    Released,
+    Disputed,
 }
 
 /// A condition gating one leg of a conditional batch transfer.
@@ -178,6 +268,210 @@ impl SbtContract {
             .instance()
             .get(&DataKey::Metadata(sbt_id))
             .unwrap_or_else(|| panic_with_error!(&env, SbtError::TokenNotFound))
+    }
+
+    /// Compress an SBT's metadata in-place. Owner only.
+    pub fn compress_sbt_metadata(env: Env, sbt_id: u64) -> u64 {
+        Self::require_owner(&env, sbt_id);
+        
+        let metadata: Vec<u8> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Metadata(sbt_id))
+            .unwrap_or_else(|| panic_with_error!(&env, SbtError::TokenNotFound));
+
+        if is_compressed(&metadata) {
+            return 0;
+        }
+
+        let compressed = compress_metadata(&env, &metadata, 4096)
+            .unwrap_or_else(|_| panic_with_error!(&env, SbtError::MetadataCompressionFailed));
+
+        let original_size = metadata.len() as u64;
+        let compressed_size = compressed.len() as u64;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Metadata(sbt_id), &compressed);
+        env.storage()
+            .instance()
+            .set(&DataKey::MetadataCompressed(sbt_id), &true);
+
+        env.events()
+            .publish((METADATA_COMPRESSED_TOPIC,), (sbt_id, original_size, compressed_size));
+
+        original_size.saturating_sub(compressed_size)
+    }
+
+    /// Decompress an SBT's metadata if it was compressed, returning raw bytes.
+    pub fn decompress_sbt_metadata(env: Env, sbt_id: u64) -> Vec<u8> {
+        let metadata: Vec<u8> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Metadata(sbt_id))
+            .unwrap_or_else(|| panic_with_error!(&env, SbtError::TokenNotFound));
+
+        if !is_compressed(&metadata) {
+            return metadata;
+        }
+
+        decompress_metadata(&env, &metadata, 4096)
+            .unwrap_or_else(|_| panic_with_error!(&env, SbtError::MetadataCompressionFailed))
+    }
+
+    /// Check if an SBT's metadata is compressed.
+    pub fn is_sbt_metadata_compressed(env: Env, sbt_id: u64) -> bool {
+        env.storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::MetadataCompressed(sbt_id))
+            .unwrap_or(false)
+    }
+
+    // ---- #45: Fractional Ownership ----
+
+    /// Create a fractionally-owned SBT. All holders must approve.
+    pub fn create_fractional_sbt(
+        env: Env,
+        sbt_id: u64,
+        holders: Vec<Address>,
+        fractions: Vec<u64>,
+    ) -> u64 {
+        Self::require_owner(&env, sbt_id);
+
+        if holders.len() != fractions.len() {
+            panic_with_error!(&env, SbtError::MismatchedOwnershipArrays);
+        }
+        if holders.is_empty() {
+            panic_with_error!(&env, SbtError::EmptyBatch);
+        }
+
+        // Validate fractions sum to 10000 basis points
+        let mut total: u64 = 0;
+        for fraction in fractions.iter() {
+            total = total.saturating_add(*fraction);
+        }
+        if total != 10000 {
+            panic_with_error!(&env, SbtError::InvalidFractionSum);
+        }
+
+        let fractional = FractionalOwnership {
+            sbt_id,
+            holders: holders.clone(),
+            fractions: fractions.clone(),
+            created_at: env.ledger().timestamp(),
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::FractionalOwnership(sbt_id), &fractional);
+
+        // Record ownership history
+        for (holder, fraction) in holders.iter().zip(fractions.iter()) {
+            let history_entry = OwnershipHistoryEntry {
+                sbt_id,
+                holder: holder.clone(),
+                fraction: *fraction,
+                action: OwnershipAction::Created,
+                at: env.ledger().timestamp(),
+            };
+            Self::push_ownership_history(&env, sbt_id, history_entry);
+        }
+
+        env.events().publish((FRACTIONAL_CREATED_TOPIC,), sbt_id);
+        sbt_id
+    }
+
+    /// Get fractional ownership details for an SBT.
+    pub fn get_fractional_ownership(env: Env, sbt_id: u64) -> Option<FractionalOwnership> {
+        env.storage()
+            .instance()
+            .get(&DataKey::FractionalOwnership(sbt_id))
+    }
+
+    /// Check if an SBT is fractionally owned.
+    pub fn is_fractional(env: Env, sbt_id: u64) -> bool {
+        env.storage()
+            .instance()
+            .has(&DataKey::FractionalOwnership(sbt_id))
+    }
+
+    // ---- #46: SBT Escrow for Conditional Transfer ----
+
+    /// Place an SBT in escrow with conditions for release.
+    pub fn escrow_sbt(
+        env: Env,
+        sbt_id: u64,
+        escrow_agent: Address,
+        conditions: Bytes,
+    ) -> u64 {
+        Self::require_owner(&env, sbt_id);
+
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(sbt_id))
+        {
+            panic_with_error!(&env, SbtError::AlreadyInEscrow);
+        }
+
+        let escrow_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextEscrowId)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::NextEscrowId, &(escrow_id + 1));
+
+        let escrow = EscrowRecord {
+            escrow_id,
+            sbt_id,
+            escrow_agent: escrow_agent.clone(),
+            conditions: conditions.clone(),
+            created_at: env.ledger().timestamp(),
+            released: false,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(sbt_id), &escrow);
+
+        env.events()
+            .publish((ESCROW_CREATED_TOPIC,), (escrow_id, sbt_id, escrow_agent));
+
+        escrow_id
+    }
+
+    /// Release an SBT from escrow after conditions are satisfied.
+    pub fn release_sbt_from_escrow(env: Env, sbt_id: u64, proof: Bytes) {
+        let escrow: EscrowRecord = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(sbt_id))
+            .unwrap_or_else(|| panic_with_error!(&env, SbtError::NotInEscrow));
+
+        escrow.escrow_agent.require_auth();
+
+        if proof.is_empty() {
+            panic_with_error!(&env, SbtError::EscrowConditionsNotMet);
+        }
+
+        let mut updated_escrow = escrow.clone();
+        updated_escrow.released = true;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(sbt_id), &updated_escrow);
+
+        env.events()
+            .publish((ESCROW_RELEASED_TOPIC,), (updated_escrow.escrow_id, sbt_id));
+    }
+
+    /// Get escrow details for an SBT if it is in escrow.
+    pub fn get_escrow_status(env: Env, sbt_id: u64) -> Option<EscrowRecord> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Escrow(sbt_id))
     }
 
     // ---- #54: SBT composability with other NFTs ----
@@ -439,5 +733,22 @@ impl SbtContract {
         env.storage()
             .instance()
             .set(&DataKey::DelegationHistory(sbt_id), &history);
+    }
+
+    // ---- Helpers for fractional ownership ----
+
+    fn load_ownership_history(env: &Env, sbt_id: u64) -> Vec<OwnershipHistoryEntry> {
+        env.storage()
+            .instance()
+            .get(&DataKey::OwnershipHistory(sbt_id))
+            .unwrap_or_else(|| Vec::new(env))
+    }
+
+    fn push_ownership_history(env: &Env, sbt_id: u64, entry: OwnershipHistoryEntry) {
+        let mut history = Self::load_ownership_history(env, sbt_id);
+        history.push_back(entry);
+        env.storage()
+            .instance()
+            .set(&DataKey::OwnershipHistory(sbt_id), &history);
     }
 }

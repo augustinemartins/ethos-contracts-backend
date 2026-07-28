@@ -1,11 +1,13 @@
 #![no_std]
 
 pub mod compression;
+pub mod consistency;
 use compression::{compress_proof as rle_compress, decompress_proof as rle_decompress};
+use consistency::CredentialRegistry;
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short,
-    xdr::FromXdr, Address, Bytes, BytesN, Env,
+    xdr::FromXdr, Address, Bytes, BytesN, Env, Vec,
 };
 
 pub const MAX_PROOF_SIZE: u32 = 4096;
@@ -51,6 +53,12 @@ pub enum VerifierError {
     OracleNotFound = 7,
     /// `proof` could not be decoded as a `ConditionalProof`.
     MalformedConditionalProof = 8,
+    /// Batch consistency check failed; credentials conflict.
+    BatchConsistencyError = 9,
+    /// Batch credential IDs list was empty.
+    EmptyBatchIds = 10,
+    /// Proof and claim lists have different lengths.
+    MismatchedBatchLengths = 11,
 }
 
 /// The on-chain format for a conditional ("prove X if Y, else prove Z")
@@ -740,6 +748,66 @@ impl ZkVerifierContract {
                     .unwrap_or(false)
             })
             .unwrap_or(false)
+    }
+
+    /// Verify a batch of credentials with consistency checking.
+    ///
+    /// Verifies that multiple credentials are all valid (via `verify_claim`)
+    /// and that they are mutually consistent (no conflicting claims).
+    ///
+    /// # Arguments
+    ///
+    /// * `credential_ids` - List of credential IDs to verify
+    /// * `proofs` - Corresponding proof bytes for each credential
+    /// * `claims` - Corresponding claim bytes for each credential
+    ///
+    /// # Returns
+    ///
+    /// `true` if all credentials are valid and consistent, `false` otherwise.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the input lists are mismatched lengths or empty.
+    pub fn verify_credentials_consistent(
+        env: Env,
+        proofs: Vec<Bytes>,
+        claims: Vec<Bytes>,
+    ) -> bool {
+        if proofs.len() != claims.len() {
+            panic_with_error!(&env, VerifierError::MismatchedBatchLengths);
+        }
+        if proofs.is_empty() {
+            panic_with_error!(&env, VerifierError::EmptyBatchIds);
+        }
+
+        // Step 1: Verify each credential individually
+        for (proof, claim) in proofs.iter().zip(claims.iter()) {
+            if !Self::verify_claim(&env, &proof, &claim) {
+                return false;
+            }
+        }
+
+        // Step 2: Check consistency between all pairs
+        let mut consistency_pairs: Vec<(u64, Bytes, u64, Bytes)> = Vec::new(&env);
+
+        for i in 0..claims.len() {
+            for j in (i + 1)..claims.len() {
+                if let (Some(claim_i), Some(claim_j)) = (claims.get(i), claims.get(j)) {
+                    consistency_pairs.push_back((
+                        i as u64,
+                        claim_i,
+                        j as u64,
+                        claim_j,
+                    ));
+                }
+            }
+        }
+
+        // Verify batch consistency
+        match CredentialRegistry::verify_batch_consistency(&env, consistency_pairs) {
+            Ok(()) => true,
+            Err(_) => false,
+        }
     }
 }
 
