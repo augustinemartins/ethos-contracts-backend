@@ -11,8 +11,14 @@ use soroban_sdk::{
 };
 
 pub mod composition_rules;
+pub mod credential_anchoring;
+#[cfg(test)]
+mod credential_anchoring_tests;
 mod oracle;
 pub mod ranking;
+pub mod slice_attribute_matching;
+pub mod slice_consensus_voting;
+pub mod slice_cost_tracking;
 pub mod slice_performance;
 mod types;
 use types::{
