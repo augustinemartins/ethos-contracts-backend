@@ -4,11 +4,18 @@ use serde_json::Value;
 use thiserror::Error;
 
 /// Unified JSON error body returned by all handlers.
+///
+/// `context` is populated on a best-effort basis by handlers that opt into
+/// error enrichment (see `error_context::ErrorContext`); it is omitted from
+/// the JSON body entirely when absent, so existing consumers of this type
+/// see no change. See `docs/error-format.md` for the full shape.
 #[derive(Debug, Serialize)]
 pub struct ApiError {
     pub code: String,
     pub message: String,
     pub details: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<crate::error_context::ErrorContext>,
     #[serde(skip)]
     status: StatusCode,
 }
@@ -19,8 +26,15 @@ impl ApiError {
             code: code.to_string(),
             message: message.into(),
             details: None,
+            context: None,
             status,
         }
+    }
+
+    /// Attaches request/user/correlation-id context to this error response.
+    pub fn with_context(mut self, context: crate::error_context::ErrorContext) -> Self {
+        self.context = Some(context);
+        self
     }
 }
 

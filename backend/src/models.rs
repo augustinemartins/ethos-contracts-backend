@@ -922,235 +922,180 @@ pub struct FullTextSearchResponse {
     pub query_time_ms: u64,
 }
 
-// ── CAPTCHA / Suspicious-Activity models (#97) ───────────────────────────────
+// ── #100: Data Retention Policies ───────────────────────────────────────────
 
-/// An issued CAPTCHA challenge, stored server-side until verified or expired.
+/// Policy controlling how long a particular data type is kept before purging.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CaptchaChallenge {
-    /// Unique challenge identifier (UUID v4).
-    pub id: String,
-    /// Opaque server-generated token bound to this challenge.
-    pub token: String,
-    /// Wall-clock expiry; challenges are invalid after this instant.
-    pub expires_at: DateTime<Utc>,
-    /// reCAPTCHA site key sent to the client so it can render the widget.
-    pub site_key: String,
-}
-
-/// Request body for `POST /captcha/verify`.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct CaptchaVerifyRequest {
-    /// The `CaptchaChallenge.id` issued by `/captcha/challenge`.
-    pub challenge_id: String,
-    /// The g-recaptcha-response token submitted by the user's browser.
-    pub captcha_token: String,
-    /// Caller's own session / bearer token (used to mint a new session on
-    /// successful verification).
-    pub user_token: String,
-}
-
-/// Response body for `POST /captcha/verify`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CaptchaVerifyResponse {
-    /// Whether the CAPTCHA was successfully verified.
-    pub verified: bool,
-    /// New short-lived session token issued on success (`None` on failure).
-    pub session_token: Option<String>,
-    /// Human-readable status message.
-    pub message: String,
-}
-
-/// A user/IP combination that has been explicitly trusted and is exempt from
-/// CAPTCHA challenges until `trusted_until`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TrustedUser {
-    /// Application-level user identifier.
-    pub user_id: String,
-    /// IP address or CIDR block that is trusted.
-    pub ip: String,
-    /// After this instant the trust entry is no longer valid.
-    pub trusted_until: DateTime<Utc>,
-}
-
-/// A detected suspicious-activity event used by the rate-based CAPTCHA trigger.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SuspiciousActivityEvent {
-    /// Source IP address.
-    pub ip: String,
-    /// Optionally identifies the authenticated user behind the request.
-    pub user_id: Option<String>,
-    /// Category of event (e.g. `"login_attempt"`, `"vault_create"`).
-    pub event_type: String,
-    /// Number of events observed within `window_start..now`.
-    pub count: u32,
-    /// Start of the observation window.
-    pub window_start: DateTime<Utc>,
-}
-
-/// Request body for `POST /admin/captcha/trusted-users`.
-#[derive(Debug, Deserialize)]
-pub struct AddTrustedUserRequest {
-    pub user_id: String,
-    pub ip: String,
-    /// Seconds from now until the trust entry expires (default: 86 400 = 1 day).
-    pub trust_duration_secs: Option<u64>,
-}
-
-// ── IP Reputation models (#96) ────────────────────────────────────────────────
-
-/// Risk level derived from an IP's abuse confidence score.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum RiskLevel {
-    Low,
-    Medium,
-    High,
-    Critical,
-}
-
-/// Reputation score for a single IP address, optionally sourced from AbuseIPDB.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IpReputationScore {
-    /// The IP address that was checked.
-    pub ip: String,
-    /// Abuse confidence score in the range `0.0..=100.0`.
-    pub score: f64,
-    /// Derived risk classification.
-    pub risk_level: RiskLevel,
-    /// Whether the IP is currently matched by a local block rule.
-    pub is_blocked: bool,
-    /// Wall-clock instant at which the check was last performed.
-    pub last_checked: DateTime<Utc>,
-    /// Data source (e.g. `"abuseipdb"`, `"stub"`, `"disabled"`).
-    pub source: String,
-    /// Raw response payload from the upstream provider (or a stub object).
-    pub details: serde_json::Value,
-}
-
-/// A manually configured IP block rule stored in the in-memory rule list.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IpBlockRule {
-    /// UUID v4 identifier for this rule.
-    pub id: String,
-    /// Exact IP address or `/24` subnet prefix (e.g. `"192.168.1"`).
-    pub ip_pattern: String,
-    /// Human-readable reason for the block.
-    pub reason: String,
-    /// When this rule was created.
+pub struct DataRetentionPolicy {
+    /// Logical name of the data type (e.g. "audit_logs", "reminder_preferences").
+    pub data_type: String,
+    /// Number of days to retain records. 0 means retain forever.
+    pub retention_days: u32,
+    /// Whether the policy is actively enforced by the purge scheduler.
+    pub enabled: bool,
+    /// Human-readable description of this policy.
+    pub description: String,
     pub created_at: DateTime<Utc>,
-    /// Optional expiry; `None` means the rule never expires.
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Request body for creating or updating a retention policy.
+#[derive(Debug, Deserialize)]
+pub struct UpsertRetentionPolicyRequest {
+    pub retention_days: u32,
+    pub enabled: Option<bool>,
+    pub description: Option<String>,
+}
+
+/// A single entry in the deletion audit trail produced by the purge job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetentionDeletionLog {
+    pub id: i64,
+    pub data_type: String,
+    pub deleted_rows: u64,
+    pub purged_at: DateTime<Utc>,
+    /// "system" for automated purges, user ID for manual purges.
+    pub actor: String,
+    /// Optional JSON details about the purge run.
+    pub details: Option<serde_json::Value>,
+}
+
+/// An exception that exempts a specific record from normal retention purging.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetentionException {
+    pub id: i64,
+    pub data_type: String,
+    /// Opaque identifier of the record being exempted.
+    pub record_id: String,
+    /// Business reason for the exemption.
+    pub reason: String,
+    /// When the exemption itself expires (None = permanent).
     pub expires_at: Option<DateTime<Utc>>,
-    /// Identity of the admin who created the rule (derived from the Bearer token).
+    pub created_at: DateTime<Utc>,
     pub created_by: String,
 }
 
-/// Request body for `POST /admin/ip-reputation/block`.
+/// Request body for registering a retention exception.
 #[derive(Debug, Deserialize)]
-pub struct IpBlockRequest {
-    /// Exact IP or `/24` prefix to block.
-    pub ip_pattern: String,
-    /// Reason for the block (required).
+pub struct CreateRetentionExceptionRequest {
+    pub record_id: String,
     pub reason: String,
-    /// If provided, the rule expires after this many hours.
-    pub expires_in_hours: Option<u32>,
+    /// Seconds until this exemption expires. None = permanent.
+    pub expires_in_seconds: Option<u64>,
 }
 
-/// Global configuration for the IP reputation subsystem.
+/// Response returned after running a manual purge.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PurgeRunResult {
+    pub data_type: String,
+    pub deleted_rows: u64,
+    pub purged_at: DateTime<Utc>,
+}
+
+// ── #101: Encrypted Field Storage ───────────────────────────────────────────
+
+/// A field value stored after AES-256-GCM encryption.
+/// The ciphertext and nonce are base64-encoded for safe serialization.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IpReputationConfig {
-    /// When `false`, all reputation checks return a stub `Low` score without
-    /// calling any external API.
-    pub check_enabled: bool,
-    /// Abuse confidence score threshold above which an IP is considered `High`
-    /// risk. Defaults to `50`.
-    pub block_threshold: u8,
-    /// Maximum age (in days) of data to consider when querying AbuseIPDB.
-    pub max_age_days: u32,
+pub struct EncryptedField {
+    /// Base64-encoded AES-256-GCM ciphertext.
+    pub ciphertext: String,
+    /// Base64-encoded 12-byte nonce used for this encryption.
+    pub nonce: String,
+    /// Key version used to encrypt this field (supports rotation).
+    pub key_version: u32,
 }
 
-impl Default for IpReputationConfig {
-    fn default() -> Self {
-        Self {
-            check_enabled: true,
-            block_threshold: 50,
-            max_age_days: 90,
-        }
-    }
+/// Metadata about an active or retired encryption key version.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EncryptionKeyInfo {
+    pub version: u32,
+    pub status: EncryptionKeyStatus,
+    pub created_at: DateTime<Utc>,
+    /// When this key was rotated out (None if still active).
+    pub rotated_at: Option<DateTime<Utc>>,
 }
 
-/// Request body for `POST /ip-reputation/check`.
-#[derive(Debug, Deserialize)]
-pub struct IpReputationCheckRequest {
-    /// Optional explicit IP to check. Falls back to `X-Forwarded-For` /
-    /// `X-Real-IP` headers when absent.
-    pub ip: Option<String>,
-}
-
-// ── Compliance Audit Report models (#99) ─────────────────────────────────────
-
-/// Pass/fail/warning status for a single compliance check.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
-pub enum ComplianceStatus {
-    Pass,
-    Fail,
-    Warning,
-    NotApplicable,
+pub enum EncryptionKeyStatus {
+    Active,
+    /// Key is being phased out; still usable for decryption but not encryption.
+    Retiring,
+    Retired,
 }
 
-impl std::fmt::Display for ComplianceStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ComplianceStatus::Pass => write!(f, "pass"),
-            ComplianceStatus::Fail => write!(f, "fail"),
-            ComplianceStatus::Warning => write!(f, "warning"),
-            ComplianceStatus::NotApplicable => write!(f, "not_applicable"),
-        }
-    }
+/// Summary of a key-rotation operation.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct KeyRotationResult {
+    pub previous_version: u32,
+    pub new_version: u32,
+    pub rotated_at: DateTime<Utc>,
+    /// Number of encrypted records re-encrypted with the new key.
+    pub records_re_encrypted: u64,
 }
 
-/// A single evaluated compliance control.
+// ── #103: Secret Rotation Policy ────────────────────────────────────────────
+
+/// Categories of secrets managed by the rotation policy.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretType {
+    ApiKey,
+    DatabasePassword,
+    EncryptionKey,
+    JwtSecret,
+    WebhookSecret,
+    RemindersApiKey,
+}
+
+/// Rotation schedule configuration for a specific secret type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ComplianceCheck {
-    /// Dot-separated identifier, e.g. `"gdpr.data_minimisation"`.
-    pub id: String,
-    /// Human-readable control name.
-    pub name: String,
-    /// Compliance framework this check belongs to (`"GDPR"`, `"SOC2"`,
-    /// `"ISO27001"`).
-    pub framework: String,
-    /// Evaluation result.
-    pub status: ComplianceStatus,
-    /// Explanation of what was checked and what was found.
-    pub description: String,
-    /// Actionable guidance when `status` is `Fail` or `Warning`; empty when
-    /// `Pass` or `NotApplicable`.
-    pub remediation: String,
+pub struct SecretRotationPolicy {
+    pub secret_type: SecretType,
+    /// How often this secret must be rotated (in days).
+    pub rotation_interval_days: u32,
+    /// Grace period (in hours) during which both old and new secrets are accepted.
+    pub grace_period_hours: u32,
+    /// Whether automated rotation is enabled.
+    pub auto_rotate: bool,
+    /// Notification channel(s) to alert when rotation is due / complete.
+    pub notify_channels: Vec<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
-/// A complete compliance audit report for the current deployment.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ComplianceAuditReport {
-    /// ISO-8601 timestamp of report generation.
-    pub generated_at: DateTime<Utc>,
-    /// Total number of checks evaluated.
-    pub total_checks: usize,
-    /// Number of checks that passed.
-    pub passed: usize,
-    /// Number of checks that failed.
-    pub failed: usize,
-    /// Number of checks with warnings.
-    pub warnings: usize,
-    /// Number of checks marked not applicable.
-    pub not_applicable: usize,
-    /// Individual check results.
-    pub checks: Vec<ComplianceCheck>,
-    /// Placeholder for a PDF export (see `generate_pdf_stub`).
-    pub pdf_stub: serde_json::Value,
+/// Request body for upserting a secret rotation policy.
+#[derive(Debug, Deserialize)]
+pub struct UpsertSecretRotationPolicyRequest {
+    pub rotation_interval_days: u32,
+    pub grace_period_hours: Option<u32>,
+    pub auto_rotate: Option<bool>,
+    pub notify_channels: Option<Vec<String>>,
 }
 
-/// Outer wrapper returned by `GET /admin/compliance-report`.
+/// A log entry recording that a secret was rotated.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ComplianceReportResponse {
-    pub report: ComplianceAuditReport,
+pub struct SecretRotationLog {
+    pub id: i64,
+    pub secret_type: SecretType,
+    pub rotated_at: DateTime<Utc>,
+    /// "system" for automated rotations, user ID for manual rotations.
+    pub actor: String,
+    /// Whether the grace period is still active.
+    pub grace_period_active: bool,
+    /// When the grace period ends (None if not applicable).
+    pub grace_period_ends_at: Option<DateTime<Utc>>,
+    pub notes: Option<String>,
+}
+
+/// Status summary for a secret type.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SecretRotationStatus {
+    pub secret_type: SecretType,
+    pub last_rotated_at: Option<DateTime<Utc>>,
+    pub next_rotation_due: Option<DateTime<Utc>>,
+    pub is_overdue: bool,
+    pub grace_period_active: bool,
+    pub grace_period_ends_at: Option<DateTime<Utc>>,
 }
