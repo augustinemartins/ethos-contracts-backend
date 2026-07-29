@@ -2,7 +2,7 @@
 
 This document covers the implementation of three advanced features for Soroban SBT (Soul-Bound Token) contracts:
 
-1. **Metadata Compression** (Issue #47)
+1. **Metadata Compression** (Issue #26, superseding the legacy #47 format)
 2. **Fractional Ownership** (Issue #45)
 3. **SBT Escrow for Conditional Transfer** (Issue #46)
 
@@ -12,28 +12,52 @@ This document covers the implementation of three advanced features for Soroban S
 
 ### Overview
 
-SBT metadata can grow large when storing structured data (JSON, images URIs, attributes, etc.). Metadata compression reduces on-chain storage costs using delta encoding + run-length encoding (RLE).
+SBT metadata can grow large when storing structured data (JSON, image URIs,
+attributes, etc.). Metadata compression reduces on-chain storage costs with a
+MessagePack extension containing a compact PackBits-style block stream.
 
 ### How It Works
 
 #### Compression Strategy
 
-The compression module uses two techniques:
-
-1. **Delta Encoding**: Store differences between consecutive bytes rather than absolute values. This is particularly effective for JSON metadata where many fields have similar structures.
-
-2. **Run-Length Encoding (RLE)**: After delta encoding, compress runs of identical bytes. Common in padding, repeated quotes, and structural elements.
+The compressor creates direct-byte and delta-byte candidates. Each candidate
+uses literal and repeated-byte blocks, and the smaller candidate is wrapped in
+a MessagePack extension. If the complete framed value is not smaller than the
+original metadata, the original bytes are returned unchanged.
 
 #### Compression Format
 
-```
-Compressed Data:
-  [MAGIC: 0xC1]          — First byte (marks as compressed metadata)
-  [is_delta: u8]         — 0 or 1 (encoding method)
-  [data...]              — Encoded payload
+```text
+MessagePack extension:
+  [0xC7][payload length: u8][type: 0x45][payload...]
+  or
+  [0xC8][payload length: u16 big-endian][type: 0x45][payload...]
+
+Payload:
+  [version: 0x01][mode: 0x00 direct | 0x01 delta][blocks...]
+
+Block:
+  Literal: [0LLLLLLL][1-128 literal bytes]
+  Repeat:  [1RRRRRRR][one repeated byte]
+
+Literal length = L + 1
+Repeat length  = R + 3
 ```
 
+The extension type `0x45` identifies Ethos credential metadata. Ext8 is used
+for payloads up to 255 bytes; larger payloads use Ext16.
+
 ### API
+
+#### Compress and Decompress Bytes
+
+```rust
+pub fn compress_metadata(env: Env, metadata: Bytes) -> Bytes
+pub fn decompress_metadata(env: Env, metadata: Bytes) -> Bytes
+```
+
+`decompress_metadata` accepts the current MessagePack extension, the legacy
+`0xC1` delta/RLE representation, and ordinary uncompressed bytes.
 
 #### Create (at mint time)
 
@@ -54,6 +78,7 @@ pub fn compress_sbt_metadata(env: Env, sbt_id: u64) -> u64 {
     // Returns: size reduction (original_size - compressed_size)
     // Only owner can compress
     // Idempotent: already compressed SBTs return 0
+    // Metadata remains unmodified when compression would increase its size
 }
 ```
 
@@ -61,11 +86,10 @@ pub fn compress_sbt_metadata(env: Env, sbt_id: u64) -> u64 {
 
 ```rust
 pub fn get_metadata(env: Env, sbt_id: u64) -> String {
-    // Returns: raw (uncompressed) metadata
-    // Automatically decompresses if needed
+    // Preserves the existing String API and automatically decompresses
 }
 
-pub fn decompress_sbt_metadata(env: Env, sbt_id: u64) -> Vec<u8> {
+pub fn decompress_sbt_metadata(env: Env, sbt_id: u64) -> Bytes {
     // Returns: raw bytes (decompressed if compressed, as-is otherwise)
 }
 ```
@@ -84,16 +108,22 @@ pub fn is_sbt_metadata_compressed(env: Env, sbt_id: u64) -> bool {
 - New SBTs default to uncompressed format
 - Compression is opt-in via `compress_sbt_metadata()`
 - Decompression is automatic on read operations
+- Metadata written with the legacy `0xC1` representation remains readable
+- Unknown or ordinary bytes pass through decompression unchanged
 
 ### Storage Savings
 
-Typical JSON metadata achieves 40-60% compression:
+The focused storage benchmark uses 64 repeated metadata bytes:
 
-```
-Example:
-  Original:  {"name":"Alice","age":28,"country":"US","verified":true} = 69 bytes
-  Compressed: Typically 28-35 bytes (60%+ savings)
-```
+| Representation | Bytes |
+| --- | ---: |
+| Original | 64 |
+| MessagePack extension | 7 |
+| Saved | 57 |
+| Savings | 89.06% |
+
+Savings depend on the input. Short or non-repeating metadata remains
+uncompressed when the MessagePack envelope would be larger.
 
 ---
 

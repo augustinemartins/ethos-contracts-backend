@@ -1,254 +1,296 @@
-//! SBT metadata compression and decompression using delta + RLE encoding.
+//! Credential metadata compression using a MessagePack extension envelope.
 //!
-//! This module provides efficient compression for SBT metadata that leverages
-//! the structured nature of JSON metadata while maintaining backward compatibility.
-//!
-//! ## Compression Strategy
-//!
-//! 1. **Delta Encoding**: Store differences between consecutive bytes rather than
-//!    absolute values. Common metadata patterns (repeated fields, similar values)
-//!    compress well with this technique.
-//!
-//! 2. **Run-Length Encoding (RLE)**: Compress runs of identical bytes after delta
-//!    encoding. Typical for padding, repeated quotes, or structural elements.
-//!
-//! 3. **Magic Prefix**: Compressed data starts with `0xC1` to distinguish from
-//!    uncompressed metadata (which won't start with control bytes).
-//!
-//! ## Format
-//!
-//! ```text
-//! Compressed:
-//!   [MAGIC: 0xC1]
-//!   [is_delta_encoded: u8] (0 or 1)
-//!   ([count: u8][value: i8])*   if delta-encoded
-//!   or
-//!   ([byte: u8])*               if not delta-encoded
-//! ```
+//! The extension payload uses a small PackBits-style encoding and selects
+//! between direct bytes and delta bytes. Inputs that would not become smaller
+//! are returned unchanged, preserving compatibility with existing metadata.
 
 use soroban_sdk::{contracterror, Bytes, Env};
 
-/// First byte marking compressed SBT metadata.
-const COMPRESSION_MAGIC: u8 = 0xC1;
+/// Maximum supported uncompressed credential metadata size.
+pub const MAX_METADATA_SIZE: u32 = 4096;
+
+const MESSAGEPACK_EXT8: u8 = 0xC7;
+const MESSAGEPACK_EXT16: u8 = 0xC8;
+const ETHOS_METADATA_TYPE: u8 = 0x45;
+const FORMAT_VERSION: u8 = 1;
+const MODE_DIRECT: u8 = 0;
+const MODE_DELTA: u8 = 1;
+const LEGACY_MAGIC: u8 = 0xC1;
+const MAX_LITERAL_LENGTH: u32 = 128;
+const MAX_REPEAT_LENGTH: u32 = 130;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum CompressionError {
-    /// Input metadata was empty.
-    EmptyMetadata = 200,
-    /// Compressed data is malformed.
-    InvalidCompressedData = 201,
-    /// Decompressed output would exceed maximum size.
-    OutputTooLarge = 202,
+    /// The MessagePack extension or its block stream is malformed.
+    InvalidCompressedData = 200,
+    /// Decompressed output would exceed the metadata size limit.
+    OutputTooLarge = 201,
 }
 
-/// Compress metadata using delta + RLE encoding.
+/// Compress metadata into the Ethos MessagePack extension format.
 ///
-/// Returns `Ok(Bytes)` with compressed data if successful, or an error if the
-/// input is empty or would fail to compress.
-///
-/// # Arguments
-///
-/// * `env` - Soroban environment
-/// * `metadata` - Uncompressed metadata bytes
-/// * `max_compressed_size` - Maximum allowed output size (typically 4096)
-pub fn compress_metadata(
-    env: &Env,
-    metadata: &Bytes,
-    max_compressed_size: u32,
-) -> Result<Bytes, CompressionError> {
-    if metadata.is_empty() {
-        return Err(CompressionError::EmptyMetadata);
+/// The original bytes are returned when the input is empty, exceeds the
+/// metadata limit, or would not become smaller after framing.
+pub fn compress_metadata(env: &Env, metadata: &Bytes) -> Bytes {
+    if metadata.is_empty() || metadata.len() > MAX_METADATA_SIZE {
+        return metadata.clone();
     }
 
-    // Try delta encoding for structured data (JSON is highly compressible this way)
-    if let Ok(delta_compressed) = compress_with_delta(env, metadata, max_compressed_size) {
-        return Ok(delta_compressed);
-    }
+    let direct = encode_blocks(env, metadata, MODE_DIRECT);
+    let delta = encode_blocks(env, metadata, MODE_DELTA);
+    let payload = if delta.len() < direct.len() {
+        delta
+    } else {
+        direct
+    };
+    let framed = frame_messagepack_extension(env, &payload);
 
-    // Fallback to simple RLE if delta encoding doesn't help
-    compress_with_rle(env, metadata, max_compressed_size)
+    if framed.len() < metadata.len() {
+        framed
+    } else {
+        metadata.clone()
+    }
 }
 
-/// Decompress metadata that was compressed with `compress_metadata`.
+/// Decompress MessagePack-framed, legacy, or uncompressed metadata.
 ///
-/// # Arguments
-///
-/// * `env` - Soroban environment
-/// * `compressed` - Compressed metadata bytes (should start with COMPRESSION_MAGIC)
-/// * `max_decompressed_size` - Maximum allowed output size (typically 4096)
+/// Ordinary uncompressed bytes are returned unchanged. The legacy `0xC1`
+/// delta/RLE format remains readable for backwards compatibility.
 pub fn decompress_metadata(
     env: &Env,
-    compressed: &Bytes,
-    max_decompressed_size: u32,
+    metadata: &Bytes,
 ) -> Result<Bytes, CompressionError> {
-    if compressed.is_empty() {
-        return Err(CompressionError::InvalidCompressedData);
+    if let Some((payload_start, payload_end, mode)) = parse_messagepack_header(metadata)? {
+        return decode_blocks(env, metadata, payload_start, payload_end, mode);
     }
 
-    let magic = compressed.get(0).unwrap();
-    if magic != COMPRESSION_MAGIC {
-        return Err(CompressionError::InvalidCompressedData);
+    if is_legacy_compressed(metadata) {
+        return decompress_legacy(env, metadata);
     }
 
-    if compressed.len() < 2 {
-        return Err(CompressionError::InvalidCompressedData);
-    }
-
-    let is_delta = compressed.get(1).unwrap() != 0;
-
-    if is_delta {
-        decompress_delta_encoded(env, compressed, max_decompressed_size)
-    } else {
-        decompress_rle_encoded(env, compressed, max_decompressed_size)
-    }
+    Ok(metadata.clone())
 }
 
-/// Check if data is already compressed with our format.
+/// Return whether metadata uses the current or legacy compressed format.
 pub fn is_compressed(metadata: &Bytes) -> bool {
-    !metadata.is_empty() && metadata.get(0).unwrap() == COMPRESSION_MAGIC
+    matches!(parse_messagepack_header(metadata), Ok(Some(_))) || is_legacy_compressed(metadata)
 }
 
-// ============================================================================
-// Private: Delta + RLE Compression
-// ============================================================================
+fn encode_blocks(env: &Env, metadata: &Bytes, mode: u8) -> Bytes {
+    let mut payload = Bytes::new(env);
+    payload.push_back(FORMAT_VERSION);
+    payload.push_back(mode);
 
-/// Delta encoding: store differences from the previous byte.
-/// Works well for structured data like JSON.
-fn compress_with_delta(
-    env: &Env,
+    let mut index = 0u32;
+    while index < metadata.len() {
+        let repeated = repeat_length(metadata, index, mode);
+        if repeated >= 3 {
+            payload.push_back(0x80 | ((repeated - 3) as u8));
+            payload.push_back(transformed_byte(metadata, index, mode));
+            index += repeated;
+            continue;
+        }
+
+        let literal_start = index;
+        let mut literal_length = 0u32;
+        while index < metadata.len() && literal_length < MAX_LITERAL_LENGTH {
+            if literal_length > 0 && repeat_length(metadata, index, mode) >= 3 {
+                break;
+            }
+            index += 1;
+            literal_length += 1;
+        }
+
+        payload.push_back((literal_length - 1) as u8);
+        for literal_index in literal_start..(literal_start + literal_length) {
+            payload.push_back(transformed_byte(metadata, literal_index, mode));
+        }
+    }
+
+    payload
+}
+
+fn repeat_length(metadata: &Bytes, start: u32, mode: u8) -> u32 {
+    let expected = transformed_byte(metadata, start, mode);
+    let mut length = 1u32;
+    while length < MAX_REPEAT_LENGTH
+        && start + length < metadata.len()
+        && transformed_byte(metadata, start + length, mode) == expected
+    {
+        length += 1;
+    }
+    length
+}
+
+fn transformed_byte(metadata: &Bytes, index: u32, mode: u8) -> u8 {
+    let current = metadata.get(index).unwrap();
+    if mode == MODE_DELTA {
+        let previous = if index == 0 {
+            0
+        } else {
+            metadata.get(index - 1).unwrap()
+        };
+        current.wrapping_sub(previous)
+    } else {
+        current
+    }
+}
+
+fn frame_messagepack_extension(env: &Env, payload: &Bytes) -> Bytes {
+    let mut framed = Bytes::new(env);
+    if payload.len() <= u8::MAX as u32 {
+        framed.push_back(MESSAGEPACK_EXT8);
+        framed.push_back(payload.len() as u8);
+    } else {
+        framed.push_back(MESSAGEPACK_EXT16);
+        framed.push_back((payload.len() >> 8) as u8);
+        framed.push_back(payload.len() as u8);
+    }
+    framed.push_back(ETHOS_METADATA_TYPE);
+    framed.append(payload);
+    framed
+}
+
+fn parse_messagepack_header(
     metadata: &Bytes,
-    max_size: u32,
-) -> Result<Bytes, CompressionError> {
-    let mut out = Bytes::new(env);
-    out.push_back(COMPRESSION_MAGIC);
-    out.push_back(1); // is_delta_encoded = true
-
-    let len = metadata.len();
-    let mut prev: i16 = 0; // Use i16 to avoid overflow on subtraction
-
-    let mut i: u32 = 0;
-    while i < len {
-        let current = metadata.get(i).unwrap() as i16;
-        let delta = (current - prev) as i8;
-        out.push_back(delta as u8);
-
-        if out.len() >= max_size {
-            return Err(CompressionError::OutputTooLarge);
-        }
-
-        prev = current;
-        i += 1;
+) -> Result<Option<(u32, u32, u8)>, CompressionError> {
+    if metadata.is_empty() {
+        return Ok(None);
     }
 
-    Ok(out)
-}
-
-/// RLE encoding for runs of identical bytes.
-fn compress_with_rle(
-    env: &Env,
-    metadata: &Bytes,
-    max_size: u32,
-) -> Result<Bytes, CompressionError> {
-    let mut out = Bytes::new(env);
-    out.push_back(COMPRESSION_MAGIC);
-    out.push_back(0); // is_delta_encoded = false
-
-    let len = metadata.len();
-    let mut i: u32 = 0;
-
-    while i < len {
-        let current = metadata.get(i).unwrap();
-        let mut run: u32 = 1;
-
-        // Count consecutive identical bytes (capped at 255)
-        while run < 255 && (i + run) < len && metadata.get(i + run).unwrap() == current {
-            run += 1;
+    let (payload_start, payload_length) = match metadata.get(0).unwrap() {
+        MESSAGEPACK_EXT8
+            if metadata.len() >= 3 && metadata.get(2).unwrap() == ETHOS_METADATA_TYPE =>
+        {
+            (3u32, metadata.get(1).unwrap() as u32)
         }
-
-        // Encode as (count, byte) pair
-        out.push_back(run as u8);
-        out.push_back(current);
-
-        if out.len() >= max_size {
-            return Err(CompressionError::OutputTooLarge);
+        MESSAGEPACK_EXT16
+            if metadata.len() >= 4 && metadata.get(3).unwrap() == ETHOS_METADATA_TYPE =>
+        {
+            let length =
+                ((metadata.get(1).unwrap() as u32) << 8) | metadata.get(2).unwrap() as u32;
+            (4u32, length)
         }
+        _ => return Ok(None),
+    };
 
-        i += run;
+    let payload_end = payload_start
+        .checked_add(payload_length)
+        .ok_or(CompressionError::InvalidCompressedData)?;
+    if payload_length < 2 || payload_end != metadata.len() {
+        return Err(CompressionError::InvalidCompressedData);
     }
 
-    Ok(out)
-}
-
-// ============================================================================
-// Private: Delta + RLE Decompression
-// ============================================================================
-
-fn decompress_delta_encoded(
-    env: &Env,
-    compressed: &Bytes,
-    max_size: u32,
-) -> Result<Bytes, CompressionError> {
-    let mut out = Bytes::new(env);
-    let mut current: i16 = 0;
-    let compressed_len = compressed.len();
-
-    let mut i: u32 = 2; // Skip magic + flag
-    while i < compressed_len {
-        let delta = compressed.get(i).unwrap() as i8 as i16;
-        current = current.wrapping_add(delta);
-
-        let byte = (current & 0xFF) as u8;
-        out.push_back(byte);
-
-        if out.len() >= max_size {
-            return Err(CompressionError::OutputTooLarge);
-        }
-
-        i += 1;
+    let version = metadata.get(payload_start).unwrap();
+    let mode = metadata.get(payload_start + 1).unwrap();
+    if version != FORMAT_VERSION || (mode != MODE_DIRECT && mode != MODE_DELTA) {
+        return Err(CompressionError::InvalidCompressedData);
     }
 
-    Ok(out)
+    Ok(Some((payload_start + 2, payload_end, mode)))
 }
 
-fn decompress_rle_encoded(
+fn decode_blocks(
     env: &Env,
-    compressed: &Bytes,
-    max_size: u32,
+    encoded: &Bytes,
+    mut index: u32,
+    end: u32,
+    mode: u8,
 ) -> Result<Bytes, CompressionError> {
-    let mut out = Bytes::new(env);
-    let compressed_len = compressed.len();
+    let mut output = Bytes::new(env);
+    let mut previous = 0u8;
 
-    let mut i: u32 = 2; // Skip magic + flag
-    while i < compressed_len {
-        if i + 1 >= compressed_len {
-            return Err(CompressionError::InvalidCompressedData);
-        }
+    while index < end {
+        let token = encoded.get(index).unwrap();
+        index += 1;
 
-        let count = compressed.get(i).unwrap();
-        let byte = compressed.get(i + 1).unwrap();
-
-        for _ in 0..count {
-            out.push_back(byte);
-
-            if out.len() >= max_size {
-                return Err(CompressionError::OutputTooLarge);
+        if token & 0x80 != 0 {
+            if index >= end {
+                return Err(CompressionError::InvalidCompressedData);
+            }
+            let count = (token as u32 & 0x7F) + 3;
+            let value = encoded.get(index).unwrap();
+            index += 1;
+            for _ in 0..count {
+                push_decoded(&mut output, value, mode, &mut previous)?;
+            }
+        } else {
+            let count = (token as u32 & 0x7F) + 1;
+            if index + count > end {
+                return Err(CompressionError::InvalidCompressedData);
+            }
+            for _ in 0..count {
+                let value = encoded.get(index).unwrap();
+                index += 1;
+                push_decoded(&mut output, value, mode, &mut previous)?;
             }
         }
-
-        i += 2;
     }
 
-    Ok(out)
+    Ok(output)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_compression_magic() {
-        assert_eq!(COMPRESSION_MAGIC, 0xC1);
+fn push_decoded(
+    output: &mut Bytes,
+    value: u8,
+    mode: u8,
+    previous: &mut u8,
+) -> Result<(), CompressionError> {
+    if output.len() >= MAX_METADATA_SIZE {
+        return Err(CompressionError::OutputTooLarge);
     }
+
+    let decoded = if mode == MODE_DELTA {
+        previous.wrapping_add(value)
+    } else {
+        value
+    };
+    output.push_back(decoded);
+    *previous = decoded;
+    Ok(())
+}
+
+fn is_legacy_compressed(metadata: &Bytes) -> bool {
+    metadata.len() >= 2
+        && metadata.get(0).unwrap() == LEGACY_MAGIC
+        && matches!(metadata.get(1).unwrap(), MODE_DIRECT | MODE_DELTA)
+}
+
+fn decompress_legacy(env: &Env, metadata: &Bytes) -> Result<Bytes, CompressionError> {
+    let mode = metadata.get(1).unwrap();
+    if mode == MODE_DELTA {
+        let mut output = Bytes::new(env);
+        let mut previous = 0u8;
+        for index in 2..metadata.len() {
+            push_decoded(
+                &mut output,
+                metadata.get(index).unwrap(),
+                MODE_DELTA,
+                &mut previous,
+            )?;
+        }
+        return Ok(output);
+    }
+
+    let mut output = Bytes::new(env);
+    let mut index = 2u32;
+    let mut previous = 0u8;
+    while index < metadata.len() {
+        if index + 1 >= metadata.len() {
+            return Err(CompressionError::InvalidCompressedData);
+        }
+        let count = metadata.get(index).unwrap();
+        let value = metadata.get(index + 1).unwrap();
+        if count == 0 {
+            return Err(CompressionError::InvalidCompressedData);
+        }
+        for _ in 0..count {
+            push_decoded(&mut output, value, MODE_DIRECT, &mut previous)?;
+        }
+        index += 2;
+    }
+
+    Ok(output)
 }
