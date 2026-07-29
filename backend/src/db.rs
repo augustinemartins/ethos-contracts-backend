@@ -72,6 +72,10 @@ pub struct AppState {
     pub batcher: Arc<crate::batching::AdaptiveBatcher>,
     /// Traffic forecasting and replica recommendations (#130).
     pub scaler: Arc<crate::predictive_scaling::PredictiveScaler>,
+    /// Append-only event log + snapshot store (#151).
+    pub event_sourcing: Arc<crate::event_sourcing::EventSourcingState>,
+    /// In-process message broker for event-driven integration (#150).
+    pub message_queue: Arc<crate::message_queue::MessageQueueState>,
 }
 
 impl axum::extract::FromRef<AppState> for Arc<Db> {
