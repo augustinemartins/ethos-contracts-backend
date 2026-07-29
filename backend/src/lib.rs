@@ -31,6 +31,7 @@ pub mod streaming;
 pub mod templates;
 pub mod timeout_adaptation;
 pub mod two_factor;
+pub mod webauthn;
 pub mod webhook;
 pub mod websocket;
 
