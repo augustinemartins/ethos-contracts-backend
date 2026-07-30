@@ -40,10 +40,17 @@ use ethos_protocol_backend::{
     routes, scheduler,
     streaming::{stream_events, stream_vaults},
     timeout_policy::{self, TimeoutState},
-    webhook::{delete_webhook, list_webhooks, register_webhook, WebhookState},
+    webhook::{delete_webhook, list_webhooks, register_webhook, verify_webhook, WebhookState},
+    webauthn::{
+        add_backup_authenticator, begin_authentication, begin_registration,
+        complete_authentication, complete_registration, list_credentials, remove_credential,
+        WebAuthnState,
+    },
     decompression::DecompressionConfig,
     rpc_pool::{RpcPool, RpcPoolConfig},
     tracing_sampling::TraceSampler,
+    event_sourcing::EventSourcingState,
+    message_queue::MessageQueueState,
 };
 
 #[cfg(test)]
@@ -166,6 +173,7 @@ pub fn build_router(state: AppState) -> Router {
         // ── Webhook routes (#65) ─────────────────────────────────────────────
         .route("/webhooks", post(register_webhook).get(list_webhooks))
         .route("/webhooks/:id", delete(delete_webhook))
+        .route("/webhooks/verify", post(verify_webhook))
         // ── GraphQL routes (#66) ─────────────────────────────────────────────
         .route("/graphql", post(graphql_handler))
         .route("/graphql/playground", get(graphql_playground))
@@ -306,6 +314,10 @@ async fn main() {
         load_shedder,
         batcher,
         scaler,
+        event_sourcing: Arc::new(EventSourcingState::new()),
+        message_queue: Arc::new(
+            MessageQueueState::new().expect("failed to initialize message queue"),
+        ),
     };
 
     // ── Dynamic ACL admin routes ─────────────────────────────────────────
@@ -349,11 +361,30 @@ async fn main() {
         .route("/logs/search", get(search_logs))
         .with_state(log_store);
 
+    // ── WebAuthn / FIDO2 routes (#148) ────────────────────────────────────
+    let webauthn_state = Arc::new(WebAuthnState::from_env());
+    let webauthn_router = Router::new()
+        .route("/webauthn/register/begin", post(begin_registration))
+        .route("/webauthn/register/complete", post(complete_registration))
+        .route("/webauthn/authenticate/begin", post(begin_authentication))
+        .route("/webauthn/authenticate/complete", post(complete_authentication))
+        .route("/webauthn/credentials/:user_id", get(list_credentials))
+        .route(
+            "/webauthn/credentials/:user_id/:cred_id",
+            delete(remove_credential),
+        )
+        .route(
+            "/webauthn/credentials/:user_id/:cred_id/backup",
+            post(add_backup_authenticator),
+        )
+        .with_state(webauthn_state);
+
     let app = build_router(state)
         .merge(acl_router)
         .merge(custom_metrics_router)
         .merge(anomaly_router)
-        .merge(log_router);
+        .merge(log_router)
+        .merge(webauthn_router);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     tracing::info!("listening on {}", listener.local_addr().unwrap());

@@ -1,5 +1,7 @@
 pub mod acl;
 pub mod anomaly_detection;
+pub mod event_sourcing;
+pub mod message_queue;
 pub mod audit;
 pub mod batching;
 pub mod cache;
@@ -31,6 +33,7 @@ pub mod streaming;
 pub mod templates;
 pub mod timeout_adaptation;
 pub mod two_factor;
+pub mod webauthn;
 pub mod webhook;
 pub mod websocket;
 

@@ -2,7 +2,7 @@
 
 mod compression;
 #[cfg(test)]
-mod compression_tests;
+mod atomic_release_tests;
 
 use crate::compression::{
     compress_metadata as compress_metadata_bytes,
@@ -10,7 +10,7 @@ use crate::compression::{
 };
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, panic_with_error,
-    symbol_short, Address, Bytes, Env, String, Vec,
+    symbol_short, Address, Bytes, Env, Map, String, Vec,
 };
 
 const MINT_TOPIC: soroban_sdk::Symbol = symbol_short!("sbt_mint");
@@ -77,6 +77,10 @@ pub enum SbtError {
     NotEscrowAgent = 23,
     /// Holder count and fraction count must match.
     MismatchedOwnershipArrays = 24,
+    /// An escrowed credential has already been released.
+    CredentialAlreadyReleased = 25,
+    /// A credential id appears more than once in an atomic release batch.
+    DuplicateCredentialId = 26,
 }
 
 /// Storage key discriminants. All SBT state is keyed by `sbt_id`.
@@ -503,6 +507,65 @@ impl SbtContract {
 
         env.events()
             .publish((ESCROW_RELEASED_TOPIC,), (updated_escrow.escrow_id, sbt_id));
+    }
+
+    /// Releases multiple escrowed credentials in one atomic invocation.
+    ///
+    /// Every credential is validated before any escrow record is updated. Each
+    /// distinct escrow agent must authorize the invocation, which attests that
+    /// the corresponding escrow condition has been satisfied. If any id is
+    /// duplicated, missing from escrow, already released, or lacks agent
+    /// authorization, Soroban aborts the invocation and commits no changes.
+    ///
+    /// The returned vector preserves the input order and contains `true` for
+    /// every credential when the complete batch succeeds.
+    pub fn atomic_release_credentials(env: Env, credential_ids: Vec<u64>) -> Vec<bool> {
+        if credential_ids.is_empty() {
+            panic_with_error!(&env, SbtError::EmptyBatch);
+        }
+
+        let mut seen_ids: Map<u64, bool> = Map::new(&env);
+        let mut authorized_agents: Map<Address, bool> = Map::new(&env);
+        let mut escrows: Vec<EscrowRecord> = Vec::new(&env);
+
+        for credential_id in credential_ids.iter() {
+            if seen_ids.contains_key(credential_id) {
+                panic_with_error!(&env, SbtError::DuplicateCredentialId);
+            }
+            seen_ids.set(credential_id, true);
+
+            let escrow: EscrowRecord = env
+                .storage()
+                .instance()
+                .get(&DataKey::Escrow(credential_id))
+                .unwrap_or_else(|| panic_with_error!(&env, SbtError::NotInEscrow));
+
+            if escrow.released {
+                panic_with_error!(&env, SbtError::CredentialAlreadyReleased);
+            }
+
+            if !authorized_agents.contains_key(escrow.escrow_agent.clone()) {
+                escrow.escrow_agent.require_auth();
+                authorized_agents.set(escrow.escrow_agent.clone(), true);
+            }
+
+            escrows.push_back(escrow);
+        }
+
+        let mut results = Vec::new(&env);
+        for escrow in escrows.iter() {
+            let mut released = escrow.clone();
+            released.released = true;
+
+            env.storage()
+                .instance()
+                .set(&DataKey::Escrow(released.sbt_id), &released);
+            env.events()
+                .publish((ESCROW_RELEASED_TOPIC,), (released.escrow_id, released.sbt_id));
+            results.push_back(true);
+        }
+
+        results
     }
 
     /// Get escrow details for an SBT if it is in escrow.

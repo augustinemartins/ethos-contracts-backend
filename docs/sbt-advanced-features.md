@@ -263,6 +263,30 @@ pub struct EscrowRecord {
 2. **Proof submission**: Escrow agent provides proof that conditions are met
 3. **Atomic release**: On validation, SBT is released atomically
 
+#### Atomic Multi-Credential Release
+
+```rust
+pub fn atomic_release_credentials(
+    env: Env,
+    credential_ids: Vec<u64>,
+) -> Vec<bool>
+```
+
+`atomic_release_credentials` releases multiple escrowed SBT credentials in a
+single contract invocation. Each distinct escrow agent must authorize the
+batch, serving as that agent's attestation that the corresponding escrow
+conditions have been satisfied.
+
+The contract validates the complete input before changing storage. Empty
+batches, duplicate credential IDs, missing escrow records, credentials that
+were already released, or missing agent authorization abort the invocation.
+Soroban then rolls back the invocation, so no credential in a failed batch is
+released and no release event from that invocation is committed.
+
+On success, the function releases every credential, emits the existing escrow
+release event for each one, and returns a vector containing `true` for every
+input credential in the same order.
+
 ### API
 
 #### Enter Escrow
@@ -514,4 +538,3 @@ impl ConflictRule for GeographicConflictRule {
 - **#45**: Implement SBT Fractional Ownership
 - **#46**: Add SBT Escrow for Conditional Transfer
 - **#47**: Implement SBT Metadata Compression
-
