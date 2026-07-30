@@ -49,6 +49,8 @@ use ethos_protocol_backend::{
     decompression::DecompressionConfig,
     rpc_pool::{RpcPool, RpcPoolConfig},
     tracing_sampling::TraceSampler,
+    event_sourcing::EventSourcingState,
+    message_queue::MessageQueueState,
 };
 
 #[cfg(test)]
@@ -312,6 +314,10 @@ async fn main() {
         load_shedder,
         batcher,
         scaler,
+        event_sourcing: Arc::new(EventSourcingState::new()),
+        message_queue: Arc::new(
+            MessageQueueState::new().expect("failed to initialize message queue"),
+        ),
     };
 
     // ── Dynamic ACL admin routes ─────────────────────────────────────────

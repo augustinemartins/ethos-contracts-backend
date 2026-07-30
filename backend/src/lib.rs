@@ -1,5 +1,7 @@
 pub mod acl;
 pub mod anomaly_detection;
+pub mod event_sourcing;
+pub mod message_queue;
 pub mod audit;
 pub mod batching;
 pub mod cache;
