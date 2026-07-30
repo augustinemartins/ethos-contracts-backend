@@ -4,11 +4,14 @@ mod compression;
 #[cfg(test)]
 mod atomic_release_tests;
 
+use crate::compression::{
+    compress_metadata as compress_metadata_bytes,
+    decompress_metadata as decompress_metadata_bytes, is_compressed, MAX_METADATA_SIZE,
+};
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, panic_with_error,
     symbol_short, Address, Bytes, Env, Map, String, Vec,
 };
-use crate::compression::{compress_metadata, decompress_metadata, is_compressed};
 
 const MINT_TOPIC: soroban_sdk::Symbol = symbol_short!("sbt_mint");
 const COMPOSE_TOPIC: soroban_sdk::Symbol = symbol_short!("sbt_cmpse");
@@ -270,28 +273,56 @@ impl SbtContract {
     }
 
     pub fn get_metadata(env: Env, sbt_id: u64) -> String {
-        env.storage()
+        if !Self::is_sbt_metadata_compressed(env.clone(), sbt_id) {
+            return env
+                .storage()
+                .instance()
+                .get(&DataKey::Metadata(sbt_id))
+                .unwrap_or_else(|| panic_with_error!(&env, SbtError::TokenNotFound));
+        }
+
+        let compressed: Bytes = env
+            .storage()
             .instance()
             .get(&DataKey::Metadata(sbt_id))
-            .unwrap_or_else(|| panic_with_error!(&env, SbtError::TokenNotFound))
+            .unwrap_or_else(|| panic_with_error!(&env, SbtError::TokenNotFound));
+        let metadata = decompress_metadata_bytes(&env, &compressed)
+            .unwrap_or_else(|_| panic_with_error!(&env, SbtError::MetadataCompressionFailed));
+        Self::bytes_to_string(&env, &metadata)
+    }
+
+    /// Compress arbitrary credential metadata using the Ethos MessagePack format.
+    ///
+    /// Metadata that would not become smaller is returned unchanged.
+    pub fn compress_metadata(env: Env, metadata: Bytes) -> Bytes {
+        compress_metadata_bytes(&env, &metadata)
+    }
+
+    /// Decompress current, legacy, or ordinary uncompressed credential metadata.
+    pub fn decompress_metadata(env: Env, metadata: Bytes) -> Bytes {
+        decompress_metadata_bytes(&env, &metadata)
+            .unwrap_or_else(|_| panic_with_error!(&env, SbtError::MetadataCompressionFailed))
     }
 
     /// Compress an SBT's metadata in-place. Owner only.
     pub fn compress_sbt_metadata(env: Env, sbt_id: u64) -> u64 {
         Self::require_owner(&env, sbt_id);
-        
-        let metadata: Vec<u8> = env
+
+        if Self::is_sbt_metadata_compressed(env.clone(), sbt_id) {
+            return 0;
+        }
+
+        let metadata: String = env
             .storage()
             .instance()
             .get(&DataKey::Metadata(sbt_id))
             .unwrap_or_else(|| panic_with_error!(&env, SbtError::TokenNotFound));
+        let metadata = Self::string_to_bytes(&env, &metadata);
+        let compressed = compress_metadata_bytes(&env, &metadata);
 
-        if is_compressed(&metadata) {
+        if !is_compressed(&compressed) {
             return 0;
         }
-
-        let compressed = compress_metadata(&env, &metadata, 4096)
-            .unwrap_or_else(|_| panic_with_error!(&env, SbtError::MetadataCompressionFailed));
 
         let original_size = metadata.len() as u64;
         let compressed_size = compressed.len() as u64;
@@ -310,18 +341,23 @@ impl SbtContract {
     }
 
     /// Decompress an SBT's metadata if it was compressed, returning raw bytes.
-    pub fn decompress_sbt_metadata(env: Env, sbt_id: u64) -> Vec<u8> {
-        let metadata: Vec<u8> = env
+    pub fn decompress_sbt_metadata(env: Env, sbt_id: u64) -> Bytes {
+        if !Self::is_sbt_metadata_compressed(env.clone(), sbt_id) {
+            let metadata: String = env
+                .storage()
+                .instance()
+                .get(&DataKey::Metadata(sbt_id))
+                .unwrap_or_else(|| panic_with_error!(&env, SbtError::TokenNotFound));
+            return Self::string_to_bytes(&env, &metadata);
+        }
+
+        let metadata: Bytes = env
             .storage()
             .instance()
             .get(&DataKey::Metadata(sbt_id))
             .unwrap_or_else(|| panic_with_error!(&env, SbtError::TokenNotFound));
 
-        if !is_compressed(&metadata) {
-            return metadata;
-        }
-
-        decompress_metadata(&env, &metadata, 4096)
+        decompress_metadata_bytes(&env, &metadata)
             .unwrap_or_else(|_| panic_with_error!(&env, SbtError::MetadataCompressionFailed))
     }
 
@@ -742,6 +778,28 @@ impl SbtContract {
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic_with_error!(env, SbtError::NotInitialized));
         admin.require_auth();
+    }
+
+    fn string_to_bytes(env: &Env, metadata: &String) -> Bytes {
+        if metadata.len() > MAX_METADATA_SIZE {
+            panic_with_error!(env, SbtError::MetadataCompressionFailed);
+        }
+
+        let length = metadata.len() as usize;
+        let mut buffer = [0u8; MAX_METADATA_SIZE as usize];
+        metadata.copy_into_slice(&mut buffer[..length]);
+        Bytes::from_slice(env, &buffer[..length])
+    }
+
+    fn bytes_to_string(env: &Env, metadata: &Bytes) -> String {
+        if metadata.len() > MAX_METADATA_SIZE {
+            panic_with_error!(env, SbtError::MetadataCompressionFailed);
+        }
+
+        let length = metadata.len() as usize;
+        let mut buffer = [0u8; MAX_METADATA_SIZE as usize];
+        metadata.copy_into_slice(&mut buffer[..length]);
+        String::from_bytes(env, &buffer[..length])
     }
 
     fn load_owner(env: &Env, sbt_id: u64) -> Address {
