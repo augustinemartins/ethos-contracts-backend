@@ -215,15 +215,12 @@ pub async fn negotiate_capabilities(
     State(state): State<Arc<DegradationState>>,
     Json(body): Json<NegotiateRequest>,
 ) -> Result<Json<NegotiationResult>, (StatusCode, Json<serde_json::Value>)> {
-    state
-        .negotiate(&body.requested)
-        .map(Json)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e })),
-            )
-        })
+    state.negotiate(&body.requested).map(Json).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e })),
+        )
+    })
 }
 
 /// `GET /capabilities/:name/fallback` — reduced-functionality fallback
@@ -232,7 +229,9 @@ pub async fn capability_fallback(
     State(state): State<Arc<DegradationState>>,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let status = state.check(&name).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let status = state
+        .check(&name)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if status.level == DegradationLevel::Full {
         return Err(StatusCode::NOT_FOUND);
     }
@@ -402,7 +401,12 @@ mod tests {
             .set_status("search", DegradationLevel::Degraded, None, false)
             .expect("set_status failed");
         state
-            .set_status("recommendations", DegradationLevel::Unavailable, None, false)
+            .set_status(
+                "recommendations",
+                DegradationLevel::Unavailable,
+                None,
+                false,
+            )
             .expect("set_status failed");
         state
             .set_status("analytics", DegradationLevel::Full, None, false)
@@ -413,6 +417,8 @@ mod tests {
         assert!(list.iter().any(|s| s.name == "search"));
         assert!(list.iter().any(|s| s.name == "recommendations"));
         // Full is not registered, so it won't appear in list
-        assert!(!list.iter().any(|s| s.name == "analytics" && s.level == DegradationLevel::Full));
+        assert!(!list
+            .iter()
+            .any(|s| s.name == "analytics" && s.level == DegradationLevel::Full));
     }
 }

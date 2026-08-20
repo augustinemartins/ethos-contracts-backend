@@ -156,7 +156,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/ready", get(ready_handler))
         .route("/metrics", get(metrics_handler))
         // ── Graceful degradation routes ─────────────────────────────────────
-        .route("/admin/capabilities", post(set_capability).get(list_capabilities))
+        .route(
+            "/admin/capabilities",
+            post(set_capability).get(list_capabilities),
+        )
         .route("/capabilities/negotiate", post(negotiate_capabilities))
         .route("/capabilities/:name/fallback", get(capability_fallback))
         // ── Legacy reminder / subscription routes ────────────────────────────
