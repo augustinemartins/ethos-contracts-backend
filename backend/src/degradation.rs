@@ -100,6 +100,7 @@ pub struct NegotiationResult {
 /// Database-backed registry of capability statuses.
 /// All instances in a load-balanced deployment share the same storage,
 /// ensuring consistent degradation state across the fleet.
+#[derive(Clone)]
 pub struct DegradationState {
     db: Arc<crate::db::Db>,
 }

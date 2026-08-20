@@ -2516,8 +2516,8 @@ impl Db {
 
         let status = stmt.query_row(rusqlite::params![name], |r| {
             let level_str: String = r.get(1)?;
-            let level: crate::degradation::DegradationLevel =
-                serde_json::from_str(&level_str).unwrap_or(crate::degradation::DegradationLevel::Full);
+            let level: crate::degradation::DegradationLevel = serde_json::from_str(&level_str)
+                .unwrap_or(crate::degradation::DegradationLevel::Full);
             Ok(crate::degradation::CapabilityStatus {
                 name: r.get(0)?,
                 level,
@@ -2562,8 +2562,8 @@ impl Db {
 
         let statuses = stmt.query_map([], |r| {
             let level_str: String = r.get(1)?;
-            let level: crate::degradation::DegradationLevel =
-                serde_json::from_str(&level_str).unwrap_or(crate::degradation::DegradationLevel::Full);
+            let level: crate::degradation::DegradationLevel = serde_json::from_str(&level_str)
+                .unwrap_or(crate::degradation::DegradationLevel::Full);
             Ok(crate::degradation::CapabilityStatus {
                 name: r.get(0)?,
                 level,
