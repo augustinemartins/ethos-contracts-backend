@@ -122,9 +122,10 @@ pub struct AdaptiveBatcher {
 
 impl AdaptiveBatcher {
     pub fn new(config: BatchConfig) -> Self {
-        let current_size = config
-            .initial_batch_size
-            .clamp(config.min_batch_size, config.max_batch_size.max(config.min_batch_size));
+        let current_size = config.initial_batch_size.clamp(
+            config.min_batch_size,
+            config.max_batch_size.max(config.min_batch_size),
+        );
         Self {
             latencies: Mutex::new(LatencyWindow::new(config.window)),
             current_size: AtomicUsize::new(current_size),
@@ -167,8 +168,7 @@ impl AdaptiveBatcher {
 
         let next = if average_latency > high_water {
             // Over budget: shrink proportionally to how far over we are.
-            let ratio =
-                high_water.as_secs_f64() / average_latency.as_secs_f64().max(0.000_001);
+            let ratio = high_water.as_secs_f64() / average_latency.as_secs_f64().max(0.000_001);
             ((current as f64) * ratio).floor() as usize
         } else if average_latency < low_water {
             // Under budget: grow, capped so a single step can't overshoot.
@@ -191,7 +191,12 @@ impl AdaptiveBatcher {
     }
 
     pub fn metrics(&self) -> BatchingMetrics {
-        let average_latency_ms = self.latencies.lock().unwrap().average().map(|d| d.as_millis());
+        let average_latency_ms = self
+            .latencies
+            .lock()
+            .unwrap()
+            .average()
+            .map(|d| d.as_millis());
         BatchingMetrics {
             current_batch_size: self.current_batch_size(),
             average_latency_ms,

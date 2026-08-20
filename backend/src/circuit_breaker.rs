@@ -236,7 +236,10 @@ impl CircuitBreaker {
                 let successes = self.consecutive_successes.fetch_add(1, Ordering::Relaxed) + 1;
                 if successes >= u64::from(self.config.success_threshold) {
                     self.consecutive_successes.store(0, Ordering::Relaxed);
-                    self.transition(CircuitState::Closed, "success threshold reached in half-open");
+                    self.transition(
+                        CircuitState::Closed,
+                        "success threshold reached in half-open",
+                    );
                 }
             }
             CircuitState::Open => {}
@@ -323,27 +326,69 @@ impl CircuitBreaker {
 
         let _ = writeln!(out, "# HELP circuit_breaker_state Current circuit breaker state (0=closed,1=half_open,2=open)");
         let _ = writeln!(out, "# TYPE circuit_breaker_state gauge");
-        let _ = writeln!(out, "circuit_breaker_state{{{labels}}} {}", snap.state.as_code());
+        let _ = writeln!(
+            out,
+            "circuit_breaker_state{{{labels}}} {}",
+            snap.state.as_code()
+        );
 
-        let _ = writeln!(out, "# HELP circuit_breaker_calls_allowed_total Calls let through the breaker");
+        let _ = writeln!(
+            out,
+            "# HELP circuit_breaker_calls_allowed_total Calls let through the breaker"
+        );
         let _ = writeln!(out, "# TYPE circuit_breaker_calls_allowed_total counter");
-        let _ = writeln!(out, "circuit_breaker_calls_allowed_total{{{labels}}} {}", snap.calls_allowed_total);
+        let _ = writeln!(
+            out,
+            "circuit_breaker_calls_allowed_total{{{labels}}} {}",
+            snap.calls_allowed_total
+        );
 
-        let _ = writeln!(out, "# HELP circuit_breaker_calls_rejected_total Calls short-circuited while open");
+        let _ = writeln!(
+            out,
+            "# HELP circuit_breaker_calls_rejected_total Calls short-circuited while open"
+        );
         let _ = writeln!(out, "# TYPE circuit_breaker_calls_rejected_total counter");
-        let _ = writeln!(out, "circuit_breaker_calls_rejected_total{{{labels}}} {}", snap.calls_rejected_total);
+        let _ = writeln!(
+            out,
+            "circuit_breaker_calls_rejected_total{{{labels}}} {}",
+            snap.calls_rejected_total
+        );
 
-        let _ = writeln!(out, "# HELP circuit_breaker_failures_total Failed calls observed by the breaker");
+        let _ = writeln!(
+            out,
+            "# HELP circuit_breaker_failures_total Failed calls observed by the breaker"
+        );
         let _ = writeln!(out, "# TYPE circuit_breaker_failures_total counter");
-        let _ = writeln!(out, "circuit_breaker_failures_total{{{labels}}} {}", snap.failures_total);
+        let _ = writeln!(
+            out,
+            "circuit_breaker_failures_total{{{labels}}} {}",
+            snap.failures_total
+        );
 
-        let _ = writeln!(out, "# HELP circuit_breaker_successes_total Successful calls observed by the breaker");
+        let _ = writeln!(
+            out,
+            "# HELP circuit_breaker_successes_total Successful calls observed by the breaker"
+        );
         let _ = writeln!(out, "# TYPE circuit_breaker_successes_total counter");
-        let _ = writeln!(out, "circuit_breaker_successes_total{{{labels}}} {}", snap.successes_total);
+        let _ = writeln!(
+            out,
+            "circuit_breaker_successes_total{{{labels}}} {}",
+            snap.successes_total
+        );
 
-        let _ = writeln!(out, "# HELP circuit_breaker_state_transitions_total Number of state transitions");
-        let _ = writeln!(out, "# TYPE circuit_breaker_state_transitions_total counter");
-        let _ = writeln!(out, "circuit_breaker_state_transitions_total{{{labels}}} {}", snap.state_transitions_total);
+        let _ = writeln!(
+            out,
+            "# HELP circuit_breaker_state_transitions_total Number of state transitions"
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE circuit_breaker_state_transitions_total counter"
+        );
+        let _ = writeln!(
+            out,
+            "circuit_breaker_state_transitions_total{{{labels}}} {}",
+            snap.state_transitions_total
+        );
 
         out
     }

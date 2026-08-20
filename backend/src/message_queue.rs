@@ -104,9 +104,7 @@ pub fn assign_partition(
             }
             None => round_robin_counter % partition_count,
         },
-        PartitionStrategy::Manual => {
-            manual_partition.unwrap_or(0).min(partition_count - 1)
-        }
+        PartitionStrategy::Manual => manual_partition.unwrap_or(0).min(partition_count - 1),
     }
 }
 
@@ -197,7 +195,10 @@ impl MessageBroker {
 
     /// Register a topic with the given configuration.  Idempotent.
     pub fn create_topic(&self, config: TopicConfig) -> Result<(), MessageQueueError> {
-        let mut topics = self.topics.lock().map_err(|_| MessageQueueError::LockPoisoned)?;
+        let mut topics = self
+            .topics
+            .lock()
+            .map_err(|_| MessageQueueError::LockPoisoned)?;
         topics.entry(config.name.clone()).or_insert_with(|| {
             let n = config.partition_count as usize;
             TopicStore {
@@ -218,7 +219,10 @@ impl MessageBroker {
         payload: serde_json::Value,
         manual_partition: Option<u32>,
     ) -> Result<String, MessageQueueError> {
-        let mut topics = self.topics.lock().map_err(|_| MessageQueueError::LockPoisoned)?;
+        let mut topics = self
+            .topics
+            .lock()
+            .map_err(|_| MessageQueueError::LockPoisoned)?;
         let store = topics
             .get_mut(topic)
             .ok_or_else(|| MessageQueueError::TopicNotFound(topic.to_string()))?;
@@ -248,7 +252,10 @@ impl MessageBroker {
         consumer_group: &str,
         max_messages: usize,
     ) -> Result<Vec<QueueMessage>, MessageQueueError> {
-        let topics = self.topics.lock().map_err(|_| MessageQueueError::LockPoisoned)?;
+        let topics = self
+            .topics
+            .lock()
+            .map_err(|_| MessageQueueError::LockPoisoned)?;
         let store = topics
             .get(topic)
             .ok_or_else(|| MessageQueueError::TopicNotFound(topic.to_string()))?;
@@ -286,7 +293,10 @@ impl MessageBroker {
         consumer_group: &str,
         offset: usize,
     ) -> Result<(), MessageQueueError> {
-        let mut topics = self.topics.lock().map_err(|_| MessageQueueError::LockPoisoned)?;
+        let mut topics = self
+            .topics
+            .lock()
+            .map_err(|_| MessageQueueError::LockPoisoned)?;
         let store = topics
             .get_mut(topic)
             .ok_or_else(|| MessageQueueError::TopicNotFound(topic.to_string()))?;
@@ -298,12 +308,11 @@ impl MessageBroker {
     }
 
     /// Move a message to the dead-letter queue for its topic.
-    pub fn send_to_dlq(
-        &self,
-        topic: &str,
-        mut msg: QueueMessage,
-    ) -> Result<(), MessageQueueError> {
-        let mut topics = self.topics.lock().map_err(|_| MessageQueueError::LockPoisoned)?;
+    pub fn send_to_dlq(&self, topic: &str, mut msg: QueueMessage) -> Result<(), MessageQueueError> {
+        let mut topics = self
+            .topics
+            .lock()
+            .map_err(|_| MessageQueueError::LockPoisoned)?;
         let store = topics
             .get_mut(topic)
             .ok_or_else(|| MessageQueueError::TopicNotFound(topic.to_string()))?;
@@ -315,7 +324,10 @@ impl MessageBroker {
 
     /// Return all messages currently in the DLQ for a topic.
     pub fn list_dlq(&self, topic: &str) -> Result<Vec<QueueMessage>, MessageQueueError> {
-        let topics = self.topics.lock().map_err(|_| MessageQueueError::LockPoisoned)?;
+        let topics = self
+            .topics
+            .lock()
+            .map_err(|_| MessageQueueError::LockPoisoned)?;
         let store = topics
             .get(topic)
             .ok_or_else(|| MessageQueueError::TopicNotFound(topic.to_string()))?;
@@ -329,7 +341,10 @@ impl MessageBroker {
         partition: u32,
         consumer_group: &str,
     ) -> Result<usize, MessageQueueError> {
-        let topics = self.topics.lock().map_err(|_| MessageQueueError::LockPoisoned)?;
+        let topics = self
+            .topics
+            .lock()
+            .map_err(|_| MessageQueueError::LockPoisoned)?;
         let store = topics
             .get(topic)
             .ok_or_else(|| MessageQueueError::TopicNotFound(topic.to_string()))?;
@@ -432,12 +447,7 @@ impl MessageConsumer {
     }
 
     /// Acknowledge all messages up to `offset` on the given topic/partition.
-    pub fn ack(
-        &self,
-        topic: &str,
-        partition: u32,
-        offset: usize,
-    ) -> Result<(), MessageQueueError> {
+    pub fn ack(&self, topic: &str, partition: u32, offset: usize) -> Result<(), MessageQueueError> {
         self.broker
             .commit_offset(topic, partition, &self.consumer_group, offset)
     }
@@ -613,12 +623,7 @@ mod tests {
         }
         // All 5 messages must land in the same partition
         let counts: Vec<usize> = (0..4u32)
-            .map(|p| {
-                broker
-                    .poll("test.topic", p, "grp", 100)
-                    .unwrap()
-                    .len()
-            })
+            .map(|p| broker.poll("test.topic", p, "grp", 100).unwrap().len())
             .collect();
         let non_zero: Vec<_> = counts.iter().filter(|&&c| c > 0).collect();
         assert_eq!(non_zero.len(), 1, "hash-key routing must be sticky");
@@ -637,7 +642,13 @@ mod tests {
             .unwrap();
         for _ in 0..8 {
             broker
-                .publish("rr.topic", None, HashMap::new(), serde_json::json!({}), None)
+                .publish(
+                    "rr.topic",
+                    None,
+                    HashMap::new(),
+                    serde_json::json!({}),
+                    None,
+                )
                 .unwrap();
         }
         let counts: Vec<usize> = (0..4u32)
@@ -719,7 +730,10 @@ mod tests {
         for p in 0..4u32 {
             let msgs = broker.poll("vault.events", p, "test", 10).unwrap();
             for m in &msgs {
-                assert_eq!(m.headers.get("event_type").map(|s| s.as_str()), Some("check_in"));
+                assert_eq!(
+                    m.headers.get("event_type").map(|s| s.as_str()),
+                    Some("check_in")
+                );
                 found_header = true;
             }
         }
@@ -743,11 +757,8 @@ mod tests {
                 )
                 .unwrap();
         }
-        let consumer = MessageConsumer::new(
-            Arc::clone(&broker),
-            "grp",
-            vec![("proc.topic".into(), 0)],
-        );
+        let consumer =
+            MessageConsumer::new(Arc::clone(&broker), "grp", vec![("proc.topic".into(), 0)]);
         let summary = consumer
             .process("proc.topic", 0, 10, 3, |_| Ok(()))
             .unwrap();

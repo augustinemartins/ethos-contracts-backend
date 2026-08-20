@@ -66,7 +66,9 @@ impl IntoResponse for AppError {
         let (status, code) = match &self {
             AppError::NotFound => (StatusCode::NOT_FOUND, "not_found"),
             AppError::InvalidInput(_) => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_input"),
-            AppError::Db(_) | AppError::DatabaseError => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
+            AppError::Db(_) | AppError::DatabaseError => {
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
+            }
             AppError::TwoFactorRequired => (StatusCode::UNAUTHORIZED, "two_factor_required"),
             AppError::TwoFactorNotEnabled => (StatusCode::BAD_REQUEST, "two_factor_not_enabled"),
         };

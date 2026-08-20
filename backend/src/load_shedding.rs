@@ -295,7 +295,9 @@ pub async fn admission_middleware(
     }
     state.load_shedder.monitor.record_accepted();
 
-    let Some(_permit) = crate::priority::PriorityEnforcer::try_acquire(&state.priority_enforcer, priority) else {
+    let Some(_permit) =
+        crate::priority::PriorityEnforcer::try_acquire(&state.priority_enforcer, priority)
+    else {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(serde_json::json!({

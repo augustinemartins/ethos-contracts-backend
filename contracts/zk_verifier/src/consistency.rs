@@ -50,11 +50,7 @@ pub trait ConflictRule {
     /// Check if two credentials are compatible.
     ///
     /// Returns `true` if credentials can coexist, `false` if they conflict.
-    fn are_compatible(
-        env: &Env,
-        claim_a: &Bytes,
-        claim_b: &Bytes,
-    ) -> bool;
+    fn are_compatible(env: &Env, claim_a: &Bytes, claim_b: &Bytes) -> bool;
 
     /// Provide a human-readable conflict reason if incompatible.
     fn conflict_reason(env: &Env) -> Bytes;
@@ -99,10 +95,9 @@ impl ConflictRule for KycStatusConflictRule {
             return true;
         }
         // Extract status from claim
-        if let (Ok(status_a), Ok(status_b)) = (
-            extract_kyc_status(claim_a),
-            extract_kyc_status(claim_b),
-        ) {
+        if let (Ok(status_a), Ok(status_b)) =
+            (extract_kyc_status(claim_a), extract_kyc_status(claim_b))
+        {
             kyc_statuses_compatible(status_a, status_b)
         } else {
             true
@@ -282,8 +277,17 @@ mod tests {
 
     #[test]
     fn test_kyc_status_conflicts() {
-        assert!(!kyc_statuses_compatible(KycStatus::Pending, KycStatus::Rejected));
-        assert!(!kyc_statuses_compatible(KycStatus::Approved, KycStatus::Rejected));
-        assert!(kyc_statuses_compatible(KycStatus::Pending, KycStatus::Approved));
+        assert!(!kyc_statuses_compatible(
+            KycStatus::Pending,
+            KycStatus::Rejected
+        ));
+        assert!(!kyc_statuses_compatible(
+            KycStatus::Approved,
+            KycStatus::Rejected
+        ));
+        assert!(kyc_statuses_compatible(
+            KycStatus::Pending,
+            KycStatus::Approved
+        ));
     }
 }

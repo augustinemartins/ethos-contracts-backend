@@ -52,11 +52,7 @@ fn atomic_release_rejects_empty_batches() {
     let (env, contract_id, _, _) = setup();
     let client = SbtContractClient::new(&env, &contract_id);
 
-    assert!(
-        client
-            .try_atomic_release_credentials(&vec![&env])
-            .is_err()
-    );
+    assert!(client.try_atomic_release_credentials(&vec![&env]).is_err());
 }
 
 #[test]
@@ -67,11 +63,9 @@ fn atomic_release_rolls_back_when_any_credential_is_not_in_escrow() {
     let missing = escrowed + 1;
     let client = SbtContractClient::new(&env, &contract_id);
 
-    assert!(
-        client
-            .try_atomic_release_credentials(&vec![&env, escrowed, missing])
-            .is_err()
-    );
+    assert!(client
+        .try_atomic_release_credentials(&vec![&env, escrowed, missing])
+        .is_err());
     assert!(!client.get_escrow_status(&escrowed).unwrap().released);
 }
 
@@ -84,11 +78,9 @@ fn atomic_release_rolls_back_when_any_credential_was_already_released() {
     let client = SbtContractClient::new(&env, &contract_id);
     client.release_sbt_from_escrow(&released, &Bytes::from_slice(&env, b"proof"));
 
-    assert!(
-        client
-            .try_atomic_release_credentials(&vec![&env, pending, released])
-            .is_err()
-    );
+    assert!(client
+        .try_atomic_release_credentials(&vec![&env, pending, released])
+        .is_err());
     assert!(!client.get_escrow_status(&pending).unwrap().released);
     assert!(client.get_escrow_status(&released).unwrap().released);
 }
@@ -100,17 +92,10 @@ fn atomic_release_rejects_duplicate_credential_ids_without_mutation() {
     let credential_id = create_escrowed_credential(&env, &contract_id, &owner, &escrow_agent);
     let client = SbtContractClient::new(&env, &contract_id);
 
-    assert!(
-        client
-            .try_atomic_release_credentials(&vec![&env, credential_id, credential_id])
-            .is_err()
-    );
-    assert!(
-        !client
-            .get_escrow_status(&credential_id)
-            .unwrap()
-            .released
-    );
+    assert!(client
+        .try_atomic_release_credentials(&vec![&env, credential_id, credential_id])
+        .is_err());
+    assert!(!client.get_escrow_status(&credential_id).unwrap().released);
 }
 
 #[test]
@@ -123,11 +108,9 @@ fn atomic_release_requires_every_distinct_escrow_agent() {
     let client = SbtContractClient::new(&env, &contract_id);
     env.set_auths(&[]);
 
-    assert!(
-        client
-            .try_atomic_release_credentials(&vec![&env, first, second])
-            .is_err()
-    );
+    assert!(client
+        .try_atomic_release_credentials(&vec![&env, first, second])
+        .is_err());
     assert!(!client.get_escrow_status(&first).unwrap().released);
     assert!(!client.get_escrow_status(&second).unwrap().released);
 }

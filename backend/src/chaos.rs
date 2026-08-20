@@ -286,7 +286,8 @@ impl ResourceExhaustionSimulator {
     }
 
     pub fn available(&self) -> usize {
-        self.capacity.saturating_sub(self.in_use.load(Ordering::SeqCst))
+        self.capacity
+            .saturating_sub(self.in_use.load(Ordering::SeqCst))
     }
 }
 
@@ -454,8 +455,14 @@ mod tests {
         let runner = ChaosRunner::new(&injector);
         let result = runner.run(200, retrying_operation(5));
 
-        assert!(result.faults_injected > 0, "expected some injected failures");
-        assert!(result.passed(), "resilient client should mostly succeed: {result:?}");
+        assert!(
+            result.faults_injected > 0,
+            "expected some injected failures"
+        );
+        assert!(
+            result.passed(),
+            "resilient client should mostly succeed: {result:?}"
+        );
     }
 
     #[test]

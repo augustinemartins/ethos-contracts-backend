@@ -16,41 +16,42 @@ use ethos_protocol_backend::{
     batching::{AdaptiveBatcher, BatchConfig},
     consensus::NodeCache,
     contract_version_check::{check_contract_version, parse_min_contract_version},
+    cost_tracking::{allocate_cost, get_cost_report, record_cost_entry, CostState},
     custom_metrics::{
-        aggregate_custom_metric, create_dashboard_share, get_shared_dashboard,
-        list_custom_metrics, list_dashboard_templates, record_custom_metric, CustomMetricsStore,
+        aggregate_custom_metric, create_dashboard_share, get_shared_dashboard, list_custom_metrics,
+        list_dashboard_templates, record_custom_metric, CustomMetricsStore,
     },
     db::{
         create_audit_store, create_event_store, create_share_store, create_share_token_store,
         create_vault_store, AppState, Db, PoolConfig,
     },
-    cost_tracking::{allocate_cost, get_cost_report, record_cost_entry, CostState},
+    decompression::DecompressionConfig,
     degradation::{
         capability_fallback, list_capabilities, negotiate_capabilities, set_capability,
         DegradationState,
     },
+    event_sourcing::EventSourcingState,
     feature_flags::{evaluate_flag_handler, get_flag, list_flags, upsert_flag, FlagState},
     graphql::{build_schema, graphql_handler, graphql_playground},
     load_shedding::{admission_middleware, LoadMonitor, LoadShedder, SheddingConfig},
+    message_queue::MessageQueueState,
     metrics::Metrics,
     predictive_scaling::{
         self, ForecastModel, LoggingAutoscalerClient, PredictiveScaler, ScalingConfig,
     },
     priority::{PriorityConfig, PriorityEnforcer},
-    routes, scheduler,
+    routes,
+    rpc_pool::{RpcPool, RpcPoolConfig},
+    scheduler,
     streaming::{stream_events, stream_vaults},
     timeout_policy::{self, TimeoutState},
-    webhook::{delete_webhook, list_webhooks, register_webhook, verify_webhook, WebhookState},
+    tracing_sampling::TraceSampler,
     webauthn::{
         add_backup_authenticator, begin_authentication, begin_registration,
         complete_authentication, complete_registration, list_credentials, remove_credential,
         WebAuthnState,
     },
-    decompression::DecompressionConfig,
-    rpc_pool::{RpcPool, RpcPoolConfig},
-    tracing_sampling::TraceSampler,
-    event_sourcing::EventSourcingState,
-    message_queue::MessageQueueState,
+    webhook::{delete_webhook, list_webhooks, register_webhook, verify_webhook, WebhookState},
 };
 
 #[cfg(test)]
@@ -284,7 +285,10 @@ async fn main() {
     // (#128, #129, #130, #131)
     let metrics = Metrics::new();
     let priority_enforcer = Arc::new(PriorityEnforcer::new(PriorityConfig::from_env()));
-    let load_shedder = Arc::new(LoadShedder::new(LoadMonitor::new(), SheddingConfig::from_env()));
+    let load_shedder = Arc::new(LoadShedder::new(
+        LoadMonitor::new(),
+        SheddingConfig::from_env(),
+    ));
     let batcher = Arc::new(AdaptiveBatcher::new(BatchConfig::from_env()));
     let scaler = Arc::new(PredictiveScaler::new(
         288, // 24h of history at a 5-minute sampling interval
@@ -367,7 +371,10 @@ async fn main() {
         .route("/webauthn/register/begin", post(begin_registration))
         .route("/webauthn/register/complete", post(complete_registration))
         .route("/webauthn/authenticate/begin", post(begin_authentication))
-        .route("/webauthn/authenticate/complete", post(complete_authentication))
+        .route(
+            "/webauthn/authenticate/complete",
+            post(complete_authentication),
+        )
         .route("/webauthn/credentials/:user_id", get(list_credentials))
         .route(
             "/webauthn/credentials/:user_id/:cred_id",

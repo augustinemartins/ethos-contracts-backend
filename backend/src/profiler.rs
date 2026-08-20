@@ -221,9 +221,7 @@ pub async fn get_flamegraph(State(state): State<Arc<ProfilerState>>) -> String {
 }
 
 /// `POST /admin/profiler/baseline` — snapshot current averages as baseline.
-pub async fn set_baseline(
-    State(state): State<Arc<ProfilerState>>,
-) -> Json<HashMap<String, f64>> {
+pub async fn set_baseline(State(state): State<Arc<ProfilerState>>) -> Json<HashMap<String, f64>> {
     Json(state.set_baseline_from_current())
 }
 
@@ -232,7 +230,9 @@ pub async fn get_regressions(
     State(state): State<Arc<ProfilerState>>,
     axum::extract::Query(query): axum::extract::Query<RegressionQuery>,
 ) -> Json<Vec<RegressionFinding>> {
-    let threshold = query.threshold_pct.unwrap_or(DEFAULT_REGRESSION_THRESHOLD_PCT);
+    let threshold = query
+        .threshold_pct
+        .unwrap_or(DEFAULT_REGRESSION_THRESHOLD_PCT);
     Json(state.detect_regressions(threshold))
 }
 

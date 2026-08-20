@@ -101,10 +101,7 @@ impl PriorityConfig {
     pub fn from_env() -> Self {
         let defaults = Self::default();
         Self {
-            low_max_concurrent: env_u64(
-                "PRIORITY_LOW_MAX_CONCURRENT",
-                defaults.low_max_concurrent,
-            ),
+            low_max_concurrent: env_u64("PRIORITY_LOW_MAX_CONCURRENT", defaults.low_max_concurrent),
             normal_max_concurrent: env_u64(
                 "PRIORITY_NORMAL_MAX_CONCURRENT",
                 defaults.normal_max_concurrent,
@@ -268,7 +265,10 @@ impl PriorityEnforcer {
     /// `max_concurrent` (a limit of `0` means unbounded). Takes `&Arc<Self>`
     /// explicitly (rather than as a `self` receiver) since stable Rust
     /// doesn't support arbitrary `self: &Arc<Self>` receivers.
-    pub fn try_acquire(enforcer: &Arc<PriorityEnforcer>, priority: Priority) -> Option<PriorityPermit> {
+    pub fn try_acquire(
+        enforcer: &Arc<PriorityEnforcer>,
+        priority: Priority,
+    ) -> Option<PriorityPermit> {
         let limit = enforcer.config.max_concurrent(priority);
         let counter = enforcer.counter(priority);
         loop {

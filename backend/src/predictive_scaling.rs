@@ -229,14 +229,18 @@ impl PredictiveScaler {
     /// is no traffic history yet.
     pub fn evaluate(&self) -> Option<u32> {
         let samples = self.history.samples();
-        let forecast = self.model.forecast(&samples, self.config.forecast_periods_ahead)?;
+        let forecast = self
+            .model
+            .forecast(&samples, self.config.forecast_periods_ahead)?;
 
         *self.last_forecast_requests.lock().unwrap() = forecast;
 
         let raw_replicas = (forecast / self.config.requests_per_replica).ceil() as u32;
         let recommended = raw_replicas.clamp(self.config.min_replicas, self.config.max_replicas);
 
-        let previous = self.last_recommended_replicas.swap(recommended, Ordering::Relaxed);
+        let previous = self
+            .last_recommended_replicas
+            .swap(recommended, Ordering::Relaxed);
         if previous != recommended {
             self.scaling_decisions_total.fetch_add(1, Ordering::Relaxed);
             self.autoscaler.set_desired_replicas(recommended);
@@ -307,7 +311,11 @@ pub async fn run(
         });
 
         if let Some(replicas) = scaler.evaluate() {
-            tracing::debug!(replicas, requests_this_period, "predictive scaling evaluated");
+            tracing::debug!(
+                replicas,
+                requests_this_period,
+                "predictive scaling evaluated"
+            );
         }
     }
 }

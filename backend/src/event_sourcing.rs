@@ -155,7 +155,10 @@ impl EventLog {
         after_sequence: u64,
     ) -> Result<Vec<StoredEvent>, EventSourcingError> {
         let all = self.events_for_vault(vault_id)?;
-        Ok(all.into_iter().filter(|e| e.sequence > after_sequence).collect())
+        Ok(all
+            .into_iter()
+            .filter(|e| e.sequence > after_sequence)
+            .collect())
     }
 
     /// Total number of events across all vaults.

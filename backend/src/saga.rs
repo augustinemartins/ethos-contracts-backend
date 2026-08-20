@@ -342,7 +342,10 @@ mod tests {
 
         let execution = saga.execute();
         assert_eq!(execution.status, SagaStatus::CompensationFailed);
-        assert_eq!(execution.steps[0].status, SagaStepStatus::CompensationFailed);
+        assert_eq!(
+            execution.steps[0].status,
+            SagaStepStatus::CompensationFailed
+        );
         assert_eq!(execution.steps[1].status, SagaStepStatus::Compensated);
         assert_eq!(hotel_compensated.load(Ordering::SeqCst), 1);
     }
