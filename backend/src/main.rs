@@ -152,6 +152,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health/consensus", get(consensus_health_handler))
         .route("/ready", get(ready_handler))
         .route("/metrics", get(metrics_handler))
+        // ── Graceful degradation routes ─────────────────────────────────────
+        .route("/admin/capabilities", post(set_capability).get(list_capabilities))
+        .route("/capabilities/negotiate", post(negotiate_capabilities))
+        .route("/capabilities/:name/fallback", get(capability_fallback))
         // ── Legacy reminder / subscription routes ────────────────────────────
         .route(
             "/api/vaults/:vault_id/reminder-preferences",
@@ -303,6 +307,8 @@ async fn main() {
         predictive_scaling::run(scaling_scaler, scaling_metrics, Duration::from_secs(300)).await;
     });
 
+    let degradation_state = Arc::new(DegradationState::new(Arc::clone(&db)));
+
     let state = AppState {
         db,
         vault_store,
@@ -322,6 +328,7 @@ async fn main() {
         message_queue: Arc::new(
             MessageQueueState::new().expect("failed to initialize message queue"),
         ),
+        degradation_state,
     };
 
     // ── Dynamic ACL admin routes ─────────────────────────────────────────
