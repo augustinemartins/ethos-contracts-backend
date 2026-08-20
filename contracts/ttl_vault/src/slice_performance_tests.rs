@@ -199,7 +199,8 @@ fn test_apply_reputation_decay_reduces_reputation() {
 
     // Apply 50% decay (decay_rate = 5000 means keep 50%).
     let reason = String::from_slice(&env, "low_success_rate");
-    let new_rep = client.apply_reputation_decay(&vault_id, &owner, &slice_id, &attestor, &5_000u32, &reason);
+    let new_rep =
+        client.apply_reputation_decay(&vault_id, &owner, &slice_id, &attestor, &5_000u32, &reason);
 
     // New reputation should be 50% of 10000 = 5000.
     assert_eq!(new_rep, 5_000);
@@ -219,11 +220,13 @@ fn test_apply_reputation_decay_cascades() {
     let reason2 = String::from_slice(&env, "decay_2");
 
     // First decay: 50% (10000 → 5000).
-    let rep1 = client.apply_reputation_decay(&vault_id, &owner, &slice_id, &attestor, &5_000u32, &reason1);
+    let rep1 =
+        client.apply_reputation_decay(&vault_id, &owner, &slice_id, &attestor, &5_000u32, &reason1);
     assert_eq!(rep1, 5_000);
 
     // Second decay: 50% (5000 → 2500).
-    let rep2 = client.apply_reputation_decay(&vault_id, &owner, &slice_id, &attestor, &5_000u32, &reason2);
+    let rep2 =
+        client.apply_reputation_decay(&vault_id, &owner, &slice_id, &attestor, &5_000u32, &reason2);
     assert_eq!(rep2, 2_500);
 }
 
@@ -236,7 +239,8 @@ fn test_apply_reputation_decay_full_decay() {
     let reason = String::from_slice(&env, "complete_failure");
 
     // Full decay (decay_rate = 0 means complete decay).
-    let new_rep = client.apply_reputation_decay(&vault_id, &owner, &slice_id, &attestor, &0u32, &reason);
+    let new_rep =
+        client.apply_reputation_decay(&vault_id, &owner, &slice_id, &attestor, &0u32, &reason);
 
     assert_eq!(new_rep, 0);
 }
@@ -250,7 +254,8 @@ fn test_apply_reputation_decay_no_decay() {
     let reason = String::from_slice(&env, "preserve");
 
     // No decay (decay_rate = 10000 means preserve).
-    let new_rep = client.apply_reputation_decay(&vault_id, &owner, &slice_id, &attestor, &10_000u32, &reason);
+    let new_rep =
+        client.apply_reputation_decay(&vault_id, &owner, &slice_id, &attestor, &10_000u32, &reason);
 
     assert_eq!(new_rep, 10_000);
 }
@@ -264,14 +269,8 @@ fn test_apply_reputation_decay_rejects_invalid_bps() {
     let reason = String::from_slice(&env, "invalid");
 
     // Invalid BPS > 10000.
-    let result = client.try_apply_reputation_decay(
-        &vault_id,
-        &owner,
-        &slice_id,
-        &attestor,
-        &10_001u32,
-        &reason,
-    );
+    let result = client
+        .try_apply_reputation_decay(&vault_id, &owner, &slice_id, &attestor, &10_001u32, &reason);
     assert!(result.is_err());
 }
 
@@ -285,12 +284,7 @@ fn test_apply_reputation_decay_rejects_non_owner() {
     let reason = String::from_slice(&env, "unauthorized");
 
     let result = client.try_apply_reputation_decay(
-        &vault_id,
-        &intruder,
-        &slice_id,
-        &attestor,
-        &5_000u32,
-        &reason,
+        &vault_id, &intruder, &slice_id, &attestor, &5_000u32, &reason,
     );
     assert!(result.is_err());
 }
@@ -304,11 +298,19 @@ fn test_apply_reputation_recovery_restores_reputation() {
     let decay_reason = String::from_slice(&env, "decay");
 
     // Reduce reputation to 5000.
-    client.apply_reputation_decay(&vault_id, &owner, &slice_id, &attestor, &5_000u32, &decay_reason);
+    client.apply_reputation_decay(
+        &vault_id,
+        &owner,
+        &slice_id,
+        &attestor,
+        &5_000u32,
+        &decay_reason,
+    );
 
     // Recover 50% (recover_rate = 5000).
     // new_rep = 5000 + (10000 - 5000) * 5000 / 10000 = 5000 + 2500 = 7500
-    let new_rep = client.apply_reputation_recovery(&vault_id, &owner, &slice_id, &attestor, &5_000u32);
+    let new_rep =
+        client.apply_reputation_recovery(&vault_id, &owner, &slice_id, &attestor, &5_000u32);
 
     assert_eq!(new_rep, 7_500);
 }
@@ -322,10 +324,18 @@ fn test_apply_reputation_recovery_full_recovery() {
     let decay_reason = String::from_slice(&env, "decay");
 
     // Reduce reputation to 2500.
-    client.apply_reputation_decay(&vault_id, &owner, &slice_id, &attestor, &2_500u32, &decay_reason);
+    client.apply_reputation_decay(
+        &vault_id,
+        &owner,
+        &slice_id,
+        &attestor,
+        &2_500u32,
+        &decay_reason,
+    );
 
     // Full recovery (recovery_rate = 10000).
-    let new_rep = client.apply_reputation_recovery(&vault_id, &owner, &slice_id, &attestor, &10_000u32);
+    let new_rep =
+        client.apply_reputation_recovery(&vault_id, &owner, &slice_id, &attestor, &10_000u32);
 
     assert_eq!(new_rep, 10_000);
 }
@@ -339,7 +349,14 @@ fn test_apply_reputation_recovery_no_recovery() {
     let decay_reason = String::from_slice(&env, "decay");
 
     // Reduce reputation to 5000.
-    client.apply_reputation_decay(&vault_id, &owner, &slice_id, &attestor, &5_000u32, &decay_reason);
+    client.apply_reputation_decay(
+        &vault_id,
+        &owner,
+        &slice_id,
+        &attestor,
+        &5_000u32,
+        &decay_reason,
+    );
 
     // No recovery (recovery_rate = 0).
     let new_rep = client.apply_reputation_recovery(&vault_id, &owner, &slice_id, &attestor, &0u32);
@@ -354,7 +371,8 @@ fn test_apply_reputation_recovery_already_at_max() {
     let slice_id = 63u64;
 
     // Reputation already at 10000, recovery should be no-op.
-    let new_rep = client.apply_reputation_recovery(&vault_id, &owner, &slice_id, &attestor, &5_000u32);
+    let new_rep =
+        client.apply_reputation_recovery(&vault_id, &owner, &slice_id, &attestor, &5_000u32);
 
     assert_eq!(new_rep, 10_000);
 }
@@ -366,7 +384,8 @@ fn test_apply_reputation_recovery_rejects_invalid_bps() {
     let slice_id = 64u64;
 
     // Invalid BPS > 10000.
-    let result = client.try_apply_reputation_recovery(&vault_id, &owner, &slice_id, &attestor, &10_001u32);
+    let result =
+        client.try_apply_reputation_recovery(&vault_id, &owner, &slice_id, &attestor, &10_001u32);
     assert!(result.is_err());
 }
 
@@ -392,8 +411,22 @@ fn test_get_decay_history_tracks_changes() {
     let decay_reason2 = String::from_slice(&env, "failure_2");
 
     // Apply two decays.
-    client.apply_reputation_decay(&vault_id, &owner, &slice_id, &attestor, &5_000u32, &decay_reason1);
-    client.apply_reputation_decay(&vault_id, &owner, &slice_id, &attestor, &5_000u32, &decay_reason2);
+    client.apply_reputation_decay(
+        &vault_id,
+        &owner,
+        &slice_id,
+        &attestor,
+        &5_000u32,
+        &decay_reason1,
+    );
+    client.apply_reputation_decay(
+        &vault_id,
+        &owner,
+        &slice_id,
+        &attestor,
+        &5_000u32,
+        &decay_reason2,
+    );
 
     // Retrieve history (limit=10).
     let history = client.get_decay_history(&slice_id, &attestor, &10u64);
@@ -423,7 +456,14 @@ fn test_get_decay_history_with_recovery() {
     let decay_reason = String::from_slice(&env, "failure");
 
     // Apply decay then recovery.
-    client.apply_reputation_decay(&vault_id, &owner, &slice_id, &attestor, &5_000u32, &decay_reason);
+    client.apply_reputation_decay(
+        &vault_id,
+        &owner,
+        &slice_id,
+        &attestor,
+        &5_000u32,
+        &decay_reason,
+    );
     client.apply_reputation_recovery(&vault_id, &owner, &slice_id, &attestor, &5_000u32);
 
     let history = client.get_decay_history(&slice_id, &attestor, &10u64);

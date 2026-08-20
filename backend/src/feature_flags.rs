@@ -122,7 +122,12 @@ impl Default for FlagState {
 /// dependencies and is stable across process restarts.
 fn bucket_for(key: &str, subject_id: &str) -> u8 {
     let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in key.as_bytes().iter().chain(b":").chain(subject_id.as_bytes()) {
+    for byte in key
+        .as_bytes()
+        .iter()
+        .chain(b":")
+        .chain(subject_id.as_bytes())
+    {
         hash ^= *byte as u64;
         hash = hash.wrapping_mul(0x100000001b3);
     }

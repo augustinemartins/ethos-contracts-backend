@@ -189,7 +189,9 @@ pub async fn delete_subscription(
 pub async fn cleanup_idempotency_keys(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let count = state.db.cleanup_expired_idempotency_keys()
+    let count = state
+        .db
+        .cleanup_expired_idempotency_keys()
         .map_err(|_| AppError::DatabaseError)?;
     Ok(Json(serde_json::json!({
         "cleaned_up": count,
@@ -211,7 +213,9 @@ pub async fn create_tenant(
         updated_at: chrono::Utc::now(),
         is_active: true,
     };
-    state.db.create_tenant(&tenant)
+    state
+        .db
+        .create_tenant(&tenant)
         .map_err(|_| AppError::DatabaseError)?;
     Ok((StatusCode::CREATED, Json(tenant)))
 }
@@ -220,7 +224,9 @@ pub async fn get_tenant_vaults(
     State(state): State<Arc<AppState>>,
     Path(tenant_id): Path<String>,
 ) -> Result<Json<Vec<String>>, AppError> {
-    let vaults = state.db.get_tenant_vaults(&tenant_id)
+    let vaults = state
+        .db
+        .get_tenant_vaults(&tenant_id)
         .map_err(|_| AppError::DatabaseError)?;
     Ok(Json(vaults))
 }
@@ -229,7 +235,9 @@ pub async fn add_vault_to_tenant(
     State(state): State<Arc<AppState>>,
     Path((tenant_id, vault_id)): Path<(String, String)>,
 ) -> Result<StatusCode, AppError> {
-    state.db.add_vault_to_tenant(&tenant_id, &vault_id)
+    state
+        .db
+        .add_vault_to_tenant(&tenant_id, &vault_id)
         .map_err(|_| AppError::DatabaseError)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -259,7 +267,9 @@ pub async fn record_credential_update(
     update.id = uuid::Uuid::new_v4().to_string();
     update.vault_id = vault_id;
     update.timestamp = chrono::Utc::now();
-    state.db.store_credential_update(&update)
+    state
+        .db
+        .store_credential_update(&update)
         .map_err(|_| AppError::DatabaseError)?;
     Ok((StatusCode::CREATED, Json(update)))
 }
@@ -272,7 +282,9 @@ pub async fn apply_operational_transform(
     transform.id = uuid::Uuid::new_v4().to_string();
     transform.vault_id = vault_id;
     transform.timestamp = chrono::Utc::now();
-    state.db.store_operational_transform(&transform)
+    state
+        .db
+        .store_operational_transform(&transform)
         .map_err(|_| AppError::DatabaseError)?;
     Ok((StatusCode::CREATED, Json(transform)))
 }
@@ -281,7 +293,9 @@ pub async fn get_vault_presence(
     State(state): State<Arc<AppState>>,
     Path(vault_id): Path<String>,
 ) -> Result<Json<Vec<crate::models::UserPresence>>, AppError> {
-    let presence = state.db.get_vault_presence(&vault_id)
+    let presence = state
+        .db
+        .get_vault_presence(&vault_id)
         .map_err(|_| AppError::DatabaseError)?;
     Ok(Json(presence))
 }
@@ -299,11 +313,15 @@ pub async fn full_text_search(
     Query(params): Query<FullTextSearchParams>,
 ) -> Result<Json<crate::models::FullTextSearchResponse>, AppError> {
     if params.q.is_empty() {
-        return Err(AppError::InvalidInput("Search query cannot be empty".into()));
+        return Err(AppError::InvalidInput(
+            "Search query cannot be empty".into(),
+        ));
     }
 
     let limit = params.limit.unwrap_or(10);
-    let results = state.db.search_indexed_content(&params.q, limit)
+    let results = state
+        .db
+        .search_indexed_content(&params.q, limit)
         .map_err(|_| AppError::DatabaseError)?;
 
     let total = results.len() as u32;

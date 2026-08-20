@@ -46,12 +46,12 @@ use crate::{
 /// Default rotation schedules for all known secret types.
 const DEFAULTS: &[(SecretType, u32, u32)] = &[
     // (type, interval_days, grace_period_hours)
-    (SecretType::ApiKey,           90,  24),
-    (SecretType::DatabasePassword, 30,   2),
-    (SecretType::EncryptionKey,   365,  48),
-    (SecretType::JwtSecret,        30,   1),
-    (SecretType::WebhookSecret,    90,  24),
-    (SecretType::RemindersApiKey,  90,  24),
+    (SecretType::ApiKey, 90, 24),
+    (SecretType::DatabasePassword, 30, 2),
+    (SecretType::EncryptionKey, 365, 48),
+    (SecretType::JwtSecret, 30, 1),
+    (SecretType::WebhookSecret, 90, 24),
+    (SecretType::RemindersApiKey, 90, 24),
 ];
 
 /// Insert default rotation policies for all known secret types if none exist yet.
@@ -89,7 +89,10 @@ pub fn seed_default_policies(db: &Arc<Db>) {
 pub async fn list_policies(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<SecretRotationPolicy>>, AppError> {
-    let policies = state.db.list_secret_rotation_policies().map_err(AppError::Db)?;
+    let policies = state
+        .db
+        .list_secret_rotation_policies()
+        .map_err(AppError::Db)?;
     Ok(Json(policies))
 }
 
@@ -136,7 +139,9 @@ pub async fn upsert_policy(
         rotation_interval_days: body.rotation_interval_days,
         grace_period_hours: body.grace_period_hours.unwrap_or(24),
         auto_rotate: body.auto_rotate.unwrap_or(false),
-        notify_channels: body.notify_channels.unwrap_or_else(|| vec!["log".to_string()]),
+        notify_channels: body
+            .notify_channels
+            .unwrap_or_else(|| vec!["log".to_string()]),
         created_at,
         updated_at: now,
     };
@@ -366,7 +371,10 @@ fn notify_rotation(log: &SecretRotationLog, policy: &SecretRotationPolicy) {
                 );
             }
             other => {
-                tracing::debug!(channel = other, "secret_rotation: notification channel not yet implemented");
+                tracing::debug!(
+                    channel = other,
+                    "secret_rotation: notification channel not yet implemented"
+                );
             }
         }
     }

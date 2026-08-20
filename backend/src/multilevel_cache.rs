@@ -6,7 +6,6 @@
 ///
 /// Cache coherence between levels is maintained on write (write-through)
 /// and on miss (read-through with promotion).
-
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -522,10 +521,7 @@ mod tests {
     #[test]
     fn test_l2_fallback_on_l1_miss() {
         // Use a very short L1 TTL and longer L2 TTL.
-        let cache = MultiLevelCache::with_ttls(
-            Duration::from_millis(1),
-            Duration::from_secs(60),
-        );
+        let cache = MultiLevelCache::with_ttls(Duration::from_millis(1), Duration::from_secs(60));
         cache.set_vault("v1", make_vault("v1"));
 
         // Wait for L1 to expire.
@@ -542,10 +538,7 @@ mod tests {
 
     #[test]
     fn test_l2_promotion_to_l1() {
-        let cache = MultiLevelCache::with_ttls(
-            Duration::from_millis(1),
-            Duration::from_secs(60),
-        );
+        let cache = MultiLevelCache::with_ttls(Duration::from_millis(1), Duration::from_secs(60));
         cache.set_vault("v1", make_vault("v1"));
         std::thread::sleep(Duration::from_millis(5));
 

@@ -562,13 +562,10 @@ impl VaultCache {
     pub fn get_coherence_token(&self, vault_id: &str) -> Option<CoherenceToken> {
         let inner = self.inner.lock().unwrap();
         inner.map.get(vault_id).and_then(|entries| {
-            entries
-                .vault
-                .as_ref()
-                .map(|e| CoherenceToken {
-                    vault_id: vault_id.to_string(),
-                    version: e.version,
-                })
+            entries.vault.as_ref().map(|e| CoherenceToken {
+                vault_id: vault_id.to_string(),
+                version: e.version,
+            })
         })
     }
 
@@ -1095,10 +1092,19 @@ mod tests {
         cache.set_vault("v1", make_vault("v1"));
         let version = cache.get_coherence_token("v1").unwrap().version;
         let remote_tokens = vec![
-            CoherenceToken { vault_id: "v1".to_string(), version },
-            CoherenceToken { vault_id: "v1".to_string(), version },
+            CoherenceToken {
+                vault_id: "v1".to_string(),
+                version,
+            },
+            CoherenceToken {
+                vault_id: "v1".to_string(),
+                version,
+            },
         ];
-        assert_eq!(cache.verify_quorum("v1", &remote_tokens), QuorumResult::Consistent);
+        assert_eq!(
+            cache.verify_quorum("v1", &remote_tokens),
+            QuorumResult::Consistent
+        );
     }
 
     #[test]

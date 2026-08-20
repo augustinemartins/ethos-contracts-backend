@@ -14589,8 +14589,13 @@ impl TtlVaultContract {
             return Err(ContractError::InvalidBps);
         }
 
-        let new_reputation =
-            slice_performance::apply_reputation_decay(&env, slice_id, &attestor, decay_rate_bps, reason);
+        let new_reputation = slice_performance::apply_reputation_decay(
+            &env,
+            slice_id,
+            &attestor,
+            decay_rate_bps,
+            reason,
+        );
         Ok(new_reputation)
     }
 
@@ -14623,18 +14628,18 @@ impl TtlVaultContract {
             return Err(ContractError::InvalidBps);
         }
 
-        let new_reputation =
-            slice_performance::apply_reputation_recovery(&env, slice_id, &attestor, improvement_rate_bps);
+        let new_reputation = slice_performance::apply_reputation_recovery(
+            &env,
+            slice_id,
+            &attestor,
+            improvement_rate_bps,
+        );
         Ok(new_reputation)
     }
 
     /// Get the current reputation factor for an attestor on a slice.
     /// Returns 10000 if the attestor has full reputation.
-    pub fn get_reputation_factor(
-        env: Env,
-        slice_id: u64,
-        attestor: Address,
-    ) -> u32 {
+    pub fn get_reputation_factor(env: Env, slice_id: u64, attestor: Address) -> u32 {
         slice_performance::get_reputation_factor(&env, slice_id, &attestor)
     }
 

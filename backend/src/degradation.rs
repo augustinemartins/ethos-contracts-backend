@@ -128,15 +128,18 @@ impl DegradationState {
 
     /// Look up a capability's status, defaulting to `Full` if unregistered.
     pub fn check(&self, name: &str) -> CapabilityStatus {
-        self.registry.lock().unwrap().get(name).cloned().unwrap_or_else(|| {
-            CapabilityStatus {
+        self.registry
+            .lock()
+            .unwrap()
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| CapabilityStatus {
                 name: name.to_string(),
                 level: DegradationLevel::Full,
                 reason: None,
                 fallback_available: false,
                 updated_at: Utc::now(),
-            }
-        })
+            })
     }
 
     pub fn list(&self) -> Vec<CapabilityStatus> {

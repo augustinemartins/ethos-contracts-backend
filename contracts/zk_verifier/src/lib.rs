@@ -140,7 +140,7 @@ mod keys {
     }
 }
 
-use keys::{DataKey, VerificationRecord, MaskingConfig};
+use keys::{DataKey, MaskingConfig, VerificationRecord};
 
 /// A stored oracle attestation, now addressable by a stable `credential_id`
 /// in addition to the `(proof_hash, claim_hash)` pair used by `verify_claim`.
@@ -457,7 +457,10 @@ impl ZkVerifierContract {
         let result = env
             .storage()
             .instance()
-            .get::<DataKey, Address>(&DataKey::Attestation(proof_hash.clone(), claim_hash.clone()))
+            .get::<DataKey, Address>(&DataKey::Attestation(
+                proof_hash.clone(),
+                claim_hash.clone(),
+            ))
             .map(|attesting_oracle| {
                 env.storage()
                     .instance()
@@ -467,9 +470,10 @@ impl ZkVerifierContract {
             .unwrap_or(false);
 
         let current_time: U64 = env.ledger().timestamp().into();
-        env.storage()
-            .instance()
-            .set(&DataKey::LastVerificationTime(proof_hash.clone()), &current_time);
+        env.storage().instance().set(
+            &DataKey::LastVerificationTime(proof_hash.clone()),
+            &current_time,
+        );
 
         env.events()
             .publish((VERIFY_LATTICE_TOPIC,), (result, proof_hash.clone()));
@@ -511,7 +515,10 @@ impl ZkVerifierContract {
 
     /// Gets the verification history for a proof identified by its hash.
     /// Returns all verification attempts with timestamps.
-    pub fn get_proof_verification_history(env: Env, proof_hash: BytesN<32>) -> Vec<VerificationRecord> {
+    pub fn get_proof_verification_history(
+        env: Env,
+        proof_hash: BytesN<32>,
+    ) -> Vec<VerificationRecord> {
         env.storage()
             .instance()
             .get::<DataKey, Vec<VerificationRecord>>(&DataKey::VerificationHistory(proof_hash))
@@ -520,11 +527,7 @@ impl ZkVerifierContract {
 
     /// Masks sensitive fields in a proof before verification.
     /// Creates a masked proof that hides specified fields.
-    pub fn mask_proof_fields(
-        env: Env,
-        proof: Bytes,
-        fields_to_mask: Vec<u32>,
-    ) -> Bytes {
+    pub fn mask_proof_fields(env: Env, proof: Bytes, fields_to_mask: Vec<u32>) -> Bytes {
         if proof.is_empty() {
             panic_with_error!(&env, VerifierError::EmptyProof);
         }
@@ -553,17 +556,20 @@ impl ZkVerifierContract {
         }
 
         let proof_hash: BytesN<32> = env.crypto().sha256(&proof).into();
-        let masking_spec: BytesN<32> = env.crypto().sha256(&Bytes::from_array(&env, &field_mask.to_le_bytes())).into();
+        let masking_spec: BytesN<32> = env
+            .crypto()
+            .sha256(&Bytes::from_array(&env, &field_mask.to_le_bytes()))
+            .into();
 
-        env.storage()
-            .instance()
-            .set(&DataKey::MaskingConfig(proof_hash), &MaskingConfig {
+        env.storage().instance().set(
+            &DataKey::MaskingConfig(proof_hash),
+            &MaskingConfig {
                 masked_fields: masking_spec,
                 version: 1,
-            });
+            },
+        );
 
-        env.events()
-            .publish((PROOF_MASKED_TOPIC,), (proof_hash,));
+        env.events().publish((PROOF_MASKED_TOPIC,), (proof_hash,));
 
         masked
     }
@@ -687,7 +693,9 @@ impl ZkVerifierContract {
         let mut history = env
             .storage()
             .instance()
-            .get::<DataKey, Vec<VerificationRecord>>(&DataKey::VerificationHistory(proof_hash.clone()))
+            .get::<DataKey, Vec<VerificationRecord>>(&DataKey::VerificationHistory(
+                proof_hash.clone(),
+            ))
             .unwrap_or_else(|| Vec::new(env));
 
         let current_time = env.ledger().timestamp();
@@ -702,8 +710,10 @@ impl ZkVerifierContract {
             .instance()
             .set(&DataKey::VerificationHistory(proof_hash.clone()), &history);
 
-        env.events()
-            .publish((AUDIT_LOG_TOPIC,), (proof_hash.clone(), current_time, verified));
+        env.events().publish(
+            (AUDIT_LOG_TOPIC,),
+            (proof_hash.clone(), current_time, verified),
+        );
     }
 
     fn require_admin(env: &Env) {
@@ -768,11 +778,7 @@ impl ZkVerifierContract {
     /// # Panics
     ///
     /// Panics if the input lists are mismatched lengths or empty.
-    pub fn verify_credentials_consistent(
-        env: Env,
-        proofs: Vec<Bytes>,
-        claims: Vec<Bytes>,
-    ) -> bool {
+    pub fn verify_credentials_consistent(env: Env, proofs: Vec<Bytes>, claims: Vec<Bytes>) -> bool {
         if proofs.len() != claims.len() {
             panic_with_error!(&env, VerifierError::MismatchedBatchLengths);
         }
@@ -793,12 +799,7 @@ impl ZkVerifierContract {
         for i in 0..claims.len() {
             for j in (i + 1)..claims.len() {
                 if let (Some(claim_i), Some(claim_j)) = (claims.get(i), claims.get(j)) {
-                    consistency_pairs.push_back((
-                        i as u64,
-                        claim_i,
-                        j as u64,
-                        claim_j,
-                    ));
+                    consistency_pairs.push_back((i as u64, claim_i, j as u64, claim_j));
                 }
             }
         }

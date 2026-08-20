@@ -245,10 +245,7 @@ mod tests {
         assert_eq!(report.total_amount, 6.0);
         assert_eq!(report.entry_count, 3);
         assert_eq!(report.by_operation.get("db.query"), Some(&3.0));
-        assert_eq!(
-            report.by_tag.get("team").unwrap().get("vaults"),
-            Some(&3.0)
-        );
+        assert_eq!(report.by_tag.get("team").unwrap().get("vaults"), Some(&3.0));
         assert_eq!(
             report.by_tag.get("team").unwrap().get("billing"),
             Some(&3.0)

@@ -1,12 +1,12 @@
 #![no_std]
 
-mod compression;
 #[cfg(test)]
 mod atomic_release_tests;
+mod compression;
 
 use crate::compression::{
-    compress_metadata as compress_metadata_bytes,
-    decompress_metadata as decompress_metadata_bytes, is_compressed, MAX_METADATA_SIZE,
+    compress_metadata as compress_metadata_bytes, decompress_metadata as decompress_metadata_bytes,
+    is_compressed, MAX_METADATA_SIZE,
 };
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, panic_with_error,
@@ -334,8 +334,10 @@ impl SbtContract {
             .instance()
             .set(&DataKey::MetadataCompressed(sbt_id), &true);
 
-        env.events()
-            .publish((METADATA_COMPRESSED_TOPIC,), (sbt_id, original_size, compressed_size));
+        env.events().publish(
+            (METADATA_COMPRESSED_TOPIC,),
+            (sbt_id, original_size, compressed_size),
+        );
 
         original_size.saturating_sub(compressed_size)
     }
@@ -440,19 +442,10 @@ impl SbtContract {
     // ---- #46: SBT Escrow for Conditional Transfer ----
 
     /// Place an SBT in escrow with conditions for release.
-    pub fn escrow_sbt(
-        env: Env,
-        sbt_id: u64,
-        escrow_agent: Address,
-        conditions: Bytes,
-    ) -> u64 {
+    pub fn escrow_sbt(env: Env, sbt_id: u64, escrow_agent: Address, conditions: Bytes) -> u64 {
         Self::require_owner(&env, sbt_id);
 
-        if env
-            .storage()
-            .instance()
-            .has(&DataKey::Escrow(sbt_id))
-        {
+        if env.storage().instance().has(&DataKey::Escrow(sbt_id)) {
             panic_with_error!(&env, SbtError::AlreadyInEscrow);
         }
 
@@ -560,8 +553,10 @@ impl SbtContract {
             env.storage()
                 .instance()
                 .set(&DataKey::Escrow(released.sbt_id), &released);
-            env.events()
-                .publish((ESCROW_RELEASED_TOPIC,), (released.escrow_id, released.sbt_id));
+            env.events().publish(
+                (ESCROW_RELEASED_TOPIC,),
+                (released.escrow_id, released.sbt_id),
+            );
             results.push_back(true);
         }
 
@@ -570,9 +565,7 @@ impl SbtContract {
 
     /// Get escrow details for an SBT if it is in escrow.
     pub fn get_escrow_status(env: Env, sbt_id: u64) -> Option<EscrowRecord> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Escrow(sbt_id))
+        env.storage().instance().get(&DataKey::Escrow(sbt_id))
     }
 
     // ---- #54: SBT composability with other NFTs ----
@@ -583,11 +576,7 @@ impl SbtContract {
     pub fn compose_sbt_with_nft(env: Env, sbt_id: u64, nft_address: Address, nft_id: u64) {
         let owner = Self::require_owner(&env, sbt_id);
 
-        if env
-            .storage()
-            .instance()
-            .has(&DataKey::Composition(sbt_id))
-        {
+        if env.storage().instance().has(&DataKey::Composition(sbt_id)) {
             panic_with_error!(&env, SbtError::AlreadyComposed);
         }
 
@@ -614,14 +603,12 @@ impl SbtContract {
     pub fn decompose_sbt(env: Env, sbt_id: u64) {
         Self::require_owner(&env, sbt_id);
 
-        if !env
-            .storage()
-            .instance()
-            .has(&DataKey::Composition(sbt_id))
-        {
+        if !env.storage().instance().has(&DataKey::Composition(sbt_id)) {
             panic_with_error!(&env, SbtError::NotComposed);
         }
-        env.storage().instance().remove(&DataKey::Composition(sbt_id));
+        env.storage()
+            .instance()
+            .remove(&DataKey::Composition(sbt_id));
 
         env.events().publish((DECOMPOSE_TOPIC,), sbt_id);
     }
@@ -641,7 +628,9 @@ impl SbtContract {
     }
 
     pub fn get_shared_metadata(env: Env, sbt_id: u64) -> Option<String> {
-        env.storage().instance().get(&DataKey::SharedMetadata(sbt_id))
+        env.storage()
+            .instance()
+            .get(&DataKey::SharedMetadata(sbt_id))
     }
 
     // ---- #53: batch transfer with conditions ----
@@ -677,7 +666,9 @@ impl SbtContract {
                 .set(&DataKey::Owner(sbt_id), &instruction.to);
             // A delegation granted by the previous owner should not carry
             // over to the new owner.
-            env.storage().instance().remove(&DataKey::Delegation(sbt_id));
+            env.storage()
+                .instance()
+                .remove(&DataKey::Delegation(sbt_id));
 
             env.events()
                 .publish((BATCH_TRANSFER_TOPIC,), (sbt_id, instruction.to.clone()));
@@ -688,7 +679,12 @@ impl SbtContract {
 
     /// Temporarily delegates the SBT to `delegate` for `duration_seconds`.
     /// Does not change ownership. Owner only.
-    pub fn delegate_sbt_temporarily(env: Env, sbt_id: u64, delegate: Address, duration_seconds: u64) {
+    pub fn delegate_sbt_temporarily(
+        env: Env,
+        sbt_id: u64,
+        delegate: Address,
+        duration_seconds: u64,
+    ) {
         let owner = Self::require_owner(&env, sbt_id);
         if duration_seconds == 0 {
             panic_with_error!(&env, SbtError::InvalidDuration);
@@ -734,7 +730,9 @@ impl SbtContract {
             .get(&DataKey::Delegation(sbt_id))
             .unwrap_or_else(|| panic_with_error!(&env, SbtError::NoActiveDelegation));
 
-        env.storage().instance().remove(&DataKey::Delegation(sbt_id));
+        env.storage()
+            .instance()
+            .remove(&DataKey::Delegation(sbt_id));
 
         let now = env.ledger().timestamp();
         Self::push_delegation_history(
@@ -757,7 +755,8 @@ impl SbtContract {
     /// eagerly clearing storage, mirroring how attestations are honored
     /// elsewhere in this workspace only while still currently valid.
     pub fn get_active_delegate(env: Env, sbt_id: u64) -> Option<Address> {
-        let record: DelegationRecord = env.storage().instance().get(&DataKey::Delegation(sbt_id))?;
+        let record: DelegationRecord =
+            env.storage().instance().get(&DataKey::Delegation(sbt_id))?;
         if record.expires_at > env.ledger().timestamp() {
             Some(record.delegate)
         } else {

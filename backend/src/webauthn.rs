@@ -124,7 +124,11 @@ pub struct WebAuthnState {
 }
 
 impl WebAuthnState {
-    pub fn new(rp_id: impl Into<String>, rp_name: impl Into<String>, origin: impl Into<String>) -> Self {
+    pub fn new(
+        rp_id: impl Into<String>,
+        rp_name: impl Into<String>,
+        origin: impl Into<String>,
+    ) -> Self {
         Self {
             credentials: Arc::new(Mutex::new(HashMap::new())),
             pending_registrations: Arc::new(Mutex::new(HashMap::new())),
@@ -137,8 +141,10 @@ impl WebAuthnState {
 
     pub fn from_env() -> Self {
         let rp_id = std::env::var("WEBAUTHN_RP_ID").unwrap_or_else(|_| "localhost".to_string());
-        let rp_name = std::env::var("WEBAUTHN_RP_NAME").unwrap_or_else(|_| "Ethos Protocol".to_string());
-        let origin = std::env::var("WEBAUTHN_ORIGIN").unwrap_or_else(|_| "http://localhost:3000".to_string());
+        let rp_name =
+            std::env::var("WEBAUTHN_RP_NAME").unwrap_or_else(|_| "Ethos Protocol".to_string());
+        let origin = std::env::var("WEBAUTHN_ORIGIN")
+            .unwrap_or_else(|_| "http://localhost:3000".to_string());
         Self::new(rp_id, rp_name, origin)
     }
 }
@@ -335,9 +341,18 @@ pub async fn begin_registration(
         },
         challenge: b64url_encode(&challenge),
         pub_key_cred_params: vec![
-            PubKeyCredParam { kind: "public-key".into(), alg: CoseAlgorithm::ES256.cose_id() },
-            PubKeyCredParam { kind: "public-key".into(), alg: CoseAlgorithm::EdDsa.cose_id() },
-            PubKeyCredParam { kind: "public-key".into(), alg: CoseAlgorithm::RS256.cose_id() },
+            PubKeyCredParam {
+                kind: "public-key".into(),
+                alg: CoseAlgorithm::ES256.cose_id(),
+            },
+            PubKeyCredParam {
+                kind: "public-key".into(),
+                alg: CoseAlgorithm::EdDsa.cose_id(),
+            },
+            PubKeyCredParam {
+                kind: "public-key".into(),
+                alg: CoseAlgorithm::RS256.cose_id(),
+            },
         ],
         timeout_ms: (CHALLENGE_TTL_SECS * 1000) as u32,
         attestation: "none".into(),
@@ -948,7 +963,9 @@ mod tests {
         // 4. Begin authentication.
         let auth_begin = begin_authentication(
             State(Arc::clone(&state)),
-            Json(BeginAuthenticationRequest { user_id: "user1".into() }),
+            Json(BeginAuthenticationRequest {
+                user_id: "user1".into(),
+            }),
         )
         .await
         .unwrap();
@@ -1020,13 +1037,18 @@ mod tests {
         // Authenticate once with sign_count=5.
         let auth_begin = begin_authentication(
             State(Arc::clone(&state)),
-            Json(BeginAuthenticationRequest { user_id: "user2".into() }),
+            Json(BeginAuthenticationRequest {
+                user_id: "user2".into(),
+            }),
         )
         .await
         .unwrap();
         let (_, Json(auth_begin)) = auth_begin;
-        let client_data =
-            client_data_json("webauthn.get", &auth_begin.challenge, "http://localhost:3000");
+        let client_data = client_data_json(
+            "webauthn.get",
+            &auth_begin.challenge,
+            "http://localhost:3000",
+        );
         complete_authentication(
             State(Arc::clone(&state)),
             Json(CompleteAuthenticationRequest {
@@ -1043,13 +1065,18 @@ mod tests {
         // Attempt replay with sign_count=3 (lower) — must be rejected.
         let auth_begin2 = begin_authentication(
             State(Arc::clone(&state)),
-            Json(BeginAuthenticationRequest { user_id: "user2".into() }),
+            Json(BeginAuthenticationRequest {
+                user_id: "user2".into(),
+            }),
         )
         .await
         .unwrap();
         let (_, Json(auth_begin2)) = auth_begin2;
-        let client_data2 =
-            client_data_json("webauthn.get", &auth_begin2.challenge, "http://localhost:3000");
+        let client_data2 = client_data_json(
+            "webauthn.get",
+            &auth_begin2.challenge,
+            "http://localhost:3000",
+        );
         let result = complete_authentication(
             State(Arc::clone(&state)),
             Json(CompleteAuthenticationRequest {

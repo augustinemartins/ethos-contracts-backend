@@ -181,7 +181,11 @@ impl AnomalyStore {
     }
 
     pub fn alerts(&self) -> Vec<Alert> {
-        self.inner.read().expect("anomaly lock poisoned").alerts.clone()
+        self.inner
+            .read()
+            .expect("anomaly lock poisoned")
+            .alerts
+            .clone()
     }
 
     pub fn baseline(&self, metric: &str) -> Option<Baseline> {

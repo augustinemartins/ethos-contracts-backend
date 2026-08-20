@@ -39,7 +39,10 @@ fn test_scaling_state() -> (
     (
         Metrics::new(),
         Arc::new(PriorityEnforcer::new(PriorityConfig::default())),
-        Arc::new(LoadShedder::new(LoadMonitor::new(), SheddingConfig::default())),
+        Arc::new(LoadShedder::new(
+            LoadMonitor::new(),
+            SheddingConfig::default(),
+        )),
         Arc::new(AdaptiveBatcher::new(BatchConfig::default())),
         Arc::new(PredictiveScaler::new(
             10,

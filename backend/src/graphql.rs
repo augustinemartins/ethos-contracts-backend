@@ -167,11 +167,7 @@ impl QueryRoot {
     }
 
     /// List all events for a vault.
-    async fn vault_events(
-        &self,
-        ctx: &Context<'_>,
-        vault_id: String,
-    ) -> Vec<GqlVaultEvent> {
+    async fn vault_events(&self, ctx: &Context<'_>, vault_id: String) -> Vec<GqlVaultEvent> {
         let store = ctx.data_unchecked::<EventStore>();
         let events = store.lock().unwrap();
         events
@@ -229,9 +225,7 @@ impl MutationRoot {
         let store = ctx.data_unchecked::<VaultStore>();
         let mut vaults = store.lock().unwrap();
 
-        let vault = vaults
-            .get_mut(&vault_id)
-            .ok_or("vault not found")?;
+        let vault = vaults.get_mut(&vault_id).ok_or("vault not found")?;
 
         vault.last_check_in = Utc::now();
         vault.ttl_remaining = Some(vault.check_in_interval);

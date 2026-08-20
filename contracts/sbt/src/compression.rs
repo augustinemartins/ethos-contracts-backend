@@ -58,10 +58,7 @@ pub fn compress_metadata(env: &Env, metadata: &Bytes) -> Bytes {
 ///
 /// Ordinary uncompressed bytes are returned unchanged. The legacy `0xC1`
 /// delta/RLE format remains readable for backwards compatibility.
-pub fn decompress_metadata(
-    env: &Env,
-    metadata: &Bytes,
-) -> Result<Bytes, CompressionError> {
+pub fn decompress_metadata(env: &Env, metadata: &Bytes) -> Result<Bytes, CompressionError> {
     if let Some((payload_start, payload_end, mode)) = parse_messagepack_header(metadata)? {
         return decode_blocks(env, metadata, payload_start, payload_end, mode);
     }
@@ -153,9 +150,7 @@ fn frame_messagepack_extension(env: &Env, payload: &Bytes) -> Bytes {
     framed
 }
 
-fn parse_messagepack_header(
-    metadata: &Bytes,
-) -> Result<Option<(u32, u32, u8)>, CompressionError> {
+fn parse_messagepack_header(metadata: &Bytes) -> Result<Option<(u32, u32, u8)>, CompressionError> {
     if metadata.is_empty() {
         return Ok(None);
     }
@@ -169,8 +164,7 @@ fn parse_messagepack_header(
         MESSAGEPACK_EXT16
             if metadata.len() >= 4 && metadata.get(3).unwrap() == ETHOS_METADATA_TYPE =>
         {
-            let length =
-                ((metadata.get(1).unwrap() as u32) << 8) | metadata.get(2).unwrap() as u32;
+            let length = ((metadata.get(1).unwrap() as u32) << 8) | metadata.get(2).unwrap() as u32;
             (4u32, length)
         }
         _ => return Ok(None),

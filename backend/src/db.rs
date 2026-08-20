@@ -1562,7 +1562,10 @@ impl Db {
         Ok(())
     }
 
-    pub fn get_tenant(&self, tenant_id: &str) -> Result<Option<crate::models::Tenant>, rusqlite::Error> {
+    pub fn get_tenant(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Option<crate::models::Tenant>, rusqlite::Error> {
         let binding = self.conn.lock().unwrap();
         let mut stmt = binding.prepare(
             "SELECT id, name, owner, created_at, updated_at, is_active FROM tenants WHERE id = ?1",
@@ -1572,11 +1575,23 @@ impl Db {
             let created_at_str: String = r.get(3)?;
             let created_at = chrono::DateTime::parse_from_rfc3339(&created_at_str)
                 .map(|dt| dt.with_timezone(&chrono::Utc))
-                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e)))?;
+                .map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
             let updated_at_str: String = r.get(4)?;
             let updated_at = chrono::DateTime::parse_from_rfc3339(&updated_at_str)
                 .map(|dt| dt.with_timezone(&chrono::Utc))
-                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e)))?;
+                .map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        4,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
             let is_active_i: i64 = r.get(5)?;
             Ok(crate::models::Tenant {
                 id: r.get(0)?,
@@ -1593,7 +1608,11 @@ impl Db {
         }
     }
 
-    pub fn add_vault_to_tenant(&self, tenant_id: &str, vault_id: &str) -> Result<(), rusqlite::Error> {
+    pub fn add_vault_to_tenant(
+        &self,
+        tenant_id: &str,
+        vault_id: &str,
+    ) -> Result<(), rusqlite::Error> {
         self.conn.lock().unwrap().execute(
             "INSERT OR IGNORE INTO tenant_vaults (tenant_id, vault_id) VALUES (?1, ?2)",
             params![tenant_id, vault_id],
@@ -1603,9 +1622,8 @@ impl Db {
 
     pub fn get_tenant_vaults(&self, tenant_id: &str) -> Result<Vec<String>, rusqlite::Error> {
         let binding = self.conn.lock().unwrap();
-        let mut stmt = binding.prepare(
-            "SELECT vault_id FROM tenant_vaults WHERE tenant_id = ?1",
-        )?;
+        let mut stmt =
+            binding.prepare("SELECT vault_id FROM tenant_vaults WHERE tenant_id = ?1")?;
         let iter = stmt.query_map(params![tenant_id], |r| r.get(0))?;
         let mut vaults = Vec::new();
         for vault_result in iter {
@@ -1614,7 +1632,10 @@ impl Db {
         Ok(vaults)
     }
 
-    pub fn upsert_tenant_billing(&self, billing: &crate::models::TenantBilling) -> Result<(), rusqlite::Error> {
+    pub fn upsert_tenant_billing(
+        &self,
+        billing: &crate::models::TenantBilling,
+    ) -> Result<(), rusqlite::Error> {
         self.conn.lock().unwrap().execute(
             r"INSERT OR REPLACE INTO tenant_billing (tenant_id, monthly_charge, billing_cycle_start, billing_cycle_end, total_vaults, status)
                VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -1632,7 +1653,10 @@ impl Db {
 
     // ── #70: Real-Time Collaboration ────────────────────────────────────────
 
-    pub fn store_credential_update(&self, update: &crate::models::CredentialUpdate) -> Result<(), rusqlite::Error> {
+    pub fn store_credential_update(
+        &self,
+        update: &crate::models::CredentialUpdate,
+    ) -> Result<(), rusqlite::Error> {
         self.conn.lock().unwrap().execute(
             r"INSERT INTO credential_updates (id, vault_id, user_id, field, old_value, new_value, timestamp, operation_id)
                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -1650,7 +1674,10 @@ impl Db {
         Ok(())
     }
 
-    pub fn store_operational_transform(&self, transform: &crate::models::OperationalTransform) -> Result<(), rusqlite::Error> {
+    pub fn store_operational_transform(
+        &self,
+        transform: &crate::models::OperationalTransform,
+    ) -> Result<(), rusqlite::Error> {
         self.conn.lock().unwrap().execute(
             r"INSERT INTO operational_transforms (id, vault_id, user_id, operation, position, content, timestamp, version)
                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -1668,7 +1695,10 @@ impl Db {
         Ok(())
     }
 
-    pub fn store_conflict_resolution(&self, resolution: &crate::models::ConflictResolution) -> Result<(), rusqlite::Error> {
+    pub fn store_conflict_resolution(
+        &self,
+        resolution: &crate::models::ConflictResolution,
+    ) -> Result<(), rusqlite::Error> {
         self.conn.lock().unwrap().execute(
             r"INSERT INTO conflict_resolutions (conflict_id, vault_id, update1_id, update2_id, resolution_strategy, resolved_at)
                VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -1684,7 +1714,10 @@ impl Db {
         Ok(())
     }
 
-    pub fn upsert_user_presence(&self, presence: &crate::models::UserPresence) -> Result<(), rusqlite::Error> {
+    pub fn upsert_user_presence(
+        &self,
+        presence: &crate::models::UserPresence,
+    ) -> Result<(), rusqlite::Error> {
         self.conn.lock().unwrap().execute(
             r"INSERT OR REPLACE INTO user_presence (user_id, vault_id, status, last_seen, session_id)
                VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -1699,7 +1732,10 @@ impl Db {
         Ok(())
     }
 
-    pub fn get_vault_presence(&self, vault_id: &str) -> Result<Vec<crate::models::UserPresence>, rusqlite::Error> {
+    pub fn get_vault_presence(
+        &self,
+        vault_id: &str,
+    ) -> Result<Vec<crate::models::UserPresence>, rusqlite::Error> {
         let binding = self.conn.lock().unwrap();
         let mut stmt = binding.prepare(
             "SELECT user_id, vault_id, status, last_seen, session_id FROM user_presence WHERE vault_id = ?1",
@@ -1708,7 +1744,13 @@ impl Db {
             let last_seen_str: String = r.get(3)?;
             let last_seen = chrono::DateTime::parse_from_rfc3339(&last_seen_str)
                 .map(|dt| dt.with_timezone(&chrono::Utc))
-                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e)))?;
+                .map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
             Ok(crate::models::UserPresence {
                 user_id: r.get(0)?,
                 vault_id: r.get(1)?,
@@ -1724,7 +1766,10 @@ impl Db {
         Ok(presence)
     }
 
-    pub fn create_collaborative_session(&self, session: &crate::models::CollaborativeSession) -> Result<(), rusqlite::Error> {
+    pub fn create_collaborative_session(
+        &self,
+        session: &crate::models::CollaborativeSession,
+    ) -> Result<(), rusqlite::Error> {
         let participants_json = serde_json::to_string(&session.participants).unwrap_or_default();
         self.conn.lock().unwrap().execute(
             r"INSERT INTO collaborative_sessions (session_id, vault_id, created_at, participants, is_active)
@@ -1742,7 +1787,12 @@ impl Db {
 
     // ── #71: Full-Text Search ───────────────────────────────────────────────
 
-    pub fn index_vault_content(&self, vault_id: &str, title: &str, content: &str) -> Result<(), rusqlite::Error> {
+    pub fn index_vault_content(
+        &self,
+        vault_id: &str,
+        title: &str,
+        content: &str,
+    ) -> Result<(), rusqlite::Error> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().to_rfc3339();
         self.conn.lock().unwrap().execute(
@@ -1753,7 +1803,11 @@ impl Db {
         Ok(())
     }
 
-    pub fn search_indexed_content(&self, query: &str, limit: u32) -> Result<Vec<crate::models::FullTextSearchResult>, rusqlite::Error> {
+    pub fn search_indexed_content(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<crate::models::FullTextSearchResult>, rusqlite::Error> {
         let binding = self.conn.lock().unwrap();
         let mut stmt = binding.prepare(
             r"SELECT id, vault_id, title, content FROM full_text_search_index
@@ -1785,7 +1839,12 @@ impl Db {
         Ok(results)
     }
 
-    pub fn add_search_facet(&self, vault_id: &str, facet_name: &str, value: &str) -> Result<(), rusqlite::Error> {
+    pub fn add_search_facet(
+        &self,
+        vault_id: &str,
+        facet_name: &str,
+        value: &str,
+    ) -> Result<(), rusqlite::Error> {
         self.conn.lock().unwrap().execute(
             r"INSERT INTO search_facets (vault_id, facet_name, value, count)
                VALUES (?1, ?2, ?3, 1)
@@ -1796,12 +1855,15 @@ impl Db {
         Ok(())
     }
 
-    pub fn get_search_facets(&self, vault_id: &str) -> Result<Vec<crate::models::SearchFacet>, rusqlite::Error> {
+    pub fn get_search_facets(
+        &self,
+        vault_id: &str,
+    ) -> Result<Vec<crate::models::SearchFacet>, rusqlite::Error> {
         let binding = self.conn.lock().unwrap();
-        let mut stmt = binding.prepare(
-            "SELECT DISTINCT facet_name FROM search_facets WHERE vault_id = ?1",
-        )?;
-        let facet_names: Vec<String> = stmt.query_map(params![vault_id], |r| r.get(0))?
+        let mut stmt =
+            binding.prepare("SELECT DISTINCT facet_name FROM search_facets WHERE vault_id = ?1")?;
+        let facet_names: Vec<String> = stmt
+            .query_map(params![vault_id], |r| r.get(0))?
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut facets = Vec::new();
@@ -1809,12 +1871,13 @@ impl Db {
             let mut values_stmt = binding.prepare(
                 "SELECT value, count FROM search_facets WHERE vault_id = ?1 AND facet_name = ?2",
             )?;
-            let values: Vec<crate::models::FacetValue> = values_stmt.query_map(params![vault_id, &facet_name], |r| {
-                Ok(crate::models::FacetValue {
-                    value: r.get(0)?,
-                    count: r.get::<_, i64>(1)? as u32,
-                })
-            })?
+            let values: Vec<crate::models::FacetValue> = values_stmt
+                .query_map(params![vault_id, &facet_name], |r| {
+                    Ok(crate::models::FacetValue {
+                        value: r.get(0)?,
+                        count: r.get::<_, i64>(1)? as u32,
+                    })
+                })?
                 .collect::<Result<Vec<_>, _>>()?;
 
             facets.push(crate::models::SearchFacet {
@@ -1863,9 +1926,7 @@ impl Db {
             r"SELECT data_type, retention_days, enabled, description, created_at, updated_at
                FROM data_retention_policies WHERE data_type = ?1",
         )?;
-        match stmt.query_row(params![data_type], |r| {
-            Self::row_to_retention_policy(r)
-        }) {
+        match stmt.query_row(params![data_type], |r| Self::row_to_retention_policy(r)) {
             Ok(p) => Ok(Some(p)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e),
@@ -1917,9 +1978,8 @@ impl Db {
         retention_days: u32,
         actor: &str,
     ) -> Result<u64, rusqlite::Error> {
-        let cutoff = (chrono::Utc::now()
-            - chrono::Duration::days(i64::from(retention_days)))
-        .to_rfc3339();
+        let cutoff =
+            (chrono::Utc::now() - chrono::Duration::days(i64::from(retention_days))).to_rfc3339();
 
         // Build a DELETE that honours active exceptions.
         let sql = format!(
@@ -2076,10 +2136,7 @@ impl Db {
     // ── #101: Encryption key version metadata ────────────────────────────────
 
     /// Record a new encryption key version as active, retiring the previous one.
-    pub fn insert_encryption_key_version(
-        &self,
-        version: u32,
-    ) -> Result<(), rusqlite::Error> {
+    pub fn insert_encryption_key_version(&self, version: u32) -> Result<(), rusqlite::Error> {
         let now = chrono::Utc::now().to_rfc3339();
         // Mark any previously active key as 'retiring'.
         self.conn.lock().unwrap().execute(
@@ -2133,10 +2190,7 @@ impl Db {
     }
 
     /// Mark a key version as fully retired.
-    pub fn retire_encryption_key_version(
-        &self,
-        version: u32,
-    ) -> Result<(), rusqlite::Error> {
+    pub fn retire_encryption_key_version(&self, version: u32) -> Result<(), rusqlite::Error> {
         let now = chrono::Utc::now().to_rfc3339();
         self.conn.lock().unwrap().execute(
             "UPDATE encryption_key_versions SET status = 'retired', rotated_at = ?1 WHERE version = ?2",
@@ -2221,8 +2275,8 @@ impl Db {
         r: &rusqlite::Row<'_>,
     ) -> Result<crate::models::SecretRotationPolicy, rusqlite::Error> {
         let secret_type_str: String = r.get(0)?;
-        let secret_type: crate::models::SecretType =
-            serde_json::from_str(&secret_type_str).map_err(|e| {
+        let secret_type: crate::models::SecretType = serde_json::from_str(&secret_type_str)
+            .map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
                     0,
                     rusqlite::types::Type::Text,
@@ -2231,8 +2285,7 @@ impl Db {
             })?;
         let auto_rotate_i: i64 = r.get(3)?;
         let channels_str: String = r.get(4)?;
-        let notify_channels: Vec<String> =
-            serde_json::from_str(&channels_str).unwrap_or_default();
+        let notify_channels: Vec<String> = serde_json::from_str(&channels_str).unwrap_or_default();
         let created_at = Self::parse_rfc3339_col(r, 5)?;
         let updated_at = Self::parse_rfc3339_col(r, 6)?;
         Ok(crate::models::SecretRotationPolicy {
@@ -2280,9 +2333,7 @@ impl Db {
                FROM secret_rotation_logs WHERE secret_type = ?1
                ORDER BY rotated_at DESC LIMIT 1",
         )?;
-        match stmt.query_row(params![secret_type_str], |r| {
-            Self::row_to_rotation_log(r)
-        }) {
+        match stmt.query_row(params![secret_type_str], |r| Self::row_to_rotation_log(r)) {
             Ok(l) => Ok(Some(l)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e),
@@ -2316,8 +2367,8 @@ impl Db {
         r: &rusqlite::Row<'_>,
     ) -> Result<crate::models::SecretRotationLog, rusqlite::Error> {
         let secret_type_str: String = r.get(1)?;
-        let secret_type: crate::models::SecretType =
-            serde_json::from_str(&secret_type_str).map_err(|e| {
+        let secret_type: crate::models::SecretType = serde_json::from_str(&secret_type_str)
+            .map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
                     1,
                     rusqlite::types::Type::Text,
@@ -2365,8 +2416,10 @@ impl Db {
         };
 
         let (grace_active, grace_ends) = if let Some(ref l) = last {
-            (l.grace_period_active && l.grace_period_ends_at.is_some_and(|d| d > now),
-             l.grace_period_ends_at)
+            (
+                l.grace_period_active && l.grace_period_ends_at.is_some_and(|d| d > now),
+                l.grace_period_ends_at,
+            )
         } else {
             (false, None)
         };

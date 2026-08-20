@@ -13,8 +13,8 @@
 //! Internal: deliver_event() → called by handlers when events are emitted
 //! ```
 
-use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use axum::{
     extract::{Path, State},
@@ -365,8 +365,8 @@ fn sign_payload(body: &str, secret: &str) -> String {
 
     type HmacSha256 = Hmac<Sha256>;
 
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .expect("HMAC accepts keys of any length");
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any length");
     mac.update(body.as_bytes());
     let result = mac.finalize().into_bytes();
 
@@ -406,7 +406,11 @@ impl SignatureAlgorithm {
 ///
 /// Returns `"<algorithm>=<hex-digest>"`, matching the format expected in the
 /// `X-Ethos-Signature` header.
-pub fn sign_payload_with_algorithm(body: &str, secret: &str, algorithm: SignatureAlgorithm) -> String {
+pub fn sign_payload_with_algorithm(
+    body: &str,
+    secret: &str,
+    algorithm: SignatureAlgorithm,
+) -> String {
     use hmac::{Hmac, Mac};
     use sha1::Sha1 as HmacSha1Inner;
     use sha2::{Sha256, Sha512};
@@ -416,19 +420,31 @@ pub fn sign_payload_with_algorithm(body: &str, secret: &str, algorithm: Signatur
             type H = Hmac<Sha256>;
             let mut mac = H::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key");
             mac.update(body.as_bytes());
-            mac.finalize().into_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>()
+            mac.finalize()
+                .into_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
         }
         SignatureAlgorithm::Sha1 => {
             type H = Hmac<HmacSha1Inner>;
             let mut mac = H::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key");
             mac.update(body.as_bytes());
-            mac.finalize().into_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>()
+            mac.finalize()
+                .into_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
         }
         SignatureAlgorithm::Sha512 => {
             type H = Hmac<Sha512>;
             let mut mac = H::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key");
             mac.update(body.as_bytes());
-            mac.finalize().into_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>()
+            mac.finalize()
+                .into_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
         }
     };
 
@@ -548,7 +564,11 @@ pub fn verify_webhook_signature(
     VerificationResult {
         valid,
         algorithm: Some(prefix.to_string()),
-        reason: if valid { None } else { Some("signature mismatch".into()) },
+        reason: if valid {
+            None
+        } else {
+            Some("signature mismatch".into())
+        },
     }
 }
 
@@ -723,8 +743,7 @@ mod tests {
     #[test]
     fn test_unsupported_algorithm_fails() {
         let ts = ts_now();
-        let result =
-            verify_webhook_signature("body", "secret", Some("md5=deadbeef"), Some(&ts));
+        let result = verify_webhook_signature("body", "secret", Some("md5=deadbeef"), Some(&ts));
         assert!(!result.valid);
         assert!(result.reason.unwrap().contains("unsupported algorithm"));
     }
