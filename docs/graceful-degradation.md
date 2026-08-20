@@ -6,6 +6,22 @@ capabilities be marked `full`, `degraded`, or `unavailable` independently,
 so clients can negotiate what's actually usable and fall back to reduced
 functionality instead of erroring out.
 
+## Shared Degradation State
+
+Capability statuses are persisted in the SQL database and shared across all
+instances in a load-balanced deployment. When an operator marks a capability
+degraded via `POST /admin/capabilities`, all instances immediately observe
+the change on subsequent reads. This ensures consistent client guidance during
+live incidents, regardless of which instance handles the request.
+
+**Example**: A downstream payment processing service becomes unavailable.
+An operator calls `POST /admin/capabilities` on any instance to mark the
+"payments" capability as degraded. All instances, load-balanced behind a
+single endpoint, will now report the same degradation status to clients
+checking `POST /capabilities/negotiate`. This allows clients to gracefully
+fall back to reduced functionality instead of receiving contradictory
+guidance depending on which instance they connect to.
+
 ## Degradation modes
 
 `DegradationLevel` (`backend/src/degradation.rs`):
@@ -32,7 +48,7 @@ Any capability not explicitly registered defaults to `full`.
 ```
 
 Operators (or automated health checks) call this when a dependency degrades
-or recovers.
+or recovers. The change is immediately visible to all instances.
 
 `GET /admin/capabilities` lists every registered capability's current status.
 
@@ -42,7 +58,8 @@ Call sites check availability directly via `DegradationState::check(name)`
 before attempting a feature, e.g.:
 
 ```rust
-let status = state.degradation_state.check("search");
+let status = state.degradation_state.check("search")
+    .expect("failed to check capability status");
 if status.level == DegradationLevel::Unavailable {
     // use fallback or return a clear degraded response
 }
@@ -91,3 +108,15 @@ configured.
    that depends on optional features.
 3. For any capability reported as `use_fallback: true`, call
    `GET /capabilities/:name/fallback` instead of the primary endpoint.
+
+## Database persistence & instance synchronization
+
+Capability statuses are stored in the `capability_statuses` table in SQLite
+(or your configured database). This ensures:
+
+- **Persistence**: Status survives process restarts. A capability marked
+  degraded before a restart remains degraded after.
+- **Synchronization**: All instances in a load-balanced deployment read from
+  the same table, ensuring consistent guidance during incidents.
+- **Immediate visibility**: Changes propagate immediately — there is no
+  in-process cache or eventual consistency delay.

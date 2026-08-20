@@ -76,6 +76,8 @@ pub struct AppState {
     pub event_sourcing: Arc<crate::event_sourcing::EventSourcingState>,
     /// In-process message broker for event-driven integration (#150).
     pub message_queue: Arc<crate::message_queue::MessageQueueState>,
+    /// Graceful degradation: shared capability status registry across instances.
+    pub degradation_state: Arc<crate::degradation::DegradationState>,
 }
 
 impl axum::extract::FromRef<AppState> for Arc<Db> {
@@ -102,29 +104,33 @@ impl axum::extract::FromRef<AppState> for crate::graphql::EthosSchema {
     }
 }
 
-impl axum::extract::FromRef<AppState> for Arc<crate::feature_flags::FlagState> {
-    fn from_ref(state: &AppState) -> Arc<crate::feature_flags::FlagState> {
-        Arc::clone(&state.flag_state)
-    }
-}
-
-impl axum::extract::FromRef<AppState> for Arc<crate::profiler::ProfilerState> {
-    fn from_ref(state: &AppState) -> Arc<crate::profiler::ProfilerState> {
-        Arc::clone(&state.profiler_state)
-    }
-}
-
-impl axum::extract::FromRef<AppState> for Arc<crate::cost_tracking::CostState> {
-    fn from_ref(state: &AppState) -> Arc<crate::cost_tracking::CostState> {
-        Arc::clone(&state.cost_state)
-    }
-}
-
 impl axum::extract::FromRef<AppState> for Arc<crate::degradation::DegradationState> {
     fn from_ref(state: &AppState) -> Arc<crate::degradation::DegradationState> {
         Arc::clone(&state.degradation_state)
     }
 }
+
+// NOTE: The following FromRef implementations reference fields that are not currently
+// in AppState. When these features are properly implemented, uncomment and add the
+// corresponding fields to AppState.
+//
+// impl axum::extract::FromRef<AppState> for Arc<crate::feature_flags::FlagState> {
+//     fn from_ref(state: &AppState) -> Arc<crate::feature_flags::FlagState> {
+//         Arc::clone(&state.flag_state)
+//     }
+// }
+//
+// impl axum::extract::FromRef<AppState> for Arc<crate::profiler::ProfilerState> {
+//     fn from_ref(state: &AppState) -> Arc<crate::profiler::ProfilerState> {
+//         Arc::clone(&state.profiler_state)
+//     }
+// }
+//
+// impl axum::extract::FromRef<AppState> for Arc<crate::cost_tracking::CostState> {
+//     fn from_ref(state: &AppState) -> Arc<crate::cost_tracking::CostState> {
+//         Arc::clone(&state.cost_state)
+//     }
+// }
 
 pub fn search_vaults(store: &VaultStore, query: &SearchQuery) -> SearchResult {
     let vaults = store.lock().unwrap();
@@ -952,6 +958,22 @@ impl Db {
                     ON secret_rotation_logs(secret_type);
                 CREATE INDEX IF NOT EXISTS idx_secret_rotation_logs_at
                     ON secret_rotation_logs(rotated_at);
+                ",
+            ),
+            (
+                "12",
+                r"
+                -- Graceful degradation: capability status registry
+                -- Shared across all instances in a load-balanced deployment.
+                CREATE TABLE IF NOT EXISTS capability_statuses (
+                    name                 TEXT PRIMARY KEY,
+                    level                TEXT NOT NULL,
+                    reason               TEXT,
+                    fallback_available   INTEGER NOT NULL DEFAULT 0,
+                    updated_at           TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_capability_statuses_updated_at
+                    ON capability_statuses(updated_at);
                 ",
             ),
         ];
@@ -2450,6 +2472,122 @@ impl Db {
                     Box::new(e),
                 )
             })
+    }
+}
+
+// ── Graceful degradation: capability status management ───────────────────────
+
+impl Db {
+    /// Store or update a capability's degradation status in the database.
+    /// All instances in a load-balanced deployment read from this shared store.
+    pub fn set_capability_status(
+        &self,
+        status: &crate::degradation::CapabilityStatus,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r"
+            INSERT INTO capability_statuses (name, level, reason, fallback_available, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(name) DO UPDATE SET
+              level = excluded.level,
+              reason = excluded.reason,
+              fallback_available = excluded.fallback_available,
+              updated_at = excluded.updated_at
+            ",
+            rusqlite::params![
+                &status.name,
+                serde_json::to_string(&status.level).unwrap(),
+                &status.reason,
+                status.fallback_available as i32,
+                status.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Look up a capability's status, returning `Full` (default) if not found.
+    pub fn get_capability_status(
+        &self,
+        name: &str,
+    ) -> Result<crate::degradation::CapabilityStatus, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT name, level, reason, fallback_available, updated_at 
+             FROM capability_statuses 
+             WHERE name = ?1",
+        )?;
+
+        let status = stmt.query_row(rusqlite::params![name], |r| {
+            let level_str: String = r.get(1)?;
+            let level: crate::degradation::DegradationLevel = serde_json::from_str(&level_str)
+                .unwrap_or(crate::degradation::DegradationLevel::Full);
+            Ok(crate::degradation::CapabilityStatus {
+                name: r.get(0)?,
+                level,
+                reason: r.get(2)?,
+                fallback_available: r.get::<_, i32>(3)? != 0,
+                updated_at: {
+                    let updated_str: String = r.get(4)?;
+                    chrono::DateTime::parse_from_rfc3339(&updated_str)
+                        .ok()
+                        .and_then(|dt| Some(dt.with_timezone(&chrono::Utc)))
+                        .unwrap_or_else(|| chrono::Utc::now())
+                },
+            })
+        });
+
+        match status {
+            Ok(s) => Ok(s),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                // Default to Full for unregistered capabilities
+                Ok(crate::degradation::CapabilityStatus {
+                    name: name.to_string(),
+                    level: crate::degradation::DegradationLevel::Full,
+                    reason: None,
+                    fallback_available: false,
+                    updated_at: chrono::Utc::now(),
+                })
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// List all registered (non-default) capability statuses.
+    pub fn list_capability_statuses(
+        &self,
+    ) -> Result<Vec<crate::degradation::CapabilityStatus>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT name, level, reason, fallback_available, updated_at 
+             FROM capability_statuses
+             ORDER BY updated_at DESC",
+        )?;
+
+        let statuses = stmt.query_map([], |r| {
+            let level_str: String = r.get(1)?;
+            let level: crate::degradation::DegradationLevel = serde_json::from_str(&level_str)
+                .unwrap_or(crate::degradation::DegradationLevel::Full);
+            Ok(crate::degradation::CapabilityStatus {
+                name: r.get(0)?,
+                level,
+                reason: r.get(2)?,
+                fallback_available: r.get::<_, i32>(3)? != 0,
+                updated_at: {
+                    let updated_str: String = r.get(4)?;
+                    chrono::DateTime::parse_from_rfc3339(&updated_str)
+                        .ok()
+                        .and_then(|dt| Some(dt.with_timezone(&chrono::Utc)))
+                        .unwrap_or_else(|| chrono::Utc::now())
+                },
+            })
+        })?;
+
+        let mut result = Vec::new();
+        for row in statuses {
+            result.push(row?);
+        }
+        Ok(result)
     }
 }
 

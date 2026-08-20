@@ -6,12 +6,17 @@
 //! clients can negotiate what's actually usable and fall back to reduced
 //! functionality instead of failing outright.
 //!
+//! Capability statuses are persisted in the SQL database and shared across all
+//! instances in a load-balanced deployment. When an operator marks a capability
+//! degraded via `POST /admin/capabilities`, all instances immediately observe
+//! the change on subsequent reads.
+//!
 //! # Concepts
 //!
 //! - [`DegradationLevel`] — `Full`, `Degraded`, or `Unavailable` for a given
 //!   named capability
-//! - [`DegradationState`] — registry of capability -> status, defaulting to
-//!   `Full` for anything not explicitly registered
+//! - [`DegradationState`] — registry of capability -> status backed by SQL,
+//!   defaulting to `Full` for anything not explicitly registered
 //! - Capability negotiation — a client posts the capabilities it wants to
 //!   use; the server reports which are fully available, degraded (usable
 //!   with reduced functionality), or unavailable (client should use a
@@ -24,8 +29,7 @@
 //! - `POST /capabilities/negotiate` — negotiate a set of requested capabilities
 //! - `GET /capabilities/:name/fallback` — fallback response for a capability
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use axum::{
     extract::{Path, State},
@@ -93,25 +97,28 @@ pub struct NegotiationResult {
     pub can_proceed: bool,
 }
 
+/// Database-backed registry of capability statuses.
+/// All instances in a load-balanced deployment share the same storage,
+/// ensuring consistent degradation state across the fleet.
+#[derive(Clone)]
 pub struct DegradationState {
-    registry: Mutex<HashMap<String, CapabilityStatus>>,
+    db: Arc<crate::db::Db>,
 }
 
 impl DegradationState {
-    pub fn new() -> Self {
-        Self {
-            registry: Mutex::new(HashMap::new()),
-        }
+    pub fn new(db: Arc<crate::db::Db>) -> Self {
+        Self { db }
     }
 
     /// Register or update a capability's degradation status.
+    /// This change is immediately visible to all instances reading from the shared database.
     pub fn set_status(
         &self,
         name: &str,
         level: DegradationLevel,
         reason: Option<String>,
         fallback_available: bool,
-    ) -> CapabilityStatus {
+    ) -> Result<CapabilityStatus, String> {
         let status = CapabilityStatus {
             name: name.to_string(),
             level,
@@ -119,63 +126,51 @@ impl DegradationState {
             fallback_available,
             updated_at: Utc::now(),
         };
-        self.registry
-            .lock()
-            .unwrap()
-            .insert(name.to_string(), status.clone());
-        status
+        self.db
+            .set_capability_status(&status)
+            .map_err(|e| format!("failed to set capability status: {}", e))?;
+        Ok(status)
     }
 
     /// Look up a capability's status, defaulting to `Full` if unregistered.
-    pub fn check(&self, name: &str) -> CapabilityStatus {
-        self.registry
-            .lock()
-            .unwrap()
-            .get(name)
-            .cloned()
-            .unwrap_or_else(|| CapabilityStatus {
-                name: name.to_string(),
-                level: DegradationLevel::Full,
-                reason: None,
-                fallback_available: false,
-                updated_at: Utc::now(),
-            })
+    /// Reads from the shared database, ensuring all instances see the same state.
+    pub fn check(&self, name: &str) -> Result<CapabilityStatus, String> {
+        self.db
+            .get_capability_status(name)
+            .map_err(|e| format!("failed to get capability status: {}", e))
     }
 
-    pub fn list(&self) -> Vec<CapabilityStatus> {
-        self.registry.lock().unwrap().values().cloned().collect()
+    pub fn list(&self) -> Result<Vec<CapabilityStatus>, String> {
+        self.db
+            .list_capability_statuses()
+            .map_err(|e| format!("failed to list capability statuses: {}", e))
     }
 
     /// Negotiate a set of requested capabilities against current status.
-    pub fn negotiate(&self, requested: &[String]) -> NegotiationResult {
-        let capabilities: Vec<NegotiatedCapability> = requested
+    pub fn negotiate(&self, requested: &[String]) -> Result<NegotiationResult, String> {
+        let capabilities: Result<Vec<NegotiatedCapability>, String> = requested
             .iter()
             .map(|name| {
-                let status = self.check(name);
-                NegotiatedCapability {
+                let status = self.check(name)?;
+                Ok(NegotiatedCapability {
                     name: status.name,
                     level: status.level,
                     reason: status.reason,
                     use_fallback: status.level != DegradationLevel::Full
                         && status.fallback_available,
-                }
+                })
             })
             .collect();
 
+        let capabilities = capabilities?;
         let can_proceed = capabilities
             .iter()
             .all(|c| c.level != DegradationLevel::Unavailable || c.use_fallback);
 
-        NegotiationResult {
+        Ok(NegotiationResult {
             capabilities,
             can_proceed,
-        }
-    }
-}
-
-impl Default for DegradationState {
-    fn default() -> Self {
-        Self::new()
+        })
     }
 }
 
@@ -192,27 +187,40 @@ pub async fn set_capability(
             Json(serde_json::json!({ "error": "name must not be empty" })),
         ));
     }
-    Ok(Json(state.set_status(
-        &body.name,
-        body.level,
-        body.reason,
-        body.fallback_available,
-    )))
+    state
+        .set_status(&body.name, body.level, body.reason, body.fallback_available)
+        .map(Json)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e })),
+            )
+        })
 }
 
 /// `GET /admin/capabilities` — list all registered capability statuses.
 pub async fn list_capabilities(
     State(state): State<Arc<DegradationState>>,
-) -> Json<Vec<CapabilityStatus>> {
-    Json(state.list())
+) -> Result<Json<Vec<CapabilityStatus>>, (StatusCode, Json<serde_json::Value>)> {
+    state.list().map(Json).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e })),
+        )
+    })
 }
 
 /// `POST /capabilities/negotiate` — negotiate a set of requested capabilities.
 pub async fn negotiate_capabilities(
     State(state): State<Arc<DegradationState>>,
     Json(body): Json<NegotiateRequest>,
-) -> Json<NegotiationResult> {
-    Json(state.negotiate(&body.requested))
+) -> Result<Json<NegotiationResult>, (StatusCode, Json<serde_json::Value>)> {
+    state.negotiate(&body.requested).map(Json).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e })),
+        )
+    })
 }
 
 /// `GET /capabilities/:name/fallback` — reduced-functionality fallback
@@ -221,7 +229,9 @@ pub async fn capability_fallback(
     State(state): State<Arc<DegradationState>>,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let status = state.check(&name);
+    let status = state
+        .check(&name)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if status.level == DegradationLevel::Full {
         return Err(StatusCode::NOT_FOUND);
     }
@@ -241,48 +251,174 @@ pub async fn capability_fallback(
 mod tests {
     use super::*;
 
+    fn create_test_db() -> Arc<crate::db::Db> {
+        let db = Arc::new(crate::db::Db::open(":memory:").expect("failed to open in-memory db"));
+        db.migrate().expect("migration failed");
+        db
+    }
+
     #[test]
     fn unregistered_capability_defaults_to_full() {
-        let state = DegradationState::new();
-        let status = state.check("payments");
+        let db = create_test_db();
+        let state = DegradationState::new(db);
+        let status = state.check("payments").expect("check failed");
         assert_eq!(status.level, DegradationLevel::Full);
+        assert_eq!(status.name, "payments");
+    }
+
+    #[test]
+    fn set_and_get_capability_status() {
+        let db = create_test_db();
+        let state = DegradationState::new(db);
+
+        let set_result = state
+            .set_status(
+                "search",
+                DegradationLevel::Unavailable,
+                Some("index rebuilding".to_string()),
+                true,
+            )
+            .expect("set_status failed");
+        assert_eq!(set_result.level, DegradationLevel::Unavailable);
+        assert_eq!(set_result.reason, Some("index rebuilding".to_string()));
+
+        let retrieved = state.check("search").expect("check failed");
+        assert_eq!(retrieved.level, DegradationLevel::Unavailable);
+        assert_eq!(retrieved.reason, Some("index rebuilding".to_string()));
+        assert!(retrieved.fallback_available);
     }
 
     #[test]
     fn negotiate_allows_proceeding_with_fallback() {
-        let state = DegradationState::new();
-        state.set_status(
-            "search",
-            DegradationLevel::Unavailable,
-            Some("index rebuilding".to_string()),
-            true,
-        );
+        let db = create_test_db();
+        let state = DegradationState::new(db);
 
-        let result = state.negotiate(&["search".to_string()]);
+        state
+            .set_status(
+                "search",
+                DegradationLevel::Unavailable,
+                Some("index rebuilding".to_string()),
+                true,
+            )
+            .expect("set_status failed");
+
+        let result = state
+            .negotiate(&["search".to_string()])
+            .expect("negotiate failed");
         assert!(result.can_proceed);
         assert!(result.capabilities[0].use_fallback);
     }
 
     #[test]
     fn negotiate_blocks_without_fallback() {
-        let state = DegradationState::new();
-        state.set_status("search", DegradationLevel::Unavailable, None, false);
+        let db = create_test_db();
+        let state = DegradationState::new(db);
 
-        let result = state.negotiate(&["search".to_string()]);
+        state
+            .set_status("search", DegradationLevel::Unavailable, None, false)
+            .expect("set_status failed");
+
+        let result = state
+            .negotiate(&["search".to_string()])
+            .expect("negotiate failed");
         assert!(!result.can_proceed);
     }
 
     #[test]
     fn degraded_capability_can_proceed() {
-        let state = DegradationState::new();
-        state.set_status(
-            "recommendations",
-            DegradationLevel::Degraded,
-            Some("stale cache".to_string()),
-            false,
-        );
+        let db = create_test_db();
+        let state = DegradationState::new(db);
 
-        let result = state.negotiate(&["recommendations".to_string()]);
+        state
+            .set_status(
+                "recommendations",
+                DegradationLevel::Degraded,
+                Some("stale cache".to_string()),
+                false,
+            )
+            .expect("set_status failed");
+
+        let result = state
+            .negotiate(&["recommendations".to_string()])
+            .expect("negotiate failed");
         assert!(result.can_proceed);
+    }
+
+    #[test]
+    fn two_handles_share_same_store() {
+        let db = create_test_db();
+        let state1 = DegradationState::new(Arc::clone(&db));
+        let state2 = DegradationState::new(Arc::clone(&db));
+
+        // Set via state1
+        state1
+            .set_status(
+                "payments",
+                DegradationLevel::Degraded,
+                Some("slow processing".to_string()),
+                true,
+            )
+            .expect("set_status failed");
+
+        // Observe change via state2
+        let status = state2.check("payments").expect("check failed");
+        assert_eq!(status.level, DegradationLevel::Degraded);
+        assert_eq!(status.reason, Some("slow processing".to_string()));
+    }
+
+    #[test]
+    fn degradation_state_persists_across_instances() {
+        let db = create_test_db();
+
+        // Instance 1: set a capability status
+        {
+            let state1 = DegradationState::new(Arc::clone(&db));
+            state1
+                .set_status(
+                    "notifications",
+                    DegradationLevel::Unavailable,
+                    Some("service down".to_string()),
+                    false,
+                )
+                .expect("set_status failed");
+        }
+
+        // Instance 2: read the same state after instance 1 is dropped
+        {
+            let state2 = DegradationState::new(Arc::clone(&db));
+            let status = state2.check("notifications").expect("check failed");
+            assert_eq!(status.level, DegradationLevel::Unavailable);
+            assert_eq!(status.reason, Some("service down".to_string()));
+        }
+    }
+
+    #[test]
+    fn list_returns_all_registered_capabilities() {
+        let db = create_test_db();
+        let state = DegradationState::new(db);
+
+        state
+            .set_status("search", DegradationLevel::Degraded, None, false)
+            .expect("set_status failed");
+        state
+            .set_status(
+                "recommendations",
+                DegradationLevel::Unavailable,
+                None,
+                false,
+            )
+            .expect("set_status failed");
+        state
+            .set_status("analytics", DegradationLevel::Full, None, false)
+            .expect("set_status failed");
+
+        let list = state.list().expect("list failed");
+        assert_eq!(list.len(), 3);
+        assert!(list.iter().any(|s| s.name == "search"));
+        assert!(list.iter().any(|s| s.name == "recommendations"));
+        // Full is not registered, so it won't appear in list
+        assert!(!list
+            .iter()
+            .any(|s| s.name == "analytics" && s.level == DegradationLevel::Full));
     }
 }
