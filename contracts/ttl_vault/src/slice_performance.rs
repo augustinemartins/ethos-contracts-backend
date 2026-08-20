@@ -350,12 +350,10 @@ pub fn apply_reputation_decay(
     // Apply decay: new_reputation = current * decay_rate / 10000
     let new_reputation = current_reputation
         .saturating_mul(decay_rate_bps)
-        .saturating_div(10_000u32.max(1));
+        .saturating_div(10_000u32);
 
     // Persist the new reputation.
-    env.storage()
-        .persistent()
-        .set(&decay_key, &new_reputation);
+    env.storage().persistent().set(&decay_key, &new_reputation);
     env.storage().persistent().extend_ttl(
         &decay_key,
         crate::VAULT_TTL_THRESHOLD,
@@ -422,13 +420,13 @@ pub fn apply_reputation_recovery(
     let max_recovery = 10_000u32.saturating_sub(current_reputation);
     let recovery_amount = max_recovery
         .saturating_mul(improvement_rate_bps)
-        .saturating_div(10_000u32.max(1));
-    let new_reputation = current_reputation.saturating_add(recovery_amount).min(10_000u32);
+        .saturating_div(10_000u32);
+    let new_reputation = current_reputation
+        .saturating_add(recovery_amount)
+        .min(10_000u32);
 
     // Persist the recovered reputation.
-    env.storage()
-        .persistent()
-        .set(&decay_key, &new_reputation);
+    env.storage().persistent().set(&decay_key, &new_reputation);
     env.storage().persistent().extend_ttl(
         &decay_key,
         crate::VAULT_TTL_THRESHOLD,
@@ -443,7 +441,7 @@ pub fn apply_reputation_recovery(
         improvement_rate_bps,
         current_reputation,
         new_reputation,
-        String::from_slice(env, "reputation_recovery"),
+        String::from_str(env, "reputation_recovery"),
     );
 
     // Publish recovery event.
@@ -481,11 +479,7 @@ fn record_decay_history(
     reason: String,
 ) {
     let count_key = SlicePerfKey::DecayHistoryCount(slice_id, attestor.clone());
-    let current_count: u64 = env
-        .storage()
-        .persistent()
-        .get(&count_key)
-        .unwrap_or(0u64);
+    let current_count: u64 = env.storage().persistent().get(&count_key).unwrap_or(0u64);
 
     let entry = DecayHistoryEntry {
         applied_at: env.ledger().timestamp(),
@@ -522,11 +516,7 @@ pub fn get_decay_history(
     limit: u64,
 ) -> Vec<DecayHistoryEntry> {
     let count_key = SlicePerfKey::DecayHistoryCount(slice_id, attestor.clone());
-    let total_count: u64 = env
-        .storage()
-        .persistent()
-        .get(&count_key)
-        .unwrap_or(0u64);
+    let total_count: u64 = env.storage().persistent().get(&count_key).unwrap_or(0u64);
 
     let mut entries: Vec<DecayHistoryEntry> = Vec::new(env);
 
@@ -543,7 +533,11 @@ pub fn get_decay_history(
             break;
         }
         let history_key = SlicePerfKey::DecayHistory(slice_id, attestor.clone(), i);
-        if let Some(entry) = env.storage().persistent().get::<SlicePerfKey, DecayHistoryEntry>(&history_key) {
+        if let Some(entry) = env
+            .storage()
+            .persistent()
+            .get::<SlicePerfKey, DecayHistoryEntry>(&history_key)
+        {
             entries.push_back(entry);
             retrieved = retrieved.saturating_add(1);
         }
