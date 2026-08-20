@@ -6,11 +6,14 @@
 # Minimum vulnerability CVSS score to trigger a build failure (0.0–10.0).
 # "high" maps to CVSS >= 7.0.
 vulnerability = "deny"
-# Warn on (but do not block) unmaintained and unsound crates.
-unmaintained = "warn"
-unsound = "warn"
+# Only fail on unmaintained/unsound advisories in our own direct
+# (workspace) dependencies — ignore noise from transitive crates deep
+# in the Soroban SDK tree. (cargo-deny >=0.18 replaced the old
+# warn/deny/allow severity for these two fields with this scope-based
+# model; `notice` was removed entirely and is no longer configurable.)
+unmaintained = "workspace"
+unsound = "workspace"
 yanked = "warn"
-notice = "warn"
 
 # Ignored advisories — reviewed and accepted due to transitive SDK constraints.
 # Keep in sync with .cargo/audit.toml.
