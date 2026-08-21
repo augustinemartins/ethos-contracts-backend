@@ -14752,4 +14752,102 @@ impl TtlVaultContract {
     pub fn get_slice_rule_ids(env: Env, slice_id: u64) -> Vec<u64> {
         composition_rules::get_slice_rules(&env, slice_id)
     }
+
+    // ── Issue #270: Template Inheritance Cycle Detection ─────────────────────
+
+    /// Create a new template with optional parent (inheritance).
+    ///
+    /// If `parent_template_id` is non-zero, this creates an inheriting template
+    /// and performs cycle detection. Panics if creating a child of `parent_template_id`
+    /// would form a cycle or exceed maximum inheritance depth.
+    ///
+    /// # Arguments
+    /// * `name` — Template identifier/name
+    /// * `data` — Template configuration data
+    /// * `parent_template_id` — Parent template ID (0 for root templates)
+    /// * `overrides` — Field overrides for inheritance
+    ///
+    /// # Returns
+    /// The assigned `template_id` for this newly created template.
+    ///
+    /// # Panics
+    /// - If parent does not exist (when `parent_template_id` > 0)
+    /// - If creating this child would form a cycle
+    /// - If inheritance depth would exceed MAX_INHERITANCE_DEPTH
+    pub fn create_template(
+        env: Env,
+        name: Bytes,
+        data: Bytes,
+        parent_template_id: u64,
+        overrides: Bytes,
+    ) -> u64 {
+        template_inheritance::create_template(&env, name, data, parent_template_id, overrides)
+    }
+
+    /// Create a template that inherits from a parent with field overrides.
+    ///
+    /// Convenience wrapper around `create_template` that looks up the parent
+    /// and derives metadata from it. Still performs full cycle detection.
+    ///
+    /// # Arguments
+    /// * `parent_id` — Template ID of the parent
+    /// * `overrides` — Field overrides for this inherited template
+    ///
+    /// # Returns
+    /// The assigned `template_id` for the new child template.
+    ///
+    /// # Panics
+    /// - If parent template does not exist
+    /// - If creating this child would form a cycle
+    /// - If inheritance depth would exceed MAX_INHERITANCE_DEPTH
+    pub fn create_inherited_template(env: Env, parent_id: u64, overrides: Bytes) -> u64 {
+        template_inheritance::create_inherited_template(&env, parent_id, overrides)
+    }
+
+    /// Retrieve a template by ID.
+    ///
+    /// Returns the stored template or `None` if not found.
+    pub fn get_template(env: Env, template_id: u64) -> Option<template_inheritance::Template> {
+        template_inheritance::get_template(&env, template_id)
+    }
+
+    /// Resolve a template, applying all ancestor overrides.
+    ///
+    /// Walks the inheritance chain and combines all field overrides into a
+    /// single `ResolvedTemplate`. Results are cached in persistent storage.
+    ///
+    /// Returns `None` if the template does not exist or the chain is broken
+    /// (e.g., a parent was deleted).
+    pub fn resolve_template(
+        env: Env,
+        template_id: u64,
+    ) -> Option<template_inheritance::ResolvedTemplate> {
+        template_inheritance::resolve_template(&env, template_id)
+    }
+
+    /// Check if a potential child→parent relationship would create a cycle.
+    ///
+    /// This is the public entry point for cycle detection. It returns a
+    /// `CycleCheckResult` indicating whether adding this child would create
+    /// a cycle and the path taken.
+    ///
+    /// # Arguments
+    /// * `parent_id` — The parent template ID to inherit from
+    /// * `child_id` — The child template ID being created
+    ///
+    /// Returns a `CycleCheckResult` with `has_cycle` and `cycle_path`.
+    pub fn check_template_inheritance_cycle(
+        env: Env,
+        parent_id: u64,
+        child_id: u64,
+    ) -> template_inheritance::CycleCheckResult {
+        template_inheritance::check_inheritance_cycle(&env, parent_id, child_id)
+    }
+
+    /// Get the inheritance depth of a template.
+    ///
+    /// Returns the number of ancestor templates in the chain (0 for root).
+    pub fn get_template_inheritance_depth(env: Env, template_id: u64) -> u32 {
+        template_inheritance::get_inheritance_depth(&env, template_id)
+    }
 }
