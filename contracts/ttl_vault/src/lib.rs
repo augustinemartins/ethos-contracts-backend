@@ -14849,7 +14849,7 @@ impl TtlVaultContract {
     pub fn execute_slice_modification(
         env: Env,
         vault_id: u64,
-        executor: Address,
+        _executor: Address,
         slice_id: u64,
         proposal_id: u64,
     ) -> bool {
