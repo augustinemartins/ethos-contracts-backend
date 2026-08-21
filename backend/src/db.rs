@@ -976,6 +976,36 @@ impl Db {
                     ON capability_statuses(updated_at);
                 ",
             ),
+            (
+                "13",
+                r"
+                -- Event sourcing: append-only event log (#267)
+                CREATE TABLE IF NOT EXISTS events (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    vault_id        TEXT NOT NULL,
+                    sequence        INTEGER NOT NULL,
+                    event_type      TEXT NOT NULL,
+                    timestamp       TEXT NOT NULL,
+                    data            TEXT NOT NULL,
+                    schema_version  INTEGER NOT NULL DEFAULT 1,
+                    UNIQUE(vault_id, sequence)
+                );
+                CREATE INDEX IF NOT EXISTS idx_events_vault_id_sequence
+                    ON events(vault_id, sequence);
+                CREATE INDEX IF NOT EXISTS idx_events_timestamp
+                    ON events(timestamp);
+
+                -- Event sourcing: snapshots for bounded replay (#267)
+                CREATE TABLE IF NOT EXISTS snapshots (
+                    vault_id            TEXT PRIMARY KEY,
+                    snapshot_sequence   INTEGER NOT NULL,
+                    taken_at            TEXT NOT NULL,
+                    state               TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_snapshots_taken_at
+                    ON snapshots(taken_at);
+                ",
+            ),
         ];
 
         for (version, sql) in MIGRATIONS {
@@ -2623,6 +2653,139 @@ impl Db {
             violations.push(row?);
         }
         Ok(violations)
+    }
+}
+
+// ── Event sourcing persistence (#267) ────────────────────────────────────────
+
+impl Db {
+    /// Persist an event to the database.
+    pub fn append_event(
+        &self,
+        vault_id: &str,
+        sequence: u64,
+        event_type: &str,
+        timestamp: &chrono::DateTime<chrono::Utc>,
+        data: &str,
+        schema_version: u32,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r"
+            INSERT INTO events (vault_id, sequence, event_type, timestamp, data, schema_version)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ",
+            rusqlite::params![vault_id, sequence as i64, event_type, timestamp.to_rfc3339(), data, schema_version as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Retrieve all events for a vault, ordered by sequence.
+    pub fn get_events_for_vault(
+        &self,
+        vault_id: &str,
+    ) -> Result<Vec<(u64, String, String, String, u32)>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r"
+            SELECT sequence, event_type, timestamp, data, schema_version
+            FROM events
+            WHERE vault_id = ?1
+            ORDER BY sequence ASC
+            ",
+        )?;
+
+        let events = stmt.query_map(rusqlite::params![vault_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)? as u64,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get::<_, i64>(4)? as u32,
+            ))
+        })?;
+
+        let mut result = Vec::new();
+        for event in events {
+            result.push(event?);
+        }
+        Ok(result)
+    }
+
+    /// Save a snapshot for a vault.
+    pub fn save_snapshot(
+        &self,
+        vault_id: &str,
+        snapshot_sequence: u64,
+        taken_at: &chrono::DateTime<chrono::Utc>,
+        state: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r"
+            INSERT INTO snapshots (vault_id, snapshot_sequence, taken_at, state)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(vault_id) DO UPDATE SET
+              snapshot_sequence = excluded.snapshot_sequence,
+              taken_at = excluded.taken_at,
+              state = excluded.state
+            ",
+            rusqlite::params![
+                vault_id,
+                snapshot_sequence as i64,
+                taken_at.to_rfc3339(),
+                state
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Retrieve the snapshot for a vault, if any.
+    pub fn get_snapshot(
+        &self,
+        vault_id: &str,
+    ) -> Result<Option<(u64, String, String)>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r"
+            SELECT snapshot_sequence, taken_at, state
+            FROM snapshots
+            WHERE vault_id = ?1
+            ",
+        )?;
+
+        stmt.query_row(rusqlite::params![vault_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)? as u64,
+                row.get(1)?,
+                row.get(2)?,
+            ))
+        })
+        .optional()
+    }
+
+    /// Delete snapshots older than a given date (for retention/archival).
+    pub fn delete_old_snapshots(
+        &self,
+        cutoff_date: &chrono::DateTime<chrono::Utc>,
+    ) -> Result<usize, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM snapshots WHERE taken_at < ?1",
+            rusqlite::params![cutoff_date.to_rfc3339()],
+        )
+    }
+
+    /// Delete events older than a given date (for retention/archival).
+    pub fn delete_old_events(
+        &self,
+        cutoff_date: &chrono::DateTime<chrono::Utc>,
+    ) -> Result<usize, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM events WHERE timestamp < ?1",
+            rusqlite::params![cutoff_date.to_rfc3339()],
+        )
     }
 }
 

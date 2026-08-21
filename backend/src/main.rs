@@ -319,7 +319,7 @@ async fn main() {
     let webhook_state = Arc::new(WebhookState::new());
 
     let state = AppState {
-        db,
+        db: Arc::clone(&db),
         vault_store,
         event_store,
         audit_store: create_audit_store(),
@@ -333,7 +333,7 @@ async fn main() {
         load_shedder,
         batcher,
         scaler,
-        event_sourcing: Arc::new(EventSourcingState::new()),
+        event_sourcing: Arc::new(EventSourcingState::with_db(db)),
         message_queue: Arc::new(
             MessageQueueState::new().expect("failed to initialize message queue"),
         ),
