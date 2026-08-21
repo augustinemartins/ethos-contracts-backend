@@ -90,11 +90,26 @@ pub struct InvalidStateTransitionEvent {
 fn is_valid_transition(from: CredentialState, to: CredentialState) -> bool {
     match (from, to) {
         // Draft can transition to Active, Suspended, or Revoked
-        (CredentialState::Draft, CredentialState::Active | CredentialState::Suspended | CredentialState::Revoked) => true,
+        (
+            CredentialState::Draft,
+            CredentialState::Active | CredentialState::Suspended | CredentialState::Revoked,
+        ) => true,
         // Active can transition to Suspended, Revoked, Expired, or Archived
-        (CredentialState::Active, CredentialState::Suspended | CredentialState::Revoked | CredentialState::Expired | CredentialState::Archived) => true,
+        (
+            CredentialState::Active,
+            CredentialState::Suspended
+            | CredentialState::Revoked
+            | CredentialState::Expired
+            | CredentialState::Archived,
+        ) => true,
         // Suspended can transition back to Active, or to Revoked/Expired/Archived
-        (CredentialState::Suspended, CredentialState::Active | CredentialState::Revoked | CredentialState::Expired | CredentialState::Archived) => true,
+        (
+            CredentialState::Suspended,
+            CredentialState::Active
+            | CredentialState::Revoked
+            | CredentialState::Expired
+            | CredentialState::Archived,
+        ) => true,
         // Expired can transition to Archived or Revoked
         (CredentialState::Expired, CredentialState::Archived | CredentialState::Revoked) => true,
         // Revoked and Archived are terminal states — no outbound transitions

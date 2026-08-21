@@ -253,10 +253,20 @@ pub fn remove_credential_anchor(
 
 /// Look up the credential ID anchored to `(external_id, system)`.
 ///
-/// Returns `Some(credential_id)` if a match is found, `None` otherwise.
+/// Returns `Some(credential_id)` if a match is found AND the credential is in
+/// an active state. Returns `None` if no match is found OR the credential is
+/// in a non-active state (Revoked, Archived, Suspended, etc.).
 pub fn verify_external_anchor(env: &Env, external_id: &Bytes, system: &Bytes) -> Option<u64> {
     let rev_key = AnchorKey::ReverseAnchor(composite_key(env, external_id, system));
-    env.storage().persistent().get::<AnchorKey, u64>(&rev_key)
+    let credential_id = env.storage().persistent().get::<AnchorKey, u64>(&rev_key)?;
+
+    // Check if credential is in an active state
+    let state = crate::credential_lifecycle::get_credential_state(env, credential_id);
+    if crate::credential_lifecycle::is_active_state(state) {
+        Some(credential_id)
+    } else {
+        None
+    }
 }
 
 /// Returns `true` if `(external_id, system)` maps to some on-chain credential.

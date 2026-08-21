@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::credential_anchoring::*;
+    use crate::credential_lifecycle;
     use crate::TtlVaultContract;
     use soroban_sdk::{Bytes, Env};
 
@@ -14,6 +15,14 @@ mod tests {
         let system = Bytes::from_slice(&env, b"kyc-v1");
 
         env.as_contract(&contract_id, || {
+            // Initialize credential and activate it
+            credential_lifecycle::init_credential_state(&env, credential_id);
+            credential_lifecycle::transition_credential_state(
+                &env,
+                credential_id,
+                credential_lifecycle::CredentialState::Active,
+            );
+
             // Create anchor
             let success =
                 create_credential_anchor(&env, credential_id, external_id.clone(), system.clone());
@@ -43,6 +52,14 @@ mod tests {
         let system = Bytes::from_slice(&env, b"kyc-v1");
 
         env.as_contract(&contract_id, || {
+            // Initialize and activate credential
+            credential_lifecycle::init_credential_state(&env, credential_id);
+            credential_lifecycle::transition_credential_state(
+                &env,
+                credential_id,
+                credential_lifecycle::CredentialState::Active,
+            );
+
             // Create anchor
             let success1 =
                 create_credential_anchor(&env, credential_id, external_id.clone(), system.clone());
@@ -65,6 +82,14 @@ mod tests {
         let system = Bytes::from_slice(&env, b"kyc-v1");
 
         env.as_contract(&contract_id, || {
+            // Initialize and activate credential
+            credential_lifecycle::init_credential_state(&env, credential_id);
+            credential_lifecycle::transition_credential_state(
+                &env,
+                credential_id,
+                credential_lifecycle::CredentialState::Active,
+            );
+
             // Create anchor
             let _ =
                 create_credential_anchor(&env, credential_id, external_id.clone(), system.clone());
@@ -95,6 +120,14 @@ mod tests {
         let system_2 = Bytes::from_slice(&env, b"gov-id");
 
         env.as_contract(&contract_id, || {
+            // Initialize and activate credential
+            credential_lifecycle::init_credential_state(&env, credential_id);
+            credential_lifecycle::transition_credential_state(
+                &env,
+                credential_id,
+                credential_lifecycle::CredentialState::Active,
+            );
+
             // Create multiple anchors
             let success1 = create_credential_anchor(
                 &env,
@@ -127,10 +160,19 @@ mod tests {
             let initial_count = get_anchor_count(&env);
             assert_eq!(initial_count, 0, "Initial count should be 0");
 
+            // Initialize and activate credential
+            let credential_id = 1u64;
+            credential_lifecycle::init_credential_state(&env, credential_id);
+            credential_lifecycle::transition_credential_state(
+                &env,
+                credential_id,
+                credential_lifecycle::CredentialState::Active,
+            );
+
             // Create an anchor
             let external_id = Bytes::from_slice(&env, b"test-id");
             let system = Bytes::from_slice(&env, b"test-sys");
-            let _ = create_credential_anchor(&env, 1u64, external_id, system);
+            let _ = create_credential_anchor(&env, credential_id, external_id, system);
 
             let count_after = get_anchor_count(&env);
             assert_eq!(count_after, 1, "Count should increment");
