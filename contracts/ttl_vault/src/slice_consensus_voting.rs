@@ -82,19 +82,14 @@ pub enum ProposalStatus {
 #[derive(Clone, Debug, PartialEq)]
 pub enum SliceModification {
     /// Update slice metadata (e.g., description or tags).
-    /// Tag allows categorizing slice modifications.
-    UpdateMetadata {
-        tag: u32,
-    },
+    /// Contains tag u32 for categorizing slice modifications.
+    UpdateMetadata(u32),
     /// Update slice rules by rule IDs (composition validation rules).
-    UpdateRules {
-        rule_ids_len: u32,
-    },
+    /// Contains rule_ids_len u32 (count of rule IDs).
+    UpdateRules(u32),
     /// Update slice weights based on performance metrics.
-    /// attestor_addresses_len: count of attestors being reweighted
-    ReweightAttestors {
-        attestor_addresses_len: u32,
-    },
+    /// Contains attestor_addresses_len u32 (count of attestors being reweighted).
+    ReweightAttestors(u32),
 }
 
 /// A modification proposal for a slice.
@@ -210,57 +205,23 @@ fn is_registered_attestor(env: &Env, address: &Address) -> bool {
 /// Try to parse proposed_changes bytes into a SliceModification.
 /// Returns Some(modification) if parsing succeeds, None otherwise.
 fn parse_slice_modification(bytes: &Bytes) -> Option<SliceModification> {
-    if bytes.is_empty() {
+    if bytes.len() < 5 {
         return None;
     }
 
     let first_byte = bytes.get(0).unwrap_or(255);
+    let value_bytes = [
+        bytes.get(1).unwrap_or(0),
+        bytes.get(2).unwrap_or(0),
+        bytes.get(3).unwrap_or(0),
+        bytes.get(4).unwrap_or(0),
+    ];
+    let value = u32::from_be_bytes(value_bytes);
 
     match first_byte {
-        0 => {
-            // UpdateMetadata: next 4 bytes are tag (u32)
-            if bytes.len() < 5 {
-                return None;
-            }
-            let tag_bytes = [
-                bytes.get(1).unwrap_or(0),
-                bytes.get(2).unwrap_or(0),
-                bytes.get(3).unwrap_or(0),
-                bytes.get(4).unwrap_or(0),
-            ];
-            let tag = u32::from_be_bytes(tag_bytes);
-            Some(SliceModification::UpdateMetadata { tag })
-        }
-        1 => {
-            // UpdateRules: next 4 bytes are rule_ids_len (u32)
-            if bytes.len() < 5 {
-                return None;
-            }
-            let len_bytes = [
-                bytes.get(1).unwrap_or(0),
-                bytes.get(2).unwrap_or(0),
-                bytes.get(3).unwrap_or(0),
-                bytes.get(4).unwrap_or(0),
-            ];
-            let rule_ids_len = u32::from_be_bytes(len_bytes);
-            Some(SliceModification::UpdateRules { rule_ids_len })
-        }
-        2 => {
-            // ReweightAttestors: next 4 bytes are attestor_addresses_len (u32)
-            if bytes.len() < 5 {
-                return None;
-            }
-            let len_bytes = [
-                bytes.get(1).unwrap_or(0),
-                bytes.get(2).unwrap_or(0),
-                bytes.get(3).unwrap_or(0),
-                bytes.get(4).unwrap_or(0),
-            ];
-            let attestor_addresses_len = u32::from_be_bytes(len_bytes);
-            Some(SliceModification::ReweightAttestors {
-                attestor_addresses_len,
-            })
-        }
+        0 => Some(SliceModification::UpdateMetadata(value)),
+        1 => Some(SliceModification::UpdateRules(value)),
+        2 => Some(SliceModification::ReweightAttestors(value)),
         _ => None,
     }
 }
@@ -557,19 +518,17 @@ fn apply_slice_modification(
     modification: &SliceModification,
 ) -> bool {
     match modification {
-        SliceModification::UpdateMetadata { tag: _ } => {
+        SliceModification::UpdateMetadata(_tag) => {
             // Validates the modification type was parsed correctly.
             // Future implementation: apply to slice metadata storage
             true
         }
-        SliceModification::UpdateRules { rule_ids_len: _ } => {
+        SliceModification::UpdateRules(_rule_ids_len) => {
             // Validates the modification type was parsed correctly.
             // Future implementation: parse rule IDs and call composition_rules module
             true
         }
-        SliceModification::ReweightAttestors {
-            attestor_addresses_len: _,
-        } => {
+        SliceModification::ReweightAttestors(_attestor_addresses_len) => {
             // Validates the modification type was parsed correctly.
             // Future implementation: parse weights and call slice_performance module
             true
@@ -863,7 +822,7 @@ mod tests {
 
         let modification = parse_slice_modification(&bytes).unwrap();
         match modification {
-            SliceModification::UpdateMetadata { tag } => {
+            SliceModification::UpdateMetadata(tag) => {
                 assert_eq!(tag, 123u32);
             }
             _ => panic!("Wrong modification type"),
@@ -882,7 +841,7 @@ mod tests {
 
         let modification = parse_slice_modification(&bytes).unwrap();
         match modification {
-            SliceModification::UpdateRules { rule_ids_len } => {
+            SliceModification::UpdateRules(rule_ids_len) => {
                 assert_eq!(rule_ids_len, 5u32);
             }
             _ => panic!("Wrong modification type"),
@@ -901,9 +860,7 @@ mod tests {
 
         let modification = parse_slice_modification(&bytes).unwrap();
         match modification {
-            SliceModification::ReweightAttestors {
-                attestor_addresses_len,
-            } => {
+            SliceModification::ReweightAttestors(attestor_addresses_len) => {
                 assert_eq!(attestor_addresses_len, 3u32);
             }
             _ => panic!("Wrong modification type"),

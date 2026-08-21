@@ -14764,6 +14764,7 @@ impl TtlVaultContract {
     /// * `env` - The Soroban environment
     /// * `vault_id` - The vault ID (for authorization)
     /// * `slice_id` - The slice being modified
+    /// * `proposer` - The address proposing the modification (must be vault owner)
     /// * `proposed_changes` - Serialized `SliceModification` describing the change
     ///
     /// # Returns
@@ -14772,16 +14773,17 @@ impl TtlVaultContract {
         env: Env,
         vault_id: u64,
         slice_id: u64,
+        proposer: Address,
         proposed_changes: Bytes,
     ) -> u64 {
-        let owner = Self::load_vault_owner(&env, vault_id);
-        owner.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        vault.owner.require_auth();
 
         slice_consensus_voting::propose_slice_modification(
             &env,
             slice_id,
             proposed_changes,
-            owner,
+            proposer,
         )
     }
 
@@ -14794,6 +14796,7 @@ impl TtlVaultContract {
     /// * `env` - The Soroban environment
     /// * `slice_id` - The slice being modified
     /// * `proposal_id` - The proposal ID to vote on
+    /// * `voter` - The address voting (must be a registered attestor)
     /// * `approve` - true to approve, false to reject
     ///
     /// # Returns
@@ -14803,9 +14806,10 @@ impl TtlVaultContract {
         env: Env,
         slice_id: u64,
         proposal_id: u64,
+        voter: Address,
         approve: bool,
     ) -> bool {
-        let voter = env.invoker();
+        voter.require_auth();
         slice_consensus_voting::vote_on_modification(&env, slice_id, proposal_id, voter, approve)
     }
 
@@ -14836,6 +14840,7 @@ impl TtlVaultContract {
     /// # Arguments
     /// * `env` - The Soroban environment
     /// * `vault_id` - The vault ID (for authorization)
+    /// * `executor` - The address executing the modification (must be vault owner)
     /// * `slice_id` - The slice being modified
     /// * `proposal_id` - The proposal ID to execute
     ///
@@ -14844,11 +14849,12 @@ impl TtlVaultContract {
     pub fn execute_slice_modification(
         env: Env,
         vault_id: u64,
+        executor: Address,
         slice_id: u64,
         proposal_id: u64,
     ) -> bool {
-        let owner = Self::load_vault_owner(&env, vault_id);
-        owner.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        vault.owner.require_auth();
 
         slice_consensus_voting::execute_slice_modification(&env, slice_id, proposal_id)
     }
