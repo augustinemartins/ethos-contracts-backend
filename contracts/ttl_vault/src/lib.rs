@@ -14752,4 +14752,180 @@ impl TtlVaultContract {
     pub fn get_slice_rule_ids(env: Env, slice_id: u64) -> Vec<u64> {
         composition_rules::get_slice_rules(&env, slice_id)
     }
+
+    // --- Slice Consensus Voting (Issue #266) ---
+
+    /// Propose a slice modification requiring attestor consensus approval.
+    ///
+    /// Only the owner of the vault can propose modifications.
+    /// Returns the proposal ID if successful.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - The vault ID (for authorization)
+    /// * `slice_id` - The slice being modified
+    /// * `proposed_changes` - Serialized `SliceModification` describing the change
+    ///
+    /// # Returns
+    /// The proposal ID if successful, 0 if the proposal could not be created.
+    pub fn propose_slice_modification(
+        env: Env,
+        vault_id: u64,
+        slice_id: u64,
+        proposed_changes: Bytes,
+    ) -> u64 {
+        let owner = Self::load_vault_owner(&env, vault_id);
+        owner.require_auth();
+
+        slice_consensus_voting::propose_slice_modification(
+            &env,
+            slice_id,
+            proposed_changes,
+            owner,
+        )
+    }
+
+    /// Cast a vote on a slice modification proposal.
+    ///
+    /// Only registered attestors can vote. Each attestor votes once.
+    /// Returns true if the vote was recorded successfully.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `slice_id` - The slice being modified
+    /// * `proposal_id` - The proposal ID to vote on
+    /// * `approve` - true to approve, false to reject
+    ///
+    /// # Returns
+    /// true if the vote was recorded, false if the voter is not an attestor,
+    /// already voted, or the proposal is not in voting phase.
+    pub fn cast_attestor_vote(
+        env: Env,
+        slice_id: u64,
+        proposal_id: u64,
+        approve: bool,
+    ) -> bool {
+        let voter = env.invoker();
+        slice_consensus_voting::vote_on_modification(&env, slice_id, proposal_id, voter, approve)
+    }
+
+    /// Finalize voting on a slice modification proposal.
+    ///
+    /// Called after the voting deadline to tally votes and set the proposal status.
+    /// Proposals are approved if >= 50% of attestors voted in favor.
+    /// Returns true if the proposal was resolved, false if already resolved.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `slice_id` - The slice being modified
+    /// * `proposal_id` - The proposal ID to finalize
+    ///
+    /// # Returns
+    /// true if the proposal was resolved, false if already resolved or invalid.
+    pub fn resolve_slice_voting(env: Env, slice_id: u64, proposal_id: u64) -> bool {
+        slice_consensus_voting::resolve_modification_voting(&env, slice_id, proposal_id)
+    }
+
+    /// Execute an approved slice modification.
+    ///
+    /// Only callable after voting is finalized and the proposal is approved.
+    /// Applies the modification to slice state and records it in history.
+    /// Returns true if execution was successful, false if proposal is not approved
+    /// or already executed.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - The vault ID (for authorization)
+    /// * `slice_id` - The slice being modified
+    /// * `proposal_id` - The proposal ID to execute
+    ///
+    /// # Returns
+    /// true if the modification was executed successfully, false otherwise.
+    pub fn execute_slice_modification(
+        env: Env,
+        vault_id: u64,
+        slice_id: u64,
+        proposal_id: u64,
+    ) -> bool {
+        let owner = Self::load_vault_owner(&env, vault_id);
+        owner.require_auth();
+
+        slice_consensus_voting::execute_slice_modification(&env, slice_id, proposal_id)
+    }
+
+    /// Get a slice modification proposal.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `slice_id` - The slice ID
+    /// * `proposal_id` - The proposal ID
+    ///
+    /// # Returns
+    /// The proposal if found, None otherwise.
+    pub fn get_slice_proposal(
+        env: Env,
+        slice_id: u64,
+        proposal_id: u64,
+    ) -> Option<slice_consensus_voting::ModificationProposal> {
+        slice_consensus_voting::get_modification_proposal(&env, slice_id, proposal_id)
+    }
+
+    /// Get the modification history for a slice.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `slice_id` - The slice ID
+    ///
+    /// # Returns
+    /// A vector of executed modifications for this slice.
+    pub fn get_slice_modification_history(
+        env: Env,
+        slice_id: u64,
+    ) -> Vec<slice_consensus_voting::ModificationRecord> {
+        slice_consensus_voting::get_modification_history(&env, slice_id)
+    }
+
+    /// Get the current vote counts for a proposal.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `slice_id` - The slice ID
+    /// * `proposal_id` - The proposal ID
+    ///
+    /// # Returns
+    /// A tuple of (approve_count, reject_count) if the proposal exists, None otherwise.
+    pub fn get_slice_proposal_votes(
+        env: Env,
+        slice_id: u64,
+        proposal_id: u64,
+    ) -> Option<(u32, u32)> {
+        slice_consensus_voting::get_proposal_votes(&env, slice_id, proposal_id)
+    }
+
+    /// Register the list of attestors eligible to vote on slice modifications.
+    ///
+    /// Only the admin can call this function.
+    /// This list is used to determine quorum requirements for voting.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `attestors` - Vector of attestor addresses
+    ///
+    /// # Panics
+    /// Panics if the caller is not the admin
+    pub fn register_slice_attestors(env: Env, attestors: Vec<Address>) {
+        Self::require_admin(&env);
+        slice_consensus_voting::register_attestor_registry(&env, attestors);
+    }
+
+    /// Get the list of registered attestors for slice voting.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    ///
+    /// # Returns
+    /// Vector of registered attestor addresses.
+    pub fn get_slice_attestors(env: Env) -> Vec<Address> {
+        slice_consensus_voting::get_attestor_registry(&env)
+    }
 }
