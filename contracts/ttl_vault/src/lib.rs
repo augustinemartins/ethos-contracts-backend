@@ -19,6 +19,7 @@ pub mod ranking;
 pub mod slice_attribute_matching;
 pub mod slice_consensus_voting;
 pub mod slice_cost_tracking;
+pub mod slice_failover;
 pub mod slice_performance;
 pub mod template_inheritance;
 mod types;
@@ -130,6 +131,8 @@ mod passkey_escrow_tests;
 mod passkey_expiry_notification_tests;
 #[cfg(test)]
 mod regression_tests;
+#[cfg(test)]
+mod slice_failover_tests;
 #[cfg(test)]
 mod slice_performance_tests;
 
@@ -14751,5 +14754,139 @@ impl TtlVaultContract {
     /// Retrieve the rule IDs associated with `slice_id`.
     pub fn get_slice_rule_ids(env: Env, slice_id: u64) -> Vec<u64> {
         composition_rules::get_slice_rules(&env, slice_id)
+    }
+
+    // ── Issue #35: Slice Failover Mechanism ───────────────────────────────────
+
+    /// Register a backup slice for a primary slice.
+    ///
+    /// When `primary_slice_id` accumulates at least `failure_threshold`
+    /// recorded failures, the contract will automatically promote
+    /// `backup_slice_id` as the active slice.
+    ///
+    /// Only the vault owner may register a backup slice.
+    ///
+    /// Returns `backup_slice_id` on success.
+    pub fn register_backup_slice(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        primary_slice_id: u64,
+        backup_slice_id: u64,
+        failure_threshold: u32,
+    ) -> Result<u64, ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        Ok(slice_failover::register_backup_slice(
+            &env,
+            primary_slice_id,
+            backup_slice_id,
+            failure_threshold,
+        ))
+    }
+
+    /// Return the ordered list of backup slice IDs registered for `primary_slice_id`.
+    pub fn get_backup_slices(env: Env, primary_slice_id: u64) -> Vec<u64> {
+        slice_failover::get_backup_slices(&env, primary_slice_id)
+    }
+
+    /// Record a failure event against `primary_slice_id`.
+    ///
+    /// If the accumulated failure count reaches the configured threshold,
+    /// failover to the first registered backup slice is activated automatically.
+    ///
+    /// Only the vault owner may record a slice failure.
+    ///
+    /// Returns `true` when failover was activated as a result of this call.
+    pub fn record_slice_failure(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        primary_slice_id: u64,
+        reason: slice_failover::FailoverReason,
+    ) -> Result<bool, ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        Ok(slice_failover::record_slice_failure(
+            &env,
+            primary_slice_id,
+            reason,
+        ))
+    }
+
+    /// Explicitly activate failover from `primary_slice_id` to `backup_slice_id`.
+    ///
+    /// Use this when you need to force-promote a backup without waiting for the
+    /// automatic failure-threshold trigger.
+    ///
+    /// Only the vault owner may activate failover.
+    ///
+    /// Returns `true` if failover was activated; `false` if it was already active
+    /// or no matching config exists.
+    pub fn activate_failover(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        primary_slice_id: u64,
+        backup_slice_id: u64,
+        reason: slice_failover::FailoverReason,
+    ) -> Result<bool, ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        Ok(slice_failover::activate_failover(
+            &env,
+            primary_slice_id,
+            backup_slice_id,
+            reason,
+        ))
+    }
+
+    /// Revert an active failover and restore `primary_slice_id` as the active slice.
+    ///
+    /// Also resets the failure counter so the primary can receive fresh traffic.
+    ///
+    /// Only the vault owner may revert failover.
+    ///
+    /// Returns `true` if the failover was reverted; `false` if it was not active
+    /// or no matching config exists.
+    pub fn revert_failover(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        primary_slice_id: u64,
+        backup_slice_id: u64,
+    ) -> Result<bool, ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        Ok(slice_failover::revert_failover(
+            &env,
+            primary_slice_id,
+            backup_slice_id,
+        ))
+    }
+
+    /// Return the currently active slice ID for `slice_id`.
+    ///
+    /// Returns `slice_id` itself when no failover is active (primary is healthy),
+    /// or the backup slice ID when failover has been activated.
+    pub fn get_active_slice(env: Env, slice_id: u64) -> u64 {
+        slice_failover::get_active_slice(&env, slice_id)
+    }
+
+    /// Return the accumulated failure count for `slice_id`.
+    pub fn get_failure_count(env: Env, slice_id: u64) -> u32 {
+        slice_failover::get_failure_count(&env, slice_id)
     }
 }
