@@ -132,6 +132,8 @@ mod passkey_expiry_notification_tests;
 mod regression_tests;
 #[cfg(test)]
 mod slice_performance_tests;
+#[cfg(test)]
+mod withdrawal_escrow_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
@@ -2379,19 +2381,32 @@ impl TtlVaultContract {
     /// * `vault_id` - The vault ID
     /// * `amount` - The amount to hold in escrow
     /// * `beneficiary` - The beneficiary address
+    /// * `caller` - The caller address (must be the vault owner)
     ///
     /// # Returns
     /// `Ok(())` on success
+    ///
+    /// # Errors
+    /// * `ContractError::InvalidAmount` - If amount is not positive
+    /// * `ContractError::VaultNotFound` - If the vault does not exist
+    /// * `ContractError::NotOwner` - If caller is not the vault owner
+    /// * `ContractError::InsufficientBalance` - If vault balance is less than amount
     pub fn create_withdrawal_escrow(
         env: Env,
         vault_id: u64,
         amount: i128,
         beneficiary: Address,
+        caller: Address,
     ) -> Result<(), ContractError> {
         if amount <= 0 {
             return Err(ContractError::InvalidAmount);
         }
+        caller.require_auth();
+
         let vault = Self::try_load_vault(&env, vault_id).ok_or(ContractError::VaultNotFound)?;
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
         if vault.balance < amount {
             return Err(ContractError::InsufficientBalance);
         }
@@ -2426,10 +2441,22 @@ impl TtlVaultContract {
     /// # Arguments
     /// * `env` - The Soroban environment
     /// * `vault_id` - The vault ID
+    /// * `caller` - The caller address (must be the escrow's beneficiary)
     ///
     /// # Returns
     /// `Ok(())` on success
-    pub fn verify_withdrawal_escrow(env: Env, vault_id: u64) -> Result<(), ContractError> {
+    ///
+    /// # Errors
+    /// * `ContractError::VaultNotFound` - If no escrow exists for the vault
+    /// * `ContractError::NotBeneficiary` - If caller is not the escrow's beneficiary
+    /// * `ContractError::InvalidAmount` - If the escrow was already verified
+    pub fn verify_withdrawal_escrow(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+
         let mut vault = Self::load_vault(&env, vault_id);
         let escrow = env
             .storage()
@@ -2437,6 +2464,9 @@ impl TtlVaultContract {
             .get::<DataKey, WithdrawalEscrow>(&DataKey::WithdrawalEscrow(vault_id))
             .ok_or(ContractError::VaultNotFound)?;
 
+        if caller != escrow.beneficiary {
+            return Err(ContractError::NotBeneficiary);
+        }
         if escrow.verified {
             return Err(ContractError::InvalidAmount);
         }
