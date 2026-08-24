@@ -14839,8 +14839,7 @@ impl TtlVaultContract {
     ///
     /// # Arguments
     /// * `env` - The Soroban environment
-    /// * `vault_id` - The vault ID (for authorization)
-    /// * `executor` - The address executing the modification (must be vault owner)
+    /// * `vault_id` - The vault ID (for authorization; the vault owner must execute)
     /// * `slice_id` - The slice being modified
     /// * `proposal_id` - The proposal ID to execute
     ///
@@ -14849,7 +14848,6 @@ impl TtlVaultContract {
     pub fn execute_slice_modification(
         env: Env,
         vault_id: u64,
-        _executor: Address,
         slice_id: u64,
         proposal_id: u64,
     ) -> bool {

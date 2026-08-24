@@ -447,9 +447,8 @@ pub fn execute_slice_modification(env: &Env, slice_id: u64, proposal_id: u64) ->
     }
 
     // Parse the proposed_changes into a concrete SliceModification.
-    let modification = match parse_slice_modification(&proposal.proposed_changes) {
-        Some(m) => m,
-        None => return false,
+    let Some(modification) = parse_slice_modification(&proposal.proposed_changes) else {
+        return false;
     };
 
     // Apply the modification to real slice state.
@@ -512,11 +511,7 @@ pub fn execute_slice_modification(env: &Env, slice_id: u64, proposal_id: u64) ->
 /// Note: Currently returns true for valid modification types. Future implementations
 /// will integrate with actual slice state (e.g., slice_performance.rs, composition_rules.rs)
 /// to apply these changes.
-fn apply_slice_modification(
-    _env: &Env,
-    _slice_id: u64,
-    modification: &SliceModification,
-) -> bool {
+fn apply_slice_modification(_env: &Env, _slice_id: u64, modification: &SliceModification) -> bool {
     match modification {
         SliceModification::UpdateMetadata(_tag) => {
             // Validates the modification type was parsed correctly.
