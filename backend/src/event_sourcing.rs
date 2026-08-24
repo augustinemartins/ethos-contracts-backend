@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::models::{EventType, Vault, VaultEvent, VaultStatus};
 use crate::db::Db;
+use crate::models::{EventType, Vault, VaultEvent, VaultStatus};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -158,8 +158,8 @@ impl EventLog {
 
         // Persist to database first (durably) before adding to in-memory cache.
         if let Some(db) = &self.db {
-            let data_json = serde_json::to_string(&event.data)
-                .map_err(EventSourcingError::Serialization)?;
+            let data_json =
+                serde_json::to_string(&event.data).map_err(EventSourcingError::Serialization)?;
             db.append_event(
                 &vault_id,
                 seq,
@@ -192,11 +192,14 @@ impl EventLog {
                 let timestamp = DateTime::parse_from_rfc3339(&timestamp_str)
                     .ok()
                     .map(|dt| dt.with_timezone(&Utc))
-                    .ok_or_else(|| EventSourcingError::DatabaseError(
-                        format!("invalid timestamp: {}", timestamp_str)
-                    ))?;
-                let data = serde_json::from_str(&data_str)
-                    .map_err(EventSourcingError::Serialization)?;
+                    .ok_or_else(|| {
+                        EventSourcingError::DatabaseError(format!(
+                            "invalid timestamp: {}",
+                            timestamp_str
+                        ))
+                    })?;
+                let data =
+                    serde_json::from_str(&data_str).map_err(EventSourcingError::Serialization)?;
                 let event_type = parse_event_type(&event_type_str)?;
                 result.push(StoredEvent {
                     vault_id: vault_id.to_string(),
@@ -347,18 +350,21 @@ impl SnapshotStore {
     pub fn get(&self, vault_id: &str) -> Result<Option<VaultSnapshot>, EventSourcingError> {
         // If database is configured, load from DB (source of truth)
         if let Some(db) = &self.db {
-            if let Some((snapshot_sequence, taken_at_str, state_str)) =
-                db.get_snapshot(vault_id)
-                    .map_err(|e| EventSourcingError::DatabaseError(e.to_string()))?
+            if let Some((snapshot_sequence, taken_at_str, state_str)) = db
+                .get_snapshot(vault_id)
+                .map_err(|e| EventSourcingError::DatabaseError(e.to_string()))?
             {
                 let taken_at = DateTime::parse_from_rfc3339(&taken_at_str)
                     .ok()
                     .map(|dt| dt.with_timezone(&Utc))
-                    .ok_or_else(|| EventSourcingError::DatabaseError(
-                        format!("invalid timestamp: {}", taken_at_str)
-                    ))?;
-                let state = serde_json::from_str(&state_str)
-                    .map_err(EventSourcingError::Serialization)?;
+                    .ok_or_else(|| {
+                        EventSourcingError::DatabaseError(format!(
+                            "invalid timestamp: {}",
+                            taken_at_str
+                        ))
+                    })?;
+                let state =
+                    serde_json::from_str(&state_str).map_err(EventSourcingError::Serialization)?;
                 return Ok(Some(VaultSnapshot {
                     vault_id: vault_id.to_string(),
                     snapshot_sequence,
@@ -748,11 +754,8 @@ mod tests {
     fn events_persist_to_database_and_survive_restart() {
         // Create a database and log with persistence enabled.
         let db = Arc::new(
-            crate::db::Db::open_with_pool_config(
-                ":memory:",
-                &crate::db::PoolConfig::default(),
-            )
-            .expect("failed to open db"),
+            crate::db::Db::open_with_pool_config(":memory:", &crate::db::PoolConfig::default())
+                .expect("failed to open db"),
         );
         db.migrate().expect("migration failed");
 
@@ -783,11 +786,8 @@ mod tests {
     #[test]
     fn snapshots_persist_to_database_and_survive_restart() {
         let db = Arc::new(
-            crate::db::Db::open_with_pool_config(
-                ":memory:",
-                &crate::db::PoolConfig::default(),
-            )
-            .expect("failed to open db"),
+            crate::db::Db::open_with_pool_config(":memory:", &crate::db::PoolConfig::default())
+                .expect("failed to open db"),
         );
         db.migrate().expect("migration failed");
 
@@ -820,11 +820,8 @@ mod tests {
     #[test]
     fn replay_from_persisted_snapshot_plus_new_events_is_correct() {
         let db = Arc::new(
-            crate::db::Db::open_with_pool_config(
-                ":memory:",
-                &crate::db::PoolConfig::default(),
-            )
-            .expect("failed to open db"),
+            crate::db::Db::open_with_pool_config(":memory:", &crate::db::PoolConfig::default())
+                .expect("failed to open db"),
         );
         db.migrate().expect("migration failed");
 

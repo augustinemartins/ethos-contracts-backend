@@ -2675,7 +2675,14 @@ impl Db {
             INSERT INTO events (vault_id, sequence, event_type, timestamp, data, schema_version)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
             ",
-            rusqlite::params![vault_id, sequence as i64, event_type, timestamp.to_rfc3339(), data, schema_version as i64],
+            rusqlite::params![
+                vault_id,
+                sequence as i64,
+                event_type,
+                timestamp.to_rfc3339(),
+                data,
+                schema_version as i64
+            ],
         )?;
         Ok(())
     }
@@ -2755,11 +2762,7 @@ impl Db {
         )?;
 
         stmt.query_row(rusqlite::params![vault_id], |row| {
-            Ok((
-                row.get::<_, i64>(0)? as u64,
-                row.get(1)?,
-                row.get(2)?,
-            ))
+            Ok((row.get::<_, i64>(0)? as u64, row.get(1)?, row.get(2)?))
         })
         .optional()
     }
