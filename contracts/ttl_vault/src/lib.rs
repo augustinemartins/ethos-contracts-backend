@@ -132,6 +132,8 @@ mod passkey_expiry_notification_tests;
 mod regression_tests;
 #[cfg(test)]
 mod slice_performance_tests;
+#[cfg(test)]
+mod withdrawal_escrow_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
@@ -355,6 +357,11 @@ pub enum ContractError {
     // Issue #37: template inheritance
     TemplateNotFound = 118,
     InheritanceCycleDetected = 119,
+    // Issue #32: credential anchoring to external systems
+    AnchorAlreadyExists = 120,
+    AnchorNotFound = 121,
+    InvalidExternalId = 122,
+    InvalidAnchorSystem = 123,
 }
 
 #[contract]
@@ -2379,19 +2386,32 @@ impl TtlVaultContract {
     /// * `vault_id` - The vault ID
     /// * `amount` - The amount to hold in escrow
     /// * `beneficiary` - The beneficiary address
+    /// * `caller` - The caller address (must be the vault owner)
     ///
     /// # Returns
     /// `Ok(())` on success
+    ///
+    /// # Errors
+    /// * `ContractError::InvalidAmount` - If amount is not positive
+    /// * `ContractError::VaultNotFound` - If the vault does not exist
+    /// * `ContractError::NotOwner` - If caller is not the vault owner
+    /// * `ContractError::InsufficientBalance` - If vault balance is less than amount
     pub fn create_withdrawal_escrow(
         env: Env,
         vault_id: u64,
         amount: i128,
         beneficiary: Address,
+        caller: Address,
     ) -> Result<(), ContractError> {
         if amount <= 0 {
             return Err(ContractError::InvalidAmount);
         }
+        caller.require_auth();
+
         let vault = Self::try_load_vault(&env, vault_id).ok_or(ContractError::VaultNotFound)?;
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
         if vault.balance < amount {
             return Err(ContractError::InsufficientBalance);
         }
@@ -2426,10 +2446,22 @@ impl TtlVaultContract {
     /// # Arguments
     /// * `env` - The Soroban environment
     /// * `vault_id` - The vault ID
+    /// * `caller` - The caller address (must be the escrow's beneficiary)
     ///
     /// # Returns
     /// `Ok(())` on success
-    pub fn verify_withdrawal_escrow(env: Env, vault_id: u64) -> Result<(), ContractError> {
+    ///
+    /// # Errors
+    /// * `ContractError::VaultNotFound` - If no escrow exists for the vault
+    /// * `ContractError::NotBeneficiary` - If caller is not the escrow's beneficiary
+    /// * `ContractError::InvalidAmount` - If the escrow was already verified
+    pub fn verify_withdrawal_escrow(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+
         let mut vault = Self::load_vault(&env, vault_id);
         let escrow = env
             .storage()
@@ -2437,6 +2469,9 @@ impl TtlVaultContract {
             .get::<DataKey, WithdrawalEscrow>(&DataKey::WithdrawalEscrow(vault_id))
             .ok_or(ContractError::VaultNotFound)?;
 
+        if caller != escrow.beneficiary {
+            return Err(ContractError::NotBeneficiary);
+        }
         if escrow.verified {
             return Err(ContractError::InvalidAmount);
         }
@@ -14753,101 +14788,78 @@ impl TtlVaultContract {
         composition_rules::get_slice_rules(&env, slice_id)
     }
 
-    // ── Issue #270: Template Inheritance Cycle Detection ─────────────────────
+    // ── Issue #32: Credential Anchoring to External Systems ───────────────────
 
-    /// Create a new template with optional parent (inheritance).
+    /// Anchor `credential_id` to `external_id` within `system`.
     ///
-    /// If `parent_template_id` is non-zero, this creates an inheriting template
-    /// and performs cycle detection. Panics if creating a child of `parent_template_id`
-    /// would form a cycle or exceed maximum inheritance depth.
+    /// This contract does not track credential ownership, so any caller may
+    /// register an anchor as long as they authorize the call themselves.
     ///
-    /// # Arguments
-    /// * `name` — Template identifier/name
-    /// * `data` — Template configuration data
-    /// * `parent_template_id` — Parent template ID (0 for root templates)
-    /// * `overrides` — Field overrides for inheritance
-    ///
-    /// # Returns
-    /// The assigned `template_id` for this newly created template.
-    ///
-    /// # Panics
-    /// - If parent does not exist (when `parent_template_id` > 0)
-    /// - If creating this child would form a cycle
-    /// - If inheritance depth would exceed MAX_INHERITANCE_DEPTH
-    pub fn create_template(
+    /// # Errors
+    /// * `InvalidExternalId` — `external_id` is empty or exceeds
+    ///   `credential_anchoring::MAX_EXTERNAL_ID_LEN`.
+    /// * `InvalidAnchorSystem` — `system` is empty or exceeds
+    ///   `credential_anchoring::MAX_SYSTEM_LEN`.
+    /// * `AnchorAlreadyExists` — an anchor for `(external_id, system)` already
+    ///   exists; remove it first via `remove_credential_anchor`.
+    pub fn create_credential_anchor(
         env: Env,
-        name: Bytes,
-        data: Bytes,
-        parent_template_id: u64,
-        overrides: Bytes,
-    ) -> u64 {
-        template_inheritance::create_template(&env, name, data, parent_template_id, overrides)
+        caller: Address,
+        credential_id: u64,
+        external_id: Bytes,
+        system: Bytes,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        if external_id.is_empty() || external_id.len() > credential_anchoring::MAX_EXTERNAL_ID_LEN {
+            return Err(ContractError::InvalidExternalId);
+        }
+        if system.is_empty() || system.len() > credential_anchoring::MAX_SYSTEM_LEN {
+            return Err(ContractError::InvalidAnchorSystem);
+        }
+        if credential_anchoring::create_credential_anchor(&env, credential_id, external_id, system)
+        {
+            Ok(())
+        } else {
+            Err(ContractError::AnchorAlreadyExists)
+        }
     }
 
-    /// Create a template that inherits from a parent with field overrides.
-    ///
-    /// Convenience wrapper around `create_template` that looks up the parent
-    /// and derives metadata from it. Still performs full cycle detection.
-    ///
-    /// # Arguments
-    /// * `parent_id` — Template ID of the parent
-    /// * `overrides` — Field overrides for this inherited template
-    ///
-    /// # Returns
-    /// The assigned `template_id` for the new child template.
-    ///
-    /// # Panics
-    /// - If parent template does not exist
-    /// - If creating this child would form a cycle
-    /// - If inheritance depth would exceed MAX_INHERITANCE_DEPTH
-    pub fn create_inherited_template(env: Env, parent_id: u64, overrides: Bytes) -> u64 {
-        template_inheritance::create_inherited_template(&env, parent_id, overrides)
+    /// Look up the credential ID anchored to `(external_id, system)`, if any.
+    /// Read-only; no authorization required.
+    pub fn verify_external_anchor(env: Env, external_id: Bytes, system: Bytes) -> Option<u64> {
+        credential_anchoring::verify_external_anchor(&env, &external_id, &system)
     }
 
-    /// Retrieve a template by ID.
+    /// Remove the anchor for `(external_id, system)` from `credential_id`.
     ///
-    /// Returns the stored template or `None` if not found.
-    pub fn get_template(env: Env, template_id: u64) -> Option<template_inheritance::Template> {
-        template_inheritance::get_template(&env, template_id)
-    }
-
-    /// Resolve a template, applying all ancestor overrides.
-    ///
-    /// Walks the inheritance chain and combines all field overrides into a
-    /// single `ResolvedTemplate`. Results are cached in persistent storage.
-    ///
-    /// Returns `None` if the template does not exist or the chain is broken
-    /// (e.g., a parent was deleted).
-    pub fn resolve_template(
+    /// # Errors
+    /// * `AnchorNotFound` — no anchor exists for `(external_id, system)`.
+    pub fn remove_credential_anchor(
         env: Env,
-        template_id: u64,
-    ) -> Option<template_inheritance::ResolvedTemplate> {
-        template_inheritance::resolve_template(&env, template_id)
+        caller: Address,
+        credential_id: u64,
+        external_id: Bytes,
+        system: Bytes,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        if credential_anchoring::remove_credential_anchor(
+            &env,
+            credential_id,
+            &external_id,
+            &system,
+        ) {
+            Ok(())
+        } else {
+            Err(ContractError::AnchorNotFound)
+        }
     }
 
-    /// Check if a potential child→parent relationship would create a cycle.
-    ///
-    /// This is the public entry point for cycle detection. It returns a
-    /// `CycleCheckResult` indicating whether adding this child would create
-    /// a cycle and the path taken.
-    ///
-    /// # Arguments
-    /// * `parent_id` — The parent template ID to inherit from
-    /// * `child_id` — The child template ID being created
-    ///
-    /// Returns a `CycleCheckResult` with `has_cycle` and `cycle_path`.
-    pub fn check_template_inheritance_cycle(
+    /// Retrieve all anchors registered for `credential_id`.
+    /// Read-only; no authorization required.
+    pub fn get_credential_anchors(
         env: Env,
-        parent_id: u64,
-        child_id: u64,
-    ) -> template_inheritance::CycleCheckResult {
-        template_inheritance::check_inheritance_cycle(&env, parent_id, child_id)
-    }
-
-    /// Get the inheritance depth of a template.
-    ///
-    /// Returns the number of ancestor templates in the chain (0 for root).
-    pub fn get_template_inheritance_depth(env: Env, template_id: u64) -> u32 {
-        template_inheritance::get_inheritance_depth(&env, template_id)
+        credential_id: u64,
+    ) -> Vec<credential_anchoring::CredentialAnchor> {
+        credential_anchoring::get_credential_anchors(&env, credential_id)
     }
 }
