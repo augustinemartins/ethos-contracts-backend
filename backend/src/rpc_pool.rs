@@ -321,10 +321,7 @@ mod tests {
     fn test_pool_metrics_initial_zero() {
         let cfg = RpcPoolConfig::default();
         let pool = RpcPool::new(&cfg).unwrap();
-        assert_eq!(
-            pool.metrics.requests_total.load(Ordering::Relaxed),
-            0
-        );
+        assert_eq!(pool.metrics.requests_total.load(Ordering::Relaxed), 0);
         assert_eq!(pool.metrics.errors_total.load(Ordering::Relaxed), 0);
     }
 
@@ -335,9 +332,6 @@ mod tests {
         // Should return Ok(true) without making any network call.
         let result = pool.health_check().await.unwrap();
         assert!(result);
-        assert_eq!(
-            pool.metrics.health_checks_total.load(Ordering::Relaxed),
-            1
-        );
+        assert_eq!(pool.metrics.health_checks_total.load(Ordering::Relaxed), 1);
     }
 }

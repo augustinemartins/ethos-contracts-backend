@@ -3,7 +3,8 @@
 //! Features are built directly on `main` behind flags instead of long-lived
 //! branches. This module provides:
 //!
-//! - Flag storage (in-memory, versioned on every mutation)
+//! - Flag storage (SQL-backed via [`crate::db::Db`], shared across all
+//!   instances, durable across restarts)
 //! - Flag evaluation (global on/off + percentage-based gradual rollout)
 //! - `POST /admin/flags` to create/update a flag
 //! - `GET /admin/flags` to list all flags
@@ -20,11 +21,11 @@
 //!
 //! # Versioning
 //!
-//! Every update to a flag increments its `version` and appends the previous
-//! state to `history`, so changes can be audited or rolled back.
+//! Every update to a flag increments its `version` and writes the previous
+//! state to the `feature_flag_history` SQL table, so changes can be audited
+//! or rolled back across process restarts and load-balanced instances.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use axum::{
     extract::{Path, State},
@@ -34,7 +35,9 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// A single historical snapshot of a flag, recorded before an update.
+use crate::db::Db;
+
+/// A single historical snapshot of a flag, recorded before each update.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlagVersionSnapshot {
     pub version: u32,
@@ -56,6 +59,8 @@ pub struct FeatureFlag {
     pub version: u32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Ordered list of prior states (oldest first), loaded from
+    /// `feature_flag_history` on every read.
     pub history: Vec<FlagVersionSnapshot>,
 }
 
@@ -91,30 +96,25 @@ pub struct FlagEvaluation {
     pub flag_version: u32,
 }
 
-pub type FlagStore = Arc<Mutex<HashMap<String, FeatureFlag>>>;
-
-pub fn create_flag_store() -> FlagStore {
-    Arc::new(Mutex::new(HashMap::new()))
-}
-
+/// Shared handle to the SQL-backed flag store.
+///
+/// All HTTP handlers receive an `Arc<FlagState>` extracted from [`AppState`]
+/// via the [`axum::extract::FromRef`] impl in `db.rs`.  Because every
+/// operation goes through `self.db` (a shared [`Arc<Db>`]), any update made
+/// on one instance is immediately visible to all other instances that share
+/// the same database file.
 #[derive(Clone)]
 pub struct FlagState {
-    pub store: FlagStore,
+    pub db: Arc<Db>,
 }
 
 impl FlagState {
-    pub fn new() -> Self {
-        Self {
-            store: create_flag_store(),
-        }
+    pub fn new(db: Arc<Db>) -> Self {
+        Self { db }
     }
 }
 
-impl Default for FlagState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// ── Evaluation logic (unchanged from original) ────────────────────────────────
 
 /// Deterministically hash `(key, subject_id)` into a bucket in `[0, 100)`.
 ///
@@ -135,6 +135,9 @@ fn bucket_for(key: &str, subject_id: &str) -> u8 {
 }
 
 /// Evaluate whether `flag` is enabled for `subject_id`.
+///
+/// The hashing/bucketing logic is identical to the original in-memory
+/// implementation — only the storage backing has changed.
 pub fn evaluate_flag(flag: &FeatureFlag, subject_id: &str) -> FlagEvaluation {
     let enabled = if !flag.enabled {
         false
@@ -163,6 +166,8 @@ pub fn evaluate_flag(flag: &FeatureFlag, subject_id: &str) -> FlagEvaluation {
     }
 }
 
+// ── HTTP handlers ─────────────────────────────────────────────────────────────
+
 /// `POST /admin/flags` — create or update a feature flag.
 pub async fn upsert_flag(
     State(state): State<Arc<FlagState>>,
@@ -181,48 +186,28 @@ pub async fn upsert_flag(
         ));
     }
 
-    let mut store = state.store.lock().unwrap();
-    let now = Utc::now();
-
-    let flag = match store.get_mut(&body.key) {
-        Some(existing) => {
-            existing.history.push(FlagVersionSnapshot {
-                version: existing.version,
-                enabled: existing.enabled,
-                rollout_percentage: existing.rollout_percentage,
-                updated_at: existing.updated_at,
-                updated_by: body.updated_by.clone(),
-            });
-            existing.description = body.description.or_else(|| existing.description.clone());
-            existing.enabled = body.enabled;
-            existing.rollout_percentage = body.rollout_percentage;
-            existing.version += 1;
-            existing.updated_at = now;
-            existing.clone()
-        }
-        None => {
-            let flag = FeatureFlag {
-                key: body.key.clone(),
-                description: body.description,
-                enabled: body.enabled,
-                rollout_percentage: body.rollout_percentage,
-                version: 1,
-                created_at: now,
-                updated_at: now,
-                history: Vec::new(),
-            };
-            store.insert(body.key.clone(), flag.clone());
-            flag
-        }
-    };
-
-    Ok((StatusCode::OK, Json(flag)))
+    state
+        .db
+        .upsert_feature_flag(&body)
+        .map(|flag| (StatusCode::OK, Json(flag)))
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+        })
 }
 
 /// `GET /admin/flags` — list all flags.
-pub async fn list_flags(State(state): State<Arc<FlagState>>) -> Json<Vec<FeatureFlag>> {
-    let store = state.store.lock().unwrap();
-    Json(store.values().cloned().collect())
+pub async fn list_flags(
+    State(state): State<Arc<FlagState>>,
+) -> Result<Json<Vec<FeatureFlag>>, (StatusCode, Json<serde_json::Value>)> {
+    state.db.list_feature_flags().map(Json).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+    })
 }
 
 /// `GET /admin/flags/:key` — fetch a single flag.
@@ -230,12 +215,11 @@ pub async fn get_flag(
     State(state): State<Arc<FlagState>>,
     Path(key): Path<String>,
 ) -> Result<Json<FeatureFlag>, StatusCode> {
-    let store = state.store.lock().unwrap();
-    store
-        .get(&key)
-        .cloned()
-        .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+    match state.db.get_feature_flag(&key) {
+        Ok(Some(flag)) => Ok(Json(flag)),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
 }
 
 /// `POST /admin/flags/:key/evaluate` — evaluate a flag for a subject.
@@ -244,9 +228,11 @@ pub async fn evaluate_flag_handler(
     Path(key): Path<String>,
     Json(body): Json<EvaluateFlagRequest>,
 ) -> Result<Json<FlagEvaluation>, StatusCode> {
-    let store = state.store.lock().unwrap();
-    let flag = store.get(&key).ok_or(StatusCode::NOT_FOUND)?;
-    Ok(Json(evaluate_flag(flag, &body.subject_id)))
+    match state.db.get_feature_flag(&key) {
+        Ok(Some(flag)) => Ok(Json(evaluate_flag(&flag, &body.subject_id))),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
 }
 
 #[cfg(test)]
@@ -296,5 +282,183 @@ mod tests {
         let first = evaluate_flag(&flag, "user-42");
         let second = evaluate_flag(&flag, "user-42");
         assert_eq!(first.enabled, second.enabled);
+    }
+
+    // ── SQL-backed storage (#274) ──────────────────────────────────────────────
+
+    use crate::db::Db as TestDb;
+    use std::sync::Arc as TestArc;
+
+    fn temp_db_path(tag: &str) -> String {
+        std::env::temp_dir()
+            .join(format!(
+                "ethos_flags_{tag}_{}.sqlite3",
+                uuid::Uuid::new_v4()
+            ))
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn upsert_req(key: &str, enabled: bool, rollout: u8) -> UpsertFlagRequest {
+        UpsertFlagRequest {
+            key: key.to_string(),
+            description: Some(format!("flag {key}")),
+            enabled,
+            rollout_percentage: rollout,
+            updated_by: Some("tester".to_string()),
+        }
+    }
+
+    /// Regression: create/update/list/fetch behave the same as the original
+    /// in-memory store from a caller's perspective.
+    #[test]
+    fn sql_store_matches_previous_single_instance_behavior() {
+        let path = temp_db_path("regression");
+        let db = TestDb::open(&path).unwrap();
+        db.migrate().unwrap();
+
+        // Unknown key fetches as None (was: not found).
+        assert!(db.get_feature_flag("nope").unwrap().is_none());
+        assert!(db.list_feature_flags().unwrap().is_empty());
+
+        // Create → version 1, empty history.
+        let created = db
+            .upsert_feature_flag(&upsert_req("new-checkout", true, 25))
+            .unwrap();
+        assert_eq!(created.version, 1);
+        assert!(created.history.is_empty());
+        assert_eq!(created.rollout_percentage, 25);
+        assert!(created.enabled);
+
+        // Update → version 2, previous state snapshotted into history.
+        let updated = db
+            .upsert_feature_flag(&upsert_req("new-checkout", true, 50))
+            .unwrap();
+        assert_eq!(updated.version, 2);
+        assert_eq!(updated.created_at, created.created_at);
+        assert!(updated.updated_at >= created.updated_at);
+        assert_eq!(updated.history.len(), 1);
+        let snapshot = &updated.history[0];
+        assert_eq!(snapshot.version, 1);
+        assert_eq!(snapshot.rollout_percentage, 25);
+        assert!(snapshot.enabled);
+        assert_eq!(snapshot.updated_by.as_deref(), Some("tester"));
+
+        // Description omitted on update keeps the previous one.
+        let mut req = upsert_req("new-checkout", false, 0);
+        req.description = None;
+        let kept = db.upsert_feature_flag(&req).unwrap();
+        assert_eq!(kept.version, 3);
+        assert_eq!(kept.description.as_deref(), Some("flag new-checkout"));
+
+        // List returns every flag; get-by-key matches list contents.
+        db.upsert_feature_flag(&upsert_req("beta-ui", true, 100))
+            .unwrap();
+        let flags = db.list_feature_flags().unwrap();
+        let keys: Vec<&str> = flags.iter().map(|f| f.key.as_str()).collect();
+        assert_eq!(keys, vec!["beta-ui", "new-checkout"]);
+        for flag in &flags {
+            assert_eq!(
+                db.get_feature_flag(&flag.key).unwrap().unwrap().version,
+                flag.version
+            );
+            // History is loaded on every read, oldest first.
+            assert_eq!(
+                db.get_feature_flag(&flag.key)
+                    .unwrap()
+                    .unwrap()
+                    .history
+                    .len(),
+                flag.history.len()
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Two independent `Db`/`FlagState` handles against the same backing
+    /// store must both observe an update made through either handle.
+    #[test]
+    fn update_visible_across_independent_handles() {
+        let path = temp_db_path("multi");
+
+        // Simulate two instances behind a load balancer sharing one database.
+        let state_a = FlagState::new(TestArc::new(TestDb::open(&path).unwrap()));
+        state_a.db.migrate().unwrap();
+        let state_b = FlagState::new(TestArc::new(TestDb::open(&path).unwrap()));
+        state_b.db.migrate().unwrap();
+
+        // Instance A creates the flag…
+        state_a
+            .db
+            .upsert_feature_flag(&upsert_req("gradual-rollout", true, 10))
+            .unwrap();
+
+        // …and instance B immediately sees it, including via evaluation.
+        let seen_by_b = state_b.db.get_feature_flag("gradual-rollout").unwrap();
+        assert!(seen_by_b.is_some());
+        let eval_b = evaluate_flag(&seen_by_b.unwrap(), "user-7");
+        assert_eq!(eval_b.flag_version, 1);
+
+        // Instance B updates it…
+        let updated = state_b
+            .db
+            .upsert_feature_flag(&upsert_req("gradual-rollout", true, 90))
+            .unwrap();
+        assert_eq!(updated.version, 2);
+
+        // …and instance A observes B's new version and history.
+        let seen_by_a = state_a
+            .db
+            .get_feature_flag("gradual-rollout")
+            .unwrap()
+            .unwrap();
+        assert_eq!(seen_by_a.version, 2);
+        assert_eq!(seen_by_a.rollout_percentage, 90);
+        assert_eq!(seen_by_a.history.len(), 1);
+        assert_eq!(state_a.db.list_feature_flags().unwrap().len(), 1);
+
+        // A subject's evaluation on either instance agrees at the same version.
+        let eval_a = evaluate_flag(&seen_by_a, "user-7");
+        assert_eq!(eval_a.flag_version, eval_b.flag_version + 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Flag state and version history must survive a process restart
+    /// (drop every handle, then re-open the backing store).
+    #[test]
+    fn flag_state_and_history_survive_restart() {
+        let path = temp_db_path("restart");
+        {
+            let db = TestDb::open(&path).unwrap();
+            db.migrate().unwrap();
+            db.upsert_feature_flag(&upsert_req("durable-flag", true, 5))
+                .unwrap();
+            db.upsert_feature_flag(&upsert_req("durable-flag", true, 40))
+                .unwrap();
+            db.upsert_feature_flag(&upsert_req("durable-flag", true, 80))
+                .unwrap();
+        }
+
+        // Re-open against the same file, simulating a restart.
+        let db = TestDb::open(&path).unwrap();
+        db.migrate().unwrap();
+        let flag = db
+            .get_feature_flag("durable-flag")
+            .expect("read after restart")
+            .expect("flag should survive restart");
+        assert_eq!(flag.version, 3);
+        assert_eq!(flag.rollout_percentage, 80);
+        assert_eq!(flag.history.len(), 2);
+        let versions: Vec<u32> = flag.history.iter().map(|h| h.version).collect();
+        assert_eq!(versions, vec![1, 2]);
+        let rollouts: Vec<u8> = flag.history.iter().map(|h| h.rollout_percentage).collect();
+        assert_eq!(rollouts, vec![5, 40]);
+        // Evaluation still works identically after the restart.
+        assert_eq!(evaluate_flag(&flag, "user-1").flag_version, 3);
+
+        let _ = std::fs::remove_file(&path);
     }
 }

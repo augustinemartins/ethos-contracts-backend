@@ -155,7 +155,7 @@ impl EnrichedError {
     pub fn new(error: AppError, context: ErrorContext) -> Self {
         let (status, code) = classify(&error);
         Self {
-            code: code.to_string(),
+            code,
             message: error.to_string(),
             context,
             status,
@@ -163,15 +163,26 @@ impl EnrichedError {
     }
 }
 
-fn classify(error: &AppError) -> (StatusCode, &'static str) {
+fn classify(error: &AppError) -> (StatusCode, String) {
     match error {
-        AppError::NotFound => (StatusCode::NOT_FOUND, "not_found"),
-        AppError::InvalidInput(_) => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_input"),
-        AppError::Db(_) | AppError::DatabaseError => {
-            (StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
+        AppError::NotFound => (StatusCode::NOT_FOUND, "not_found".to_string()),
+        AppError::InvalidInput(_) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_input".to_string(),
+        ),
+        AppError::Db(_) | AppError::DatabaseError => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error".to_string(),
+        ),
+        AppError::TwoFactorRequired => {
+            (StatusCode::UNAUTHORIZED, "two_factor_required".to_string())
         }
-        AppError::TwoFactorRequired => (StatusCode::UNAUTHORIZED, "two_factor_required"),
-        AppError::TwoFactorNotEnabled => (StatusCode::BAD_REQUEST, "two_factor_not_enabled"),
+        AppError::TwoFactorNotEnabled => (
+            StatusCode::BAD_REQUEST,
+            "two_factor_not_enabled".to_string(),
+        ),
+        // Wrapped ApiErrors already carry their own status and code.
+        AppError::Api(api) => (api.status(), api.code().to_string()),
     }
 }
 
@@ -209,7 +220,8 @@ pub async fn correlation_id_middleware(mut request: Request, next: Next) -> Resp
 
     request.headers_mut().insert(
         CORRELATION_ID_HEADER,
-        HeaderValue::from_str(&correlation_id).unwrap_or_else(|_| HeaderValue::from_static("invalid")),
+        HeaderValue::from_str(&correlation_id)
+            .unwrap_or_else(|_| HeaderValue::from_static("invalid")),
     );
 
     let mut response = next.run(request).await;

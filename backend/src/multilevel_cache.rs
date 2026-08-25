@@ -7,7 +7,7 @@
 /// Cache coherence between levels is maintained on write (write-through)
 /// and on miss (read-through with promotion).
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::models::{Vault, VaultSummary};

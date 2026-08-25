@@ -113,7 +113,11 @@ pub fn get_log(store: &RequestLogStore, id: &str) -> Option<RequestLog> {
 }
 
 /// List all logs, newest first, with optional path prefix filter.
-pub fn list_logs(store: &RequestLogStore, path_prefix: Option<&str>, limit: usize) -> Vec<RequestLog> {
+pub fn list_logs(
+    store: &RequestLogStore,
+    path_prefix: Option<&str>,
+    limit: usize,
+) -> Vec<RequestLog> {
     let store = store.lock().unwrap();
     let mut logs: Vec<RequestLog> = store
         .iter()
@@ -136,7 +140,10 @@ pub enum ReplayCondition {
     /// Only replay if the path contains this substring.
     PathContains(String),
     /// Only replay if the request body key matches value.
-    BodyKeyEquals { key: String, value: serde_json::Value },
+    BodyKeyEquals {
+        key: String,
+        value: serde_json::Value,
+    },
     /// Always replay (default).
     Always,
 }
@@ -189,7 +196,12 @@ pub fn replay_log_entry(
     let replayed_body = log.response_body.clone();
 
     let (outcome, diff_notes) = if validate {
-        compare_responses(log.response_status, &log.response_body, replayed_status, &replayed_body)
+        compare_responses(
+            log.response_status,
+            &log.response_body,
+            replayed_status,
+            &replayed_body,
+        )
     } else {
         (ReplayOutcome::Unvalidated, vec![])
     };
@@ -226,7 +238,8 @@ fn compare_responses(
     if orig_body != replay_body {
         notes.push("Response body differs from original".into());
         // Surface top-level key differences for objects.
-        if let (Some(orig_obj), Some(replay_obj)) = (orig_body.as_object(), replay_body.as_object()) {
+        if let (Some(orig_obj), Some(replay_obj)) = (orig_body.as_object(), replay_body.as_object())
+        {
             for key in orig_obj.keys() {
                 if orig_obj.get(key) != replay_obj.get(key) {
                     notes.push(format!("  Key '{}' changed", key));
@@ -236,7 +249,10 @@ fn compare_responses(
     }
 
     if notes.is_empty() {
-        (ReplayOutcome::Identical, vec!["Responses are identical".into()])
+        (
+            ReplayOutcome::Identical,
+            vec!["Responses are identical".into()],
+        )
     } else {
         (ReplayOutcome::Diverged, notes)
     }
@@ -285,7 +301,6 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use std::sync::Arc;
 
 use crate::error::AppError;
 
@@ -296,7 +311,9 @@ pub async fn replay_handler(
 ) -> Result<(StatusCode, Json<ReplayResult>), AppError> {
     let log = get_log(&log_store, &body.log_id).ok_or(AppError::NotFound)?;
 
-    let conditions = body.conditions.unwrap_or_else(|| vec![ReplayCondition::Always]);
+    let conditions = body
+        .conditions
+        .unwrap_or_else(|| vec![ReplayCondition::Always]);
     let validate = body.validate.unwrap_or(true);
 
     let result = replay_log_entry(&log, &conditions, validate);
@@ -312,10 +329,14 @@ pub async fn batch_replay_handler(
         return Err(AppError::InvalidInput("log_ids must not be empty".into()));
     }
     if body.log_ids.len() > 50 {
-        return Err(AppError::InvalidInput("Cannot replay more than 50 logs at once".into()));
+        return Err(AppError::InvalidInput(
+            "Cannot replay more than 50 logs at once".into(),
+        ));
     }
 
-    let conditions = body.conditions.unwrap_or_else(|| vec![ReplayCondition::Always]);
+    let conditions = body
+        .conditions
+        .unwrap_or_else(|| vec![ReplayCondition::Always]);
     let validate = body.validate.unwrap_or(true);
 
     let mut results = Vec::new();
@@ -339,14 +360,29 @@ pub async fn batch_replay_handler(
         }
     }
 
-    let identical = results.iter().filter(|r| r.outcome == ReplayOutcome::Identical).count();
-    let diverged  = results.iter().filter(|r| r.outcome == ReplayOutcome::Diverged).count();
-    let skipped   = results.iter().filter(|r| r.outcome == ReplayOutcome::Skipped).count();
+    let identical = results
+        .iter()
+        .filter(|r| r.outcome == ReplayOutcome::Identical)
+        .count();
+    let diverged = results
+        .iter()
+        .filter(|r| r.outcome == ReplayOutcome::Diverged)
+        .count();
+    let skipped = results
+        .iter()
+        .filter(|r| r.outcome == ReplayOutcome::Skipped)
+        .count();
     let total = results.len();
 
     Ok((
         StatusCode::OK,
-        Json(BatchReplayResponse { results, total, identical, diverged, skipped }),
+        Json(BatchReplayResponse {
+            results,
+            total,
+            identical,
+            diverged,
+            skipped,
+        }),
     ))
 }
 
@@ -421,11 +457,7 @@ mod tests {
     #[test]
     fn test_replay_condition_skips_on_mismatch() {
         let log = make_log("POST", "/api/vaults/1/check-in", 404);
-        let result = replay_log_entry(
-            &log,
-            &[ReplayCondition::OriginalStatusEquals(200)],
-            true,
-        );
+        let result = replay_log_entry(&log, &[ReplayCondition::OriginalStatusEquals(200)], true);
         assert_eq!(result.outcome, ReplayOutcome::Skipped);
     }
 
@@ -437,7 +469,11 @@ mod tests {
         assert_eq!(result.outcome, ReplayOutcome::Unvalidated);
 
         // Path contains "deposit" → should skip.
-        let result2 = replay_log_entry(&log, &[ReplayCondition::PathContains("deposit".into())], false);
+        let result2 = replay_log_entry(
+            &log,
+            &[ReplayCondition::PathContains("deposit".into())],
+            false,
+        );
         assert_eq!(result2.outcome, ReplayOutcome::Skipped);
     }
 
@@ -499,6 +535,8 @@ mod tests {
             .collect();
 
         assert_eq!(results.len(), 2);
-        assert!(results.iter().all(|r| r.outcome == ReplayOutcome::Identical));
+        assert!(results
+            .iter()
+            .all(|r| r.outcome == ReplayOutcome::Identical));
     }
 }

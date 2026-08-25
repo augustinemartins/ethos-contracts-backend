@@ -242,11 +242,7 @@ async fn get_retry_policy(
     State(state): State<RetryPolicyState>,
     Path(id): Path<String>,
 ) -> Result<Json<RetryPolicy>, StatusCode> {
-    state
-        .store
-        .get(&id)
-        .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+    state.store.get(&id).map(Json).ok_or(StatusCode::NOT_FOUND)
 }
 
 /// Builds the `/admin/retry-policies` router with its own state; merge it

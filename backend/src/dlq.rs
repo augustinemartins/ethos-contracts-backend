@@ -17,7 +17,11 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use axum::{extract::{Query, State}, http::StatusCode, Json};
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    Json,
+};
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};

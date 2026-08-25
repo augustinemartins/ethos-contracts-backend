@@ -36,17 +36,27 @@ use crate::{
     db::{AppState, Db},
     error::AppError,
     models::{
-        CreateRetentionExceptionRequest, DataRetentionPolicy, PurgeRunResult,
-        RetentionDeletionLog, RetentionException, UpsertRetentionPolicyRequest,
+        CreateRetentionExceptionRequest, DataRetentionPolicy, PurgeRunResult, RetentionDeletionLog,
+        RetentionException, UpsertRetentionPolicyRequest,
     },
 };
 
 /// Maps logical `data_type` names to `(table, id_col, timestamp_col)`.
 const TABLE_MAP: &[(&str, &str, &str, &str)] = &[
-    ("audit_logs",           "audit_logs",            "id",       "timestamp"),
-    ("reminder_preferences", "reminder_preferences",  "vault_id", "deleted_at"),
-    ("idempotency_keys",     "idempotency_keys",      "key",      "created_at"),
-    ("secret_rotation_logs", "secret_rotation_logs",  "id",       "rotated_at"),
+    ("audit_logs", "audit_logs", "id", "timestamp"),
+    (
+        "reminder_preferences",
+        "reminder_preferences",
+        "vault_id",
+        "deleted_at",
+    ),
+    ("idempotency_keys", "idempotency_keys", "key", "created_at"),
+    (
+        "secret_rotation_logs",
+        "secret_rotation_logs",
+        "id",
+        "rotated_at",
+    ),
 ];
 
 fn lookup_table(data_type: &str) -> Option<(&'static str, &'static str, &'static str)> {
@@ -93,12 +103,19 @@ pub async fn upsert_policy(
     if lookup_table(&data_type).is_none() {
         return Err(AppError::InvalidInput(format!(
             "unknown data_type '{data_type}'; supported: {}",
-            TABLE_MAP.iter().map(|(dt, _, _, _)| *dt).collect::<Vec<_>>().join(", ")
+            TABLE_MAP
+                .iter()
+                .map(|(dt, _, _, _)| *dt)
+                .collect::<Vec<_>>()
+                .join(", ")
         )));
     }
 
     let now = Utc::now();
-    let existing = state.db.get_retention_policy(&data_type).map_err(AppError::Db)?;
+    let existing = state
+        .db
+        .get_retention_policy(&data_type)
+        .map_err(AppError::Db)?;
     let created_at = existing.as_ref().map(|p| p.created_at).unwrap_or(now);
 
     let policy = DataRetentionPolicy {
@@ -109,7 +126,10 @@ pub async fn upsert_policy(
         created_at,
         updated_at: now,
     };
-    state.db.upsert_retention_policy(&policy).map_err(AppError::Db)?;
+    state
+        .db
+        .upsert_retention_policy(&policy)
+        .map_err(AppError::Db)?;
 
     let status = if existing.is_some() {
         StatusCode::OK
@@ -159,7 +179,14 @@ pub async fn trigger_purge(
 
     let deleted = state
         .db
-        .purge_by_retention_policy(&data_type, table, id_col, ts_col, policy.retention_days, &actor)
+        .purge_by_retention_policy(
+            &data_type,
+            table,
+            id_col,
+            ts_col,
+            policy.retention_days,
+            &actor,
+        )
         .map_err(AppError::Db)?;
 
     Ok(Json(PurgeRunResult {
@@ -241,7 +268,10 @@ pub async fn add_exception(
         created_at: now,
         created_by: actor,
     };
-    state.db.add_retention_exception(&exc).map_err(AppError::Db)?;
+    state
+        .db
+        .add_retention_exception(&exc)
+        .map_err(AppError::Db)?;
 
     Ok((StatusCode::CREATED, Json(exc)))
 }

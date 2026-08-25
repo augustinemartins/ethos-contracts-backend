@@ -36,6 +36,16 @@ impl ApiError {
         self.context = Some(context);
         self
     }
+
+    /// The HTTP status this error responds with.
+    pub fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    /// The machine-readable error code.
+    pub fn code(&self) -> &str {
+        &self.code
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -59,10 +69,25 @@ pub enum AppError {
     TwoFactorRequired,
     #[error("2FA not enabled")]
     TwoFactorNotEnabled,
+    /// Wraps an [`ApiError`] that already carries its own HTTP status and
+    /// JSON body shape (e.g. from `audit::authorize_admin`); rendered as-is.
+    #[error("{}", .0.message)]
+    Api(ApiError),
+}
+
+impl From<ApiError> for AppError {
+    fn from(value: ApiError) -> Self {
+        // Manual impl (rather than #[from]) because ApiError intentionally
+        // implements IntoResponse but not std::error::Error.
+        AppError::Api(value)
+    }
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
+        if let AppError::Api(api) = self {
+            return api.into_response();
+        }
         let (status, code) = match &self {
             AppError::NotFound => (StatusCode::NOT_FOUND, "not_found"),
             AppError::InvalidInput(_) => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_input"),
@@ -71,6 +96,7 @@ impl IntoResponse for AppError {
             }
             AppError::TwoFactorRequired => (StatusCode::UNAUTHORIZED, "two_factor_required"),
             AppError::TwoFactorNotEnabled => (StatusCode::BAD_REQUEST, "two_factor_not_enabled"),
+            AppError::Api(_) => unreachable!("handled above"),
         };
         ApiError::new(status, code, self.to_string()).into_response()
     }
