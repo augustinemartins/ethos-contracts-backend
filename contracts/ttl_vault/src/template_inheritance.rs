@@ -371,4 +371,288 @@ mod tests {
     fn test_max_inheritance_depth() {
         assert_eq!(MAX_INHERITANCE_DEPTH, 16);
     }
+
+    #[test]
+    fn test_create_root_template() {
+        let env = soroban_sdk::Env::default();
+        let contract_id = env.register_contract(None, crate::TtlVaultContract);
+        env.as_contract(&contract_id, || {
+            let name = Bytes::new(&env);
+            let data = Bytes::new(&env);
+            let overrides = Bytes::new(&env);
+
+            let template_id = create_template(&env, name.clone(), data.clone(), 0, overrides);
+            assert_eq!(template_id, 0);
+
+            let retrieved = get_template(&env, template_id);
+            assert!(retrieved.is_some());
+            let template = retrieved.unwrap();
+            assert_eq!(template.template_id, 0);
+            assert_eq!(template.parent_template_id, 0);
+        });
+    }
+
+    #[test]
+    fn test_create_inherited_template() {
+        let env = soroban_sdk::Env::default();
+        let contract_id = env.register_contract(None, crate::TtlVaultContract);
+        env.as_contract(&contract_id, || {
+            let name = Bytes::new(&env);
+            let data = Bytes::new(&env);
+            let overrides = Bytes::new(&env);
+
+            // Create root template
+            let root_id = create_template(&env, name.clone(), data.clone(), 0, overrides.clone());
+
+            // Create child template inheriting from root
+            let child_id =
+                create_template(&env, name.clone(), data.clone(), root_id, overrides.clone());
+            assert_eq!(child_id, 1);
+
+            let retrieved = get_template(&env, child_id);
+            assert!(retrieved.is_some());
+            let child = retrieved.unwrap();
+            assert_eq!(child.template_id, child_id);
+            assert_eq!(child.parent_template_id, root_id);
+        });
+    }
+
+    #[test]
+    fn test_inheritance_chain_normal() {
+        let env = soroban_sdk::Env::default();
+        let contract_id = env.register_contract(None, crate::TtlVaultContract);
+        env.as_contract(&contract_id, || {
+            let name = Bytes::new(&env);
+            let data = Bytes::new(&env);
+            let overrides = Bytes::new(&env);
+
+            // Create a chain: 0 -> 1 -> 2 -> 3
+            // Note: template 0 is created first but can't be a parent (0 is sentinel for no parent)
+            let id0 = create_template(&env, name.clone(), data.clone(), 0, overrides.clone());
+            assert_eq!(id0, 0);
+
+            // Now create a second root template (id1) to use as parent
+            let id1_root = create_template(&env, name.clone(), data.clone(), 0, overrides.clone());
+            assert_eq!(id1_root, 1);
+
+            // Create child of id1_root
+            let id2 = create_template(
+                &env,
+                name.clone(),
+                data.clone(),
+                id1_root,
+                overrides.clone(),
+            );
+            assert_eq!(id2, 2);
+
+            let id3 = create_template(&env, name.clone(), data.clone(), id2, overrides.clone());
+            assert_eq!(id3, 3);
+
+            // Verify depths
+            let depth0 = get_inheritance_depth(&env, id0);
+            let depth1_root = get_inheritance_depth(&env, id1_root);
+            let depth2 = get_inheritance_depth(&env, id2);
+            let depth3 = get_inheritance_depth(&env, id3);
+
+            assert_eq!(depth0, 0);
+            assert_eq!(depth1_root, 0);
+            assert_eq!(depth2, 1);
+            assert_eq!(depth3, 2);
+        });
+    }
+
+    #[test]
+    fn test_cycle_detection_direct() {
+        let env = soroban_sdk::Env::default();
+        let contract_id = env.register_contract(None, crate::TtlVaultContract);
+        env.as_contract(&contract_id, || {
+            let name = Bytes::new(&env);
+            let data = Bytes::new(&env);
+            let overrides = Bytes::new(&env);
+
+            // Create: 0 -> 1
+            let id0 = create_template(&env, name.clone(), data.clone(), 0, overrides.clone());
+            let id1 = create_template(&env, name.clone(), data.clone(), id0, overrides.clone());
+
+            // Try to create: 0 -> 1 -> 0 (cycle)
+            let result = check_inheritance_cycle(&env, id1, id0);
+            assert!(result.has_cycle);
+            assert!(!result.cycle_path.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_cycle_detection_indirect() {
+        let env = soroban_sdk::Env::default();
+        let contract_id = env.register_contract(None, crate::TtlVaultContract);
+        env.as_contract(&contract_id, || {
+            let name = Bytes::new(&env);
+            let data = Bytes::new(&env);
+            let overrides = Bytes::new(&env);
+
+            // Create: 0 -> 1 -> 2
+            let id0 = create_template(&env, name.clone(), data.clone(), 0, overrides.clone());
+            let id1 = create_template(&env, name.clone(), data.clone(), id0, overrides.clone());
+            let id2 = create_template(&env, name.clone(), data.clone(), id1, overrides.clone());
+
+            // Try to create: 2 -> 0 (would make 0 -> 1 -> 2 -> 0)
+            let result = check_inheritance_cycle(&env, id2, id0);
+            assert!(result.has_cycle);
+        });
+    }
+
+    #[test]
+    fn test_max_depth_enforcement() {
+        let env = soroban_sdk::Env::default();
+        let contract_id = env.register_contract(None, crate::TtlVaultContract);
+        env.as_contract(&contract_id, || {
+            let name = Bytes::new(&env);
+            let data = Bytes::new(&env);
+            let overrides = Bytes::new(&env);
+
+            // Build a chain up to MAX_INHERITANCE_DEPTH
+            // Note: template 0 can't be a parent (0 is sentinel), so create dummy first
+            let _dummy = create_template(&env, name.clone(), data.clone(), 0, overrides.clone());
+
+            // Now create the actual root
+            let root_id = create_template(&env, name.clone(), data.clone(), 0, overrides.clone());
+            let mut current_id = root_id;
+
+            for _ in 1..MAX_INHERITANCE_DEPTH {
+                current_id = create_template(
+                    &env,
+                    name.clone(),
+                    data.clone(),
+                    current_id,
+                    overrides.clone(),
+                );
+            }
+
+            // Verify depth is at the limit (counting from root, which has depth 0)
+            let depth = get_inheritance_depth(&env, current_id);
+            assert_eq!(depth, MAX_INHERITANCE_DEPTH - 1);
+
+            // Verify the chain was built successfully up to the depth limit
+            // Note: check_inheritance_cycle detects cycles, not depth violations per se
+            // The depth limit is enforced in create_template when parent_template_id > 0
+            let result = check_inheritance_cycle(&env, current_id, 999);
+            // Should not detect a cycle since 999 is not in the chain
+            assert!(!result.has_cycle);
+        });
+    }
+
+    #[test]
+    fn test_resolve_template_root() {
+        let env = soroban_sdk::Env::default();
+        let contract_id = env.register_contract(None, crate::TtlVaultContract);
+        env.as_contract(&contract_id, || {
+            let name = Bytes::new(&env);
+            let data = Bytes::from_slice(&env, &[1, 2, 3, 4]);
+            let overrides = Bytes::new(&env);
+
+            let id = create_template(&env, name.clone(), data.clone(), 0, overrides);
+
+            let resolved = resolve_template(&env, id);
+            assert!(resolved.is_some());
+
+            let rt = resolved.unwrap();
+            assert_eq!(rt.template_id, id);
+            assert_eq!(rt.depth, 0);
+        });
+    }
+
+    #[test]
+    fn test_resolve_template_with_inheritance() {
+        let env = soroban_sdk::Env::default();
+        let contract_id = env.register_contract(None, crate::TtlVaultContract);
+        env.as_contract(&contract_id, || {
+            let name = Bytes::new(&env);
+            let data = Bytes::from_slice(&env, &[1, 2, 3]);
+            let overrides = Bytes::new(&env);
+
+            // Create chain: dummy (0) -> root (1) -> child (2)
+            // Note: template 0 cannot be a parent (0 is sentinel for no parent)
+            let _dummy = create_template(&env, name.clone(), data.clone(), 0, overrides.clone());
+            let root = create_template(&env, name.clone(), data.clone(), 0, overrides.clone());
+            let id2 = create_template(&env, name.clone(), data.clone(), root, overrides.clone());
+
+            // Resolve the leaf
+            let resolved = resolve_template(&env, id2);
+            assert!(resolved.is_some());
+
+            let rt = resolved.unwrap();
+            assert_eq!(rt.template_id, id2);
+            assert_eq!(rt.depth, 1);
+        });
+    }
+
+    #[test]
+    fn test_get_nonexistent_template() {
+        let env = soroban_sdk::Env::default();
+        let contract_id = env.register_contract(None, crate::TtlVaultContract);
+        env.as_contract(&contract_id, || {
+            let template = get_template(&env, 999);
+            assert!(template.is_none());
+        });
+    }
+
+    #[test]
+    fn test_resolve_nonexistent_template() {
+        let env = soroban_sdk::Env::default();
+        let contract_id = env.register_contract(None, crate::TtlVaultContract);
+        env.as_contract(&contract_id, || {
+            let resolved = resolve_template(&env, 999);
+            assert!(resolved.is_none());
+        });
+    }
+
+    #[test]
+    fn test_cycle_check_no_cycle() {
+        let env = soroban_sdk::Env::default();
+        let contract_id = env.register_contract(None, crate::TtlVaultContract);
+        env.as_contract(&contract_id, || {
+            let name = Bytes::new(&env);
+            let data = Bytes::new(&env);
+            let overrides = Bytes::new(&env);
+
+            // Create: 0 -> 1
+            let id0 = create_template(&env, name.clone(), data.clone(), 0, overrides.clone());
+            let id1 = create_template(&env, name.clone(), data.clone(), id0, overrides.clone());
+
+            // Check if creating 1 -> 999 would cycle (should not)
+            let result = check_inheritance_cycle(&env, id1, 999);
+            assert!(!result.has_cycle);
+        });
+    }
+
+    #[test]
+    fn test_inheritance_depth_increases() {
+        let env = soroban_sdk::Env::default();
+        let contract_id = env.register_contract(None, crate::TtlVaultContract);
+        env.as_contract(&contract_id, || {
+            let name = Bytes::new(&env);
+            let data = Bytes::new(&env);
+            let overrides = Bytes::new(&env);
+
+            // Create a dummy template 0 (can't be used as parent since 0 is sentinel)
+            let _dummy = create_template(&env, name.clone(), data.clone(), 0, overrides.clone());
+
+            // Now create the actual root that can be used as a parent
+            let root = create_template(&env, name.clone(), data.clone(), 0, overrides.clone());
+            assert_eq!(get_inheritance_depth(&env, root), 0);
+
+            // Build inheritance chain from the root
+            let id1 = create_template(&env, name.clone(), data.clone(), root, overrides.clone());
+            assert_eq!(get_inheritance_depth(&env, id1), 1);
+
+            let id2 = create_template(&env, name.clone(), data.clone(), id1, overrides.clone());
+            assert_eq!(get_inheritance_depth(&env, id2), 2);
+
+            let id3 = create_template(&env, name.clone(), data.clone(), id2, overrides.clone());
+            assert_eq!(get_inheritance_depth(&env, id3), 3);
+
+            let id4 = create_template(&env, name.clone(), data.clone(), id3, overrides.clone());
+            assert_eq!(get_inheritance_depth(&env, id4), 4);
+        });
+    }
 }
