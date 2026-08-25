@@ -299,8 +299,24 @@ await fetch('/webauthn/register/complete', {
 
 - **Challenges are single-use** and expire after 5 minutes.
 - **Origin binding**: the server validates that `origin` in `clientDataJSON` matches `WEBAUTHN_ORIGIN`.
-- **Authenticator cloning detection**: the server rejects authentication if the sign
-  counter does not increase (indicates a cloned authenticator).
+- **Assertion signature verification**: during registration, the server parses the COSE
+  public key out of the attestation object's `authData` — rejecting registration if the
+  key can't be parsed — and stores it alongside the credential's declared algorithm
+  (`ES256`, `RS256`, or `EdDSA`). During authentication, the server reconstructs
+  `authenticatorData || SHA-256(clientDataJSON)` and cryptographically verifies
+  `signature` against that stored public key. Authentication fails with `401 Unauthorized`
+  if the signature is invalid. This is what actually proves possession of the
+  authenticator's private key — earlier versions of this endpoint only checked that a
+  signature was present and non-empty, without verifying it cryptographically.
+- **Authenticator cloning detection**: *after* signature verification succeeds, the server
+  additionally rejects authentication with `403 Forbidden` if the sign counter does not
+  increase (indicates a cloned authenticator). This is a secondary, defense-in-depth
+  check — not a substitute for signature verification.
 - **Duplicate credential prevention**: the same credential ID cannot be registered twice.
 - **Backup credentials**: up to N backup authenticators per user, each flagged `is_backup=true`
   for differentiated UX treatment.
+
+> **Not yet implemented**: attestation *statement* verification (certificate chain
+> validation for formats like `"packed"` or `"tpm"`) is not performed. The server requests
+> `attestation: "none"`, so only the credential's own public key is cryptographically
+> verified — not the authenticator manufacturer's attestation certificate.
