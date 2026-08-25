@@ -257,8 +257,8 @@ fn kyc_statuses_compatible(a: KycStatus, b: KycStatus) -> bool {
     if a == b {
         return true;
     }
-    // Conflicts:
-    // pending + approved = OK (both express KYC in progress or done)
+    // Conflicts per issue #268:
+    // pending + approved = CONFLICT
     // pending + rejected = CONFLICT
     // approved + rejected = CONFLICT
     !matches!(
@@ -276,6 +276,7 @@ fn kyc_statuses_compatible(a: KycStatus, b: KycStatus) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use soroban_sdk::{Bytes, Env};
 
     #[test]
     fn test_age_ranges_overlap() {
@@ -289,6 +290,7 @@ mod tests {
 
     #[test]
     fn test_kyc_status_conflicts() {
+        // All different status combinations should conflict per issue #268
         assert!(!kyc_statuses_compatible(
             KycStatus::Pending,
             KycStatus::Rejected
@@ -297,9 +299,140 @@ mod tests {
             KycStatus::Approved,
             KycStatus::Rejected
         ));
-        assert!(kyc_statuses_compatible(
+        // Pending and Approved now conflict (changed from original)
+        assert!(!kyc_statuses_compatible(
             KycStatus::Pending,
             KycStatus::Approved
         ));
+    }
+
+    #[test]
+    fn test_kyc_pending_approved_conflict() {
+        // Test that pending and approved conflict as documented
+        assert!(!kyc_statuses_compatible(
+            KycStatus::Pending,
+            KycStatus::Approved
+        ));
+        assert!(!kyc_statuses_compatible(
+            KycStatus::Approved,
+            KycStatus::Pending
+        ));
+    }
+
+    #[test]
+    fn test_kyc_identical_statuses_compatible() {
+        // Two identical KYC statuses should be compatible
+        assert!(kyc_statuses_compatible(
+            KycStatus::Approved,
+            KycStatus::Approved
+        ));
+        assert!(kyc_statuses_compatible(
+            KycStatus::Pending,
+            KycStatus::Pending
+        ));
+        assert!(kyc_statuses_compatible(
+            KycStatus::Rejected,
+            KycStatus::Rejected
+        ));
+    }
+
+    #[test]
+    fn test_is_kyc_status_claim_detector() {
+        let env = Env::default();
+
+        // Valid KYC status claims (1 byte with valid status codes)
+        let pending_claim = Bytes::from_array(&env, &[0u8]);
+        let approved_claim = Bytes::from_array(&env, &[1u8]);
+        let rejected_claim = Bytes::from_array(&env, &[2u8]);
+
+        assert!(is_kyc_status_claim(&pending_claim));
+        assert!(is_kyc_status_claim(&approved_claim));
+        assert!(is_kyc_status_claim(&rejected_claim));
+
+        // Empty claim should not be KYC
+        let empty_claim = Bytes::new(&env);
+        assert!(!is_kyc_status_claim(&empty_claim));
+
+        // Too long (age claims are 8 bytes)
+        let age_claim = Bytes::from_array(&env, &[0u8, 18, 0, 0, 0, 100, 0, 0]);
+        assert!(!is_kyc_status_claim(&age_claim));
+    }
+
+    #[test]
+    fn test_are_credentials_compatible_routes_kyc_correctly() {
+        let env = Env::default();
+
+        // Create two KYC claims with conflicting statuses
+        let pending_claim = Bytes::from_array(&env, &[0u8]); // Pending
+        let approved_claim = Bytes::from_array(&env, &[1u8]); // Approved
+
+        // This should route to KycStatusConflictRule and detect conflict
+        assert!(!CredentialRegistry::are_credentials_compatible(
+            &env,
+            &pending_claim,
+            &approved_claim
+        ));
+
+        // Two identical KYC claims should be compatible
+        let pending_claim2 = Bytes::from_array(&env, &[0u8]);
+        assert!(CredentialRegistry::are_credentials_compatible(
+            &env,
+            &pending_claim,
+            &pending_claim2
+        ));
+    }
+
+    #[test]
+    fn test_verify_batch_consistency_detects_kyc_conflict() {
+        let env = Env::default();
+
+        let pending_claim = Bytes::from_array(&env, &[0u8]); // Pending
+        let approved_claim = Bytes::from_array(&env, &[1u8]); // Approved
+
+        let mut pairs = soroban_sdk::Vec::new(&env);
+        pairs.push_back((1u64, pending_claim, 2u64, approved_claim));
+
+        // Should detect conflict
+        let result = CredentialRegistry::verify_batch_consistency(&env, pairs);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), ConsistencyError::ConflictDetected);
+    }
+
+    #[test]
+    fn test_verify_batch_consistency_accepts_compatible_kyc() {
+        let env = Env::default();
+
+        let approved_claim1 = Bytes::from_array(&env, &[1u8]); // Approved
+        let approved_claim2 = Bytes::from_array(&env, &[1u8]); // Approved
+
+        let mut pairs = soroban_sdk::Vec::new(&env);
+        pairs.push_back((1u64, approved_claim1, 2u64, approved_claim2));
+
+        // Should not detect conflict (both approved)
+        let result = CredentialRegistry::verify_batch_consistency(&env, pairs);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_generate_conflict_report_for_kyc() {
+        let env = Env::default();
+
+        let pending_claim = Bytes::from_array(&env, &[0u8]);
+        let approved_claim = Bytes::from_array(&env, &[1u8]);
+
+        let report = CredentialRegistry::generate_conflict_report(
+            &env,
+            100,
+            200,
+            &pending_claim,
+            &approved_claim,
+        );
+
+        assert_eq!(report.credential_id_a, 100);
+        assert_eq!(report.credential_id_b, 200);
+        assert_eq!(
+            report.conflict_reason,
+            Bytes::from_slice(&env, b"KYC status conflict")
+        );
     }
 }
