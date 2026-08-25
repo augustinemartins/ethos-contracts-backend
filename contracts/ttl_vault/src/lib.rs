@@ -357,6 +357,11 @@ pub enum ContractError {
     // Issue #37: template inheritance
     TemplateNotFound = 118,
     InheritanceCycleDetected = 119,
+    // Issue #32: credential anchoring to external systems
+    AnchorAlreadyExists = 120,
+    AnchorNotFound = 121,
+    InvalidExternalId = 122,
+    InvalidAnchorSystem = 123,
 }
 
 #[contract]
@@ -14781,5 +14786,80 @@ impl TtlVaultContract {
     /// Retrieve the rule IDs associated with `slice_id`.
     pub fn get_slice_rule_ids(env: Env, slice_id: u64) -> Vec<u64> {
         composition_rules::get_slice_rules(&env, slice_id)
+    }
+
+    // ── Issue #32: Credential Anchoring to External Systems ───────────────────
+
+    /// Anchor `credential_id` to `external_id` within `system`.
+    ///
+    /// This contract does not track credential ownership, so any caller may
+    /// register an anchor as long as they authorize the call themselves.
+    ///
+    /// # Errors
+    /// * `InvalidExternalId` — `external_id` is empty or exceeds
+    ///   `credential_anchoring::MAX_EXTERNAL_ID_LEN`.
+    /// * `InvalidAnchorSystem` — `system` is empty or exceeds
+    ///   `credential_anchoring::MAX_SYSTEM_LEN`.
+    /// * `AnchorAlreadyExists` — an anchor for `(external_id, system)` already
+    ///   exists; remove it first via `remove_credential_anchor`.
+    pub fn create_credential_anchor(
+        env: Env,
+        caller: Address,
+        credential_id: u64,
+        external_id: Bytes,
+        system: Bytes,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        if external_id.is_empty() || external_id.len() > credential_anchoring::MAX_EXTERNAL_ID_LEN {
+            return Err(ContractError::InvalidExternalId);
+        }
+        if system.is_empty() || system.len() > credential_anchoring::MAX_SYSTEM_LEN {
+            return Err(ContractError::InvalidAnchorSystem);
+        }
+        if credential_anchoring::create_credential_anchor(&env, credential_id, external_id, system)
+        {
+            Ok(())
+        } else {
+            Err(ContractError::AnchorAlreadyExists)
+        }
+    }
+
+    /// Look up the credential ID anchored to `(external_id, system)`, if any.
+    /// Read-only; no authorization required.
+    pub fn verify_external_anchor(env: Env, external_id: Bytes, system: Bytes) -> Option<u64> {
+        credential_anchoring::verify_external_anchor(&env, &external_id, &system)
+    }
+
+    /// Remove the anchor for `(external_id, system)` from `credential_id`.
+    ///
+    /// # Errors
+    /// * `AnchorNotFound` — no anchor exists for `(external_id, system)`.
+    pub fn remove_credential_anchor(
+        env: Env,
+        caller: Address,
+        credential_id: u64,
+        external_id: Bytes,
+        system: Bytes,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        if credential_anchoring::remove_credential_anchor(
+            &env,
+            credential_id,
+            &external_id,
+            &system,
+        ) {
+            Ok(())
+        } else {
+            Err(ContractError::AnchorNotFound)
+        }
+    }
+
+    /// Retrieve all anchors registered for `credential_id`.
+    /// Read-only; no authorization required.
+    pub fn get_credential_anchors(
+        env: Env,
+        credential_id: u64,
+    ) -> Vec<credential_anchoring::CredentialAnchor> {
+        credential_anchoring::get_credential_anchors(&env, credential_id)
     }
 }
