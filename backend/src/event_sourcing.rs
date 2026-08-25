@@ -13,7 +13,25 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use crate::db::Db;
 use crate::models::{EventType, Vault, VaultEvent, VaultStatus};
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn parse_event_type(s: &str) -> Result<EventType, EventSourcingError> {
+    match s {
+        "CheckIn" => Ok(EventType::CheckIn),
+        "TtlUpdate" => Ok(EventType::TtlUpdate),
+        "StatusChange" => Ok(EventType::StatusChange),
+        "Deposit" => Ok(EventType::Deposit),
+        "Withdrawal" => Ok(EventType::Withdrawal),
+        "Release" => Ok(EventType::Release),
+        _ => Err(EventSourcingError::DatabaseError(format!(
+            "unknown event type: {}",
+            s
+        ))),
+    }
+}
 
 // ── Schema version ────────────────────────────────────────────────────────────
 
@@ -85,12 +103,15 @@ impl StoredEvent {
 /// Invariants:
 ///  - Events are only ever appended; existing entries are never modified.
 ///  - The per-vault `next_sequence` counter strictly increases.
+///  - When a Db is provided, events are persisted durably before append() returns.
 #[derive(Debug, Clone)]
 pub struct EventLog {
     /// All stored events, ordered by insertion (global append order).
     events: Arc<Mutex<Vec<StoredEvent>>>,
     /// Per-vault next sequence number.
     sequences: Arc<Mutex<HashMap<String, u64>>>,
+    /// Optional database connection for durable persistence.
+    db: Option<Arc<Db>>,
 }
 
 impl EventLog {
@@ -98,12 +119,22 @@ impl EventLog {
         Self {
             events: Arc::new(Mutex::new(Vec::new())),
             sequences: Arc::new(Mutex::new(HashMap::new())),
+            db: None,
+        }
+    }
+
+    pub fn with_db(db: Arc<Db>) -> Self {
+        Self {
+            events: Arc::new(Mutex::new(Vec::new())),
+            sequences: Arc::new(Mutex::new(HashMap::new())),
+            db: Some(db),
         }
     }
 
     /// Append a new event.  Returns the assigned sequence number.
     ///
     /// This is the **only** way to add events — there is no update or delete.
+    /// If a Db is configured, the event is persisted durably before this method returns.
     pub fn append(
         &self,
         vault_id: impl Into<String>,
@@ -123,7 +154,22 @@ impl EventLog {
             assigned
         };
 
-        let event = StoredEvent::new(vault_id, seq, event_type, data);
+        let event = StoredEvent::new(vault_id.clone(), seq, event_type, data);
+
+        // Persist to database first (durably) before adding to in-memory cache.
+        if let Some(db) = &self.db {
+            let data_json =
+                serde_json::to_string(&event.data).map_err(EventSourcingError::Serialization)?;
+            db.append_event(
+                &vault_id,
+                seq,
+                &format!("{:?}", event.event_type),
+                &event.timestamp,
+                &data_json,
+                event.schema_version,
+            )
+            .map_err(|e| EventSourcingError::DatabaseError(e.to_string()))?;
+        }
 
         self.events
             .lock()
@@ -134,7 +180,41 @@ impl EventLog {
     }
 
     /// Return all events for a vault, ordered by sequence ascending.
+    /// Reads from the database if configured, otherwise from the in-memory cache.
     pub fn events_for_vault(&self, vault_id: &str) -> Result<Vec<StoredEvent>, EventSourcingError> {
+        // If database is configured, load from DB (source of truth)
+        if let Some(db) = &self.db {
+            let db_events = db
+                .get_events_for_vault(vault_id)
+                .map_err(|e| EventSourcingError::DatabaseError(e.to_string()))?;
+            let mut result = Vec::new();
+            for (seq, event_type_str, timestamp_str, data_str, schema_version) in db_events {
+                let timestamp = DateTime::parse_from_rfc3339(&timestamp_str)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .ok_or_else(|| {
+                        EventSourcingError::DatabaseError(format!(
+                            "invalid timestamp: {}",
+                            timestamp_str
+                        ))
+                    })?;
+                let data =
+                    serde_json::from_str(&data_str).map_err(EventSourcingError::Serialization)?;
+                let event_type = parse_event_type(&event_type_str)?;
+                result.push(StoredEvent {
+                    vault_id: vault_id.to_string(),
+                    sequence: seq,
+                    event_type,
+                    timestamp,
+                    data,
+                    schema_version,
+                });
+            }
+            result.sort_by_key(|e| e.sequence);
+            return Ok(result);
+        }
+
+        // Fall back to in-memory cache
         let guard = self
             .events
             .lock()
@@ -221,9 +301,13 @@ impl SnapshotState {
 }
 
 /// Thread-safe snapshot store keyed by vault ID.
+///
+/// Snapshots can be persisted to SQLite via an optional Db connection.
 #[derive(Debug, Clone, Default)]
 pub struct SnapshotStore {
     snapshots: Arc<Mutex<HashMap<String, VaultSnapshot>>>,
+    /// Optional database connection for durable persistence.
+    db: Option<Arc<Db>>,
 }
 
 impl SnapshotStore {
@@ -231,8 +315,29 @@ impl SnapshotStore {
         Self::default()
     }
 
+    pub fn with_db(db: Arc<Db>) -> Self {
+        Self {
+            snapshots: Arc::new(Mutex::new(HashMap::new())),
+            db: Some(db),
+        }
+    }
+
     /// Persist a new snapshot, replacing any previous one for the vault.
+    /// If a Db is configured, the snapshot is persisted durably before this method returns.
     pub fn save(&self, snapshot: VaultSnapshot) -> Result<(), EventSourcingError> {
+        // Persist to database first (durably) before adding to in-memory cache.
+        if let Some(db) = &self.db {
+            let state_json = serde_json::to_string(&snapshot.state)
+                .map_err(EventSourcingError::Serialization)?;
+            db.save_snapshot(
+                &snapshot.vault_id,
+                snapshot.snapshot_sequence,
+                &snapshot.taken_at,
+                &state_json,
+            )
+            .map_err(|e| EventSourcingError::DatabaseError(e.to_string()))?;
+        }
+
         self.snapshots
             .lock()
             .map_err(|_| EventSourcingError::LockPoisoned)?
@@ -241,7 +346,37 @@ impl SnapshotStore {
     }
 
     /// Retrieve the latest snapshot for a vault, if any.
+    /// Reads from the database if configured, otherwise from the in-memory cache.
     pub fn get(&self, vault_id: &str) -> Result<Option<VaultSnapshot>, EventSourcingError> {
+        // If database is configured, load from DB (source of truth)
+        if let Some(db) = &self.db {
+            if let Some((snapshot_sequence, taken_at_str, state_str)) = db
+                .get_snapshot(vault_id)
+                .map_err(|e| EventSourcingError::DatabaseError(e.to_string()))?
+            {
+                let taken_at = DateTime::parse_from_rfc3339(&taken_at_str)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .ok_or_else(|| {
+                        EventSourcingError::DatabaseError(format!(
+                            "invalid timestamp: {}",
+                            taken_at_str
+                        ))
+                    })?;
+                let state =
+                    serde_json::from_str(&state_str).map_err(EventSourcingError::Serialization)?;
+                return Ok(Some(VaultSnapshot {
+                    vault_id: vault_id.to_string(),
+                    snapshot_sequence,
+                    taken_at,
+                    state,
+                }));
+            } else {
+                return Ok(None);
+            }
+        }
+
+        // Fall back to in-memory cache
         Ok(self
             .snapshots
             .lock()
@@ -438,6 +573,13 @@ impl EventSourcingState {
         }
     }
 
+    pub fn with_db(db: Arc<Db>) -> Self {
+        Self {
+            log: Arc::new(EventLog::with_db(Arc::clone(&db))),
+            snapshots: Arc::new(SnapshotStore::with_db(db)),
+        }
+    }
+
     pub fn replayer(&self) -> EventReplayer<'_> {
         EventReplayer::new(&self.log, &self.snapshots)
     }
@@ -459,6 +601,8 @@ pub enum EventSourcingError {
     VaultNotFound(String),
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[error("database error: {0}")]
+    DatabaseError(String),
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -604,5 +748,128 @@ mod tests {
         let replayer = EventReplayer::new(&log, &snapshots);
         let result = replayer.replay("vault-1").unwrap();
         assert_eq!(result.state.status, VaultStatus::Released);
+    }
+
+    #[test]
+    fn events_persist_to_database_and_survive_restart() {
+        // Create a database and log with persistence enabled.
+        let db = Arc::new(
+            crate::db::Db::open_with_pool_config(":memory:", &crate::db::PoolConfig::default())
+                .expect("failed to open db"),
+        );
+        db.migrate().expect("migration failed");
+
+        let log = EventLog::with_db(Arc::clone(&db));
+
+        // Append events
+        log.append(
+            "vault-1",
+            EventType::Deposit,
+            serde_json::json!({"balance_delta": 1000}),
+        )
+        .unwrap();
+        log.append(
+            "vault-1",
+            EventType::CheckIn,
+            serde_json::json!({"ttl_remaining": 86400}),
+        )
+        .unwrap();
+
+        // Verify events are persisted (simulate restart by creating new log)
+        let new_log = EventLog::with_db(db);
+        let events = new_log.events_for_vault("vault-1").unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, EventType::Deposit);
+        assert_eq!(events[1].event_type, EventType::CheckIn);
+    }
+
+    #[test]
+    fn snapshots_persist_to_database_and_survive_restart() {
+        let db = Arc::new(
+            crate::db::Db::open_with_pool_config(":memory:", &crate::db::PoolConfig::default())
+                .expect("failed to open db"),
+        );
+        db.migrate().expect("migration failed");
+
+        let snapshots = SnapshotStore::with_db(Arc::clone(&db));
+
+        // Save a snapshot
+        snapshots
+            .save(VaultSnapshot {
+                vault_id: "vault-1".into(),
+                snapshot_sequence: 100,
+                taken_at: Utc::now(),
+                state: SnapshotState {
+                    balance: 5000,
+                    status: VaultStatus::Active,
+                    last_check_in: Utc::now(),
+                    ttl_remaining: Some(172800),
+                },
+            })
+            .unwrap();
+
+        // Simulate restart by creating new snapshot store
+        let new_snapshots = SnapshotStore::with_db(db);
+        let retrieved = new_snapshots.get("vault-1").unwrap();
+        assert!(retrieved.is_some());
+        let snap = retrieved.unwrap();
+        assert_eq!(snap.snapshot_sequence, 100);
+        assert_eq!(snap.state.balance, 5000);
+    }
+
+    #[test]
+    fn replay_from_persisted_snapshot_plus_new_events_is_correct() {
+        let db = Arc::new(
+            crate::db::Db::open_with_pool_config(":memory:", &crate::db::PoolConfig::default())
+                .expect("failed to open db"),
+        );
+        db.migrate().expect("migration failed");
+
+        let log = EventLog::with_db(Arc::clone(&db));
+        let snapshots = SnapshotStore::with_db(Arc::clone(&db));
+
+        // Append 3 events and take a snapshot after the first 2
+        log.append(
+            "vault-1",
+            EventType::Deposit,
+            serde_json::json!({"balance_delta": 1000}),
+        )
+        .unwrap();
+        log.append(
+            "vault-1",
+            EventType::CheckIn,
+            serde_json::json!({"ttl_remaining": 86400}),
+        )
+        .unwrap();
+
+        snapshots
+            .save(VaultSnapshot {
+                vault_id: "vault-1".into(),
+                snapshot_sequence: 2,
+                taken_at: Utc::now(),
+                state: SnapshotState {
+                    balance: 1000,
+                    status: VaultStatus::Active,
+                    last_check_in: Utc::now(),
+                    ttl_remaining: Some(86400),
+                },
+            })
+            .unwrap();
+
+        // Add one more event after snapshot
+        log.append(
+            "vault-1",
+            EventType::Withdrawal,
+            serde_json::json!({"balance_delta": 200}),
+        )
+        .unwrap();
+
+        // Replay should use snapshot + new event
+        let replayer = EventReplayer::new(&log, &snapshots);
+        let result = replayer.replay("vault-1").unwrap();
+        // 1000 (snapshot) − 200 (withdrawal) = 800
+        assert_eq!(result.state.balance, 800);
+        assert_eq!(result.events_applied, 1);
+        assert_eq!(result.last_sequence, 3);
     }
 }
