@@ -14,6 +14,9 @@ pub mod composition_rules;
 pub mod credential_anchoring;
 #[cfg(test)]
 mod credential_anchoring_tests;
+pub mod credential_lifecycle;
+#[cfg(test)]
+mod credential_lifecycle_tests;
 mod oracle;
 pub mod ranking;
 pub mod slice_attribute_matching;
@@ -354,17 +357,19 @@ pub enum ContractError {
     RuleNotFound = 114,
     // Issue #34: credential lifecycle state machine
     InvalidCredentialState = 115,
+    // Issue #269: credential lifecycle state transitions
+    InvalidStateTransition = 116,
     // Issue #35: slice failover mechanism
-    InvalidSlice = 116,
-    FailoverAlreadyActive = 117,
-    // Issue #37: template inheritance
-    TemplateNotFound = 118,
-    InheritanceCycleDetected = 119,
+    InvalidSlice = 117,
+    FailoverAlreadyActive = 118,
     // Issue #32: credential anchoring to external systems
     AnchorAlreadyExists = 120,
     AnchorNotFound = 121,
     InvalidExternalId = 122,
     InvalidAnchorSystem = 123,
+    // Issue #37: template inheritance
+    TemplateNotFound = 124,
+    InheritanceCycleDetected = 125,
 }
 
 #[contract]
@@ -14864,5 +14869,357 @@ impl TtlVaultContract {
         credential_id: u64,
     ) -> Vec<credential_anchoring::CredentialAnchor> {
         credential_anchoring::get_credential_anchors(&env, credential_id)
+    }
+
+    // ── Issue #269: Credential Lifecycle State Machine ────────────────────────
+
+    /// Initialize a credential with Draft state.
+    ///
+    /// # Arguments
+    /// * `credential_id` - The credential ID to initialize
+    ///
+    /// # Panics
+    /// * Panics if the contract is paused
+    pub fn init_credential(env: Env, credential_id: u64) {
+        Self::assert_not_paused(&env);
+        credential_lifecycle::init_credential_state(&env, credential_id);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+    }
+
+    /// Get the current lifecycle state of a credential.
+    ///
+    /// # Arguments
+    /// * `credential_id` - The credential ID to query
+    ///
+    /// # Returns
+    /// The current CredentialState (Draft, Active, Suspended, Revoked, Expired, or Archived)
+    pub fn get_credential_state(
+        env: Env,
+        credential_id: u64,
+    ) -> credential_lifecycle::CredentialState {
+        credential_lifecycle::get_credential_state(&env, credential_id)
+    }
+
+    /// Activate a credential (transition from Draft to Active).
+    ///
+    /// Only the contract admin can activate credentials.
+    ///
+    /// # Arguments
+    /// * `caller` - The address attempting to activate the credential
+    /// * `credential_id` - The credential ID to activate
+    ///
+    /// # Returns
+    /// `Ok(())` if successful, `Err(ContractError)` if transition is invalid
+    ///
+    /// # Panics
+    /// * Panics if caller is not the admin
+    /// * Panics if the contract is paused
+    pub fn activate_credential(
+        env: Env,
+        caller: Address,
+        credential_id: u64,
+    ) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
+        caller.require_auth();
+        Self::require_admin(&env);
+
+        let success = credential_lifecycle::transition_credential_state(
+            &env,
+            credential_id,
+            credential_lifecycle::CredentialState::Active,
+        );
+
+        if !success {
+            return Err(ContractError::InvalidStateTransition);
+        }
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        Ok(())
+    }
+
+    /// Suspend a credential (transition to Suspended state).
+    ///
+    /// Only the contract admin can suspend credentials.
+    /// Suspended credentials can be reactivated later.
+    ///
+    /// # Arguments
+    /// * `caller` - The address attempting to suspend the credential
+    /// * `credential_id` - The credential ID to suspend
+    ///
+    /// # Returns
+    /// `Ok(())` if successful, `Err(ContractError)` if transition is invalid
+    ///
+    /// # Panics
+    /// * Panics if caller is not the admin
+    /// * Panics if the contract is paused
+    pub fn suspend_credential(
+        env: Env,
+        caller: Address,
+        credential_id: u64,
+    ) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
+        caller.require_auth();
+        Self::require_admin(&env);
+
+        let success = credential_lifecycle::transition_credential_state(
+            &env,
+            credential_id,
+            credential_lifecycle::CredentialState::Suspended,
+        );
+
+        if !success {
+            return Err(ContractError::InvalidStateTransition);
+        }
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        Ok(())
+    }
+
+    /// Revoke a credential (transition to Revoked state).
+    ///
+    /// Only the contract admin can revoke credentials.
+    /// Revoked credentials cannot be reactivated - this is a terminal state.
+    ///
+    /// # Arguments
+    /// * `caller` - The address attempting to revoke the credential
+    /// * `credential_id` - The credential ID to revoke
+    ///
+    /// # Returns
+    /// `Ok(())` if successful, `Err(ContractError)` if transition is invalid
+    ///
+    /// # Panics
+    /// * Panics if caller is not the admin
+    /// * Panics if the contract is paused
+    pub fn revoke_credential(
+        env: Env,
+        caller: Address,
+        credential_id: u64,
+    ) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
+        caller.require_auth();
+        Self::require_admin(&env);
+
+        let success = credential_lifecycle::transition_credential_state(
+            &env,
+            credential_id,
+            credential_lifecycle::CredentialState::Revoked,
+        );
+
+        if !success {
+            return Err(ContractError::InvalidStateTransition);
+        }
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        Ok(())
+    }
+
+    /// Archive a credential (transition to Archived state).
+    ///
+    /// Only the contract admin can archive credentials.
+    /// Archived credentials are read-only and cannot transition to other states.
+    ///
+    /// # Arguments
+    /// * `caller` - The address attempting to archive the credential
+    /// * `credential_id` - The credential ID to archive
+    ///
+    /// # Returns
+    /// `Ok(())` if successful, `Err(ContractError)` if transition is invalid
+    ///
+    /// # Panics
+    /// * Panics if caller is not the admin
+    /// * Panics if the contract is paused
+    pub fn archive_credential(
+        env: Env,
+        caller: Address,
+        credential_id: u64,
+    ) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
+        caller.require_auth();
+        Self::require_admin(&env);
+
+        let success = credential_lifecycle::transition_credential_state(
+            &env,
+            credential_id,
+            credential_lifecycle::CredentialState::Archived,
+        );
+
+        if !success {
+            return Err(ContractError::InvalidStateTransition);
+        }
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        Ok(())
+    }
+
+    /// Mark a credential as expired (transition to Expired state).
+    ///
+    /// Only the contract admin can mark credentials as expired.
+    ///
+    /// # Arguments
+    /// * `caller` - The address attempting to expire the credential
+    /// * `credential_id` - The credential ID to expire
+    ///
+    /// # Returns
+    /// `Ok(())` if successful, `Err(ContractError)` if transition is invalid
+    ///
+    /// # Panics
+    /// * Panics if caller is not the admin
+    /// * Panics if the contract is paused
+    pub fn expire_credential(
+        env: Env,
+        caller: Address,
+        credential_id: u64,
+    ) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
+        caller.require_auth();
+        Self::require_admin(&env);
+
+        let success = credential_lifecycle::transition_credential_state(
+            &env,
+            credential_id,
+            credential_lifecycle::CredentialState::Expired,
+        );
+
+        if !success {
+            return Err(ContractError::InvalidStateTransition);
+        }
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        Ok(())
+    }
+
+    // ── Issue #35: Slice Failover Mechanism ────────────────────────────────────
+
+    /// Register a backup slice for a primary slice.
+    ///
+    /// # Errors
+    /// * `ContractError::VaultNotFound` - vault does not exist
+    /// * `ContractError::NotOwner` - caller is not the vault owner
+    /// * `ContractError::InvalidSlice` - primary and backup slice IDs are equal
+    pub fn register_backup_slice(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        primary_slice_id: u64,
+        backup_slice_id: u64,
+        failure_threshold: u32,
+    ) -> Result<u64, ContractError> {
+        caller.require_auth();
+        let vault = Self::try_load_vault(&env, vault_id).ok_or(ContractError::VaultNotFound)?;
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        Ok(slice_failover::register_backup_slice(
+            &env,
+            primary_slice_id,
+            backup_slice_id,
+            failure_threshold,
+        ))
+    }
+
+    /// Get the list of backup slices registered for a primary slice.
+    /// Read-only; no authorization required.
+    pub fn get_backup_slices(env: Env, primary_slice_id: u64) -> Vec<u64> {
+        slice_failover::get_backup_slices(&env, primary_slice_id)
+    }
+
+    /// Get the currently active slice for a primary slice (itself if no failover).
+    /// Read-only; no authorization required.
+    pub fn get_active_slice(env: Env, slice_id: u64) -> u64 {
+        slice_failover::get_active_slice(&env, slice_id)
+    }
+
+    /// Get the current recorded failure count for a slice.
+    /// Read-only; no authorization required.
+    pub fn get_failure_count(env: Env, slice_id: u64) -> u32 {
+        slice_failover::get_failure_count(&env, slice_id)
+    }
+
+    /// Record a failure for a slice. Automatically activates failover to the
+    /// registered backup once the configured failure threshold is reached.
+    ///
+    /// # Errors
+    /// * `ContractError::VaultNotFound` - vault does not exist
+    /// * `ContractError::NotOwner` - caller is not the vault owner
+    pub fn record_slice_failure(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        primary_slice_id: u64,
+        reason: slice_failover::FailoverReason,
+    ) -> Result<bool, ContractError> {
+        caller.require_auth();
+        let vault = Self::try_load_vault(&env, vault_id).ok_or(ContractError::VaultNotFound)?;
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        Ok(slice_failover::record_slice_failure(
+            &env,
+            primary_slice_id,
+            reason,
+        ))
+    }
+
+    /// Explicitly activate failover from a primary slice to a registered backup.
+    ///
+    /// # Errors
+    /// * `ContractError::VaultNotFound` - vault does not exist
+    /// * `ContractError::NotOwner` - caller is not the vault owner
+    pub fn activate_failover(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        primary_slice_id: u64,
+        backup_slice_id: u64,
+        reason: slice_failover::FailoverReason,
+    ) -> Result<bool, ContractError> {
+        caller.require_auth();
+        let vault = Self::try_load_vault(&env, vault_id).ok_or(ContractError::VaultNotFound)?;
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        Ok(slice_failover::activate_failover(
+            &env,
+            primary_slice_id,
+            backup_slice_id,
+            reason,
+        ))
+    }
+
+    /// Revert an active failover, restoring the primary slice and resetting
+    /// its failure counter.
+    ///
+    /// # Errors
+    /// * `ContractError::VaultNotFound` - vault does not exist
+    /// * `ContractError::NotOwner` - caller is not the vault owner
+    pub fn revert_failover(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        primary_slice_id: u64,
+        backup_slice_id: u64,
+    ) -> Result<bool, ContractError> {
+        caller.require_auth();
+        let vault = Self::try_load_vault(&env, vault_id).ok_or(ContractError::VaultNotFound)?;
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        Ok(slice_failover::revert_failover(
+            &env,
+            primary_slice_id,
+            backup_slice_id,
+        ))
     }
 }
