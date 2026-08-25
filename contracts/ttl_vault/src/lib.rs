@@ -359,14 +359,14 @@ pub enum ContractError {
     // Issue #35: slice failover mechanism
     InvalidSlice = 117,
     FailoverAlreadyActive = 118,
-    // Issue #37: template inheritance
-    TemplateNotFound = 118,
-    InheritanceCycleDetected = 119,
     // Issue #32: credential anchoring to external systems
     AnchorAlreadyExists = 120,
     AnchorNotFound = 121,
     InvalidExternalId = 122,
     InvalidAnchorSystem = 123,
+    // Issue #37: template inheritance
+    TemplateNotFound = 124,
+    InheritanceCycleDetected = 125,
 }
 
 #[contract]
