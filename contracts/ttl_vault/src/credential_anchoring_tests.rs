@@ -189,7 +189,7 @@ mod contract_wiring_tests {
     use crate::{ContractError, TtlVaultContract, TtlVaultContractClient};
     use soroban_sdk::{testutils::Address as _, Address, Bytes, Env};
 
-    fn setup() -> (Env, Address, TtlVaultContractClient<'static>) {
+    fn setup() -> (Env, Address, Address, TtlVaultContractClient<'static>) {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -200,16 +200,18 @@ mod contract_wiring_tests {
         client.initialize(&xlm_token, &admin);
 
         let caller = Address::generate(&env);
-        (env, caller, client)
+        (env, caller, admin, client)
     }
 
     #[test]
     fn test_create_verify_and_get_via_entry_points() {
-        let (env, caller, client) = setup();
+        let (env, caller, admin, client) = setup();
         let credential_id = 7u64;
         let external_id = Bytes::from_slice(&env, b"external-id-abc");
         let system = Bytes::from_slice(&env, b"kyc-v1");
 
+        client.init_credential(&credential_id);
+        client.activate_credential(&admin, &credential_id);
         client.create_credential_anchor(&caller, &credential_id, &external_id, &system);
 
         let found = client.verify_external_anchor(&external_id, &system);
@@ -223,7 +225,7 @@ mod contract_wiring_tests {
 
     #[test]
     fn test_remove_via_entry_point() {
-        let (env, caller, client) = setup();
+        let (env, caller, _admin, client) = setup();
         let credential_id = 8u64;
         let external_id = Bytes::from_slice(&env, b"external-id-def");
         let system = Bytes::from_slice(&env, b"gov-id");
@@ -236,7 +238,7 @@ mod contract_wiring_tests {
 
     #[test]
     fn test_remove_nonexistent_anchor_rejected() {
-        let (env, caller, client) = setup();
+        let (env, caller, _admin, client) = setup();
         let external_id = Bytes::from_slice(&env, b"never-created");
         let system = Bytes::from_slice(&env, b"kyc-v1");
 
@@ -249,7 +251,7 @@ mod contract_wiring_tests {
 
     #[test]
     fn test_duplicate_anchor_rejected_via_entry_point() {
-        let (env, caller, client) = setup();
+        let (env, caller, _admin, client) = setup();
         let credential_id = 9u64;
         let external_id = Bytes::from_slice(&env, b"external-id-dup");
         let system = Bytes::from_slice(&env, b"hr-db");
@@ -265,7 +267,7 @@ mod contract_wiring_tests {
 
     #[test]
     fn test_empty_external_id_rejected() {
-        let (env, caller, client) = setup();
+        let (env, caller, _admin, client) = setup();
         let empty_external_id = Bytes::new(&env);
         let system = Bytes::from_slice(&env, b"kyc-v1");
 
@@ -278,7 +280,7 @@ mod contract_wiring_tests {
 
     #[test]
     fn test_empty_system_rejected() {
-        let (env, caller, client) = setup();
+        let (env, caller, _admin, client) = setup();
         let external_id = Bytes::from_slice(&env, b"external-id-xyz");
         let empty_system = Bytes::new(&env);
 
@@ -291,7 +293,7 @@ mod contract_wiring_tests {
 
     #[test]
     fn test_oversized_system_rejected() {
-        let (env, caller, client) = setup();
+        let (env, caller, _admin, client) = setup();
         let external_id = Bytes::from_slice(&env, b"external-id-xyz");
         let oversized_system = Bytes::from_slice(&env, &[b'a'; 65]);
 
@@ -305,7 +307,7 @@ mod contract_wiring_tests {
     #[test]
     #[should_panic]
     fn test_unauthorized_caller_cannot_create_anchor() {
-        let (env, caller, client) = setup();
+        let (env, caller, _admin, client) = setup();
         // Withdraw the mocked authorization: no address has signed this
         // invocation, so `caller.require_auth()` inside the entry point must
         // reject the call. This proves a caller cannot anchor a credential
@@ -320,7 +322,7 @@ mod contract_wiring_tests {
     #[test]
     #[should_panic]
     fn test_unauthorized_caller_cannot_remove_anchor() {
-        let (env, caller, client) = setup();
+        let (env, caller, _admin, client) = setup();
         let external_id = Bytes::from_slice(&env, b"external-id-unauth-2");
         let system = Bytes::from_slice(&env, b"kyc-v1");
         client.create_credential_anchor(&caller, &3u64, &external_id, &system);

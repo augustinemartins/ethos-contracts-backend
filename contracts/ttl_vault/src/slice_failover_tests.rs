@@ -63,7 +63,8 @@ fn test_register_backup_slice_by_owner() {
     let backup_id = 2u64;
     let threshold = 3u32;
 
-    let returned = client.register_backup_slice(&vault_id, &owner, &primary_id, &backup_id, &threshold);
+    let returned =
+        client.register_backup_slice(&vault_id, &owner, &primary_id, &backup_id, &threshold);
     assert_eq!(returned, backup_id);
 
     let backups = client.get_backup_slices(&primary_id);
@@ -208,7 +209,10 @@ fn test_double_activate_is_noop() {
         &backup_id,
         &slice_failover::FailoverReason::ExplicitFailure,
     );
-    assert!(!second, "second activate while already active should return false");
+    assert!(
+        !second,
+        "second activate while already active should return false"
+    );
 }
 
 /// Reverting when no failover is active returns false.
@@ -323,8 +327,5 @@ fn test_register_backup_same_as_primary_fails() {
         .try_register_backup_slice(&vault_id, &owner, &5u64, &5u64, &2u32)
         .unwrap_err()
         .unwrap();
-    assert_eq!(
-        err,
-        soroban_sdk::Error::from_contract_error(ContractError::InvalidSlice as u32)
-    );
+    assert_eq!(err, ContractError::InvalidSlice);
 }
