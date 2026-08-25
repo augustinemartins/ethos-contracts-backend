@@ -135,6 +135,8 @@ mod regression_tests;
 mod slice_failover_tests;
 #[cfg(test)]
 mod slice_performance_tests;
+#[cfg(test)]
+mod withdrawal_escrow_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
@@ -358,6 +360,11 @@ pub enum ContractError {
     // Issue #37: template inheritance
     TemplateNotFound = 118,
     InheritanceCycleDetected = 119,
+    // Issue #32: credential anchoring to external systems
+    AnchorAlreadyExists = 120,
+    AnchorNotFound = 121,
+    InvalidExternalId = 122,
+    InvalidAnchorSystem = 123,
 }
 
 #[contract]
@@ -2382,19 +2389,32 @@ impl TtlVaultContract {
     /// * `vault_id` - The vault ID
     /// * `amount` - The amount to hold in escrow
     /// * `beneficiary` - The beneficiary address
+    /// * `caller` - The caller address (must be the vault owner)
     ///
     /// # Returns
     /// `Ok(())` on success
+    ///
+    /// # Errors
+    /// * `ContractError::InvalidAmount` - If amount is not positive
+    /// * `ContractError::VaultNotFound` - If the vault does not exist
+    /// * `ContractError::NotOwner` - If caller is not the vault owner
+    /// * `ContractError::InsufficientBalance` - If vault balance is less than amount
     pub fn create_withdrawal_escrow(
         env: Env,
         vault_id: u64,
         amount: i128,
         beneficiary: Address,
+        caller: Address,
     ) -> Result<(), ContractError> {
         if amount <= 0 {
             return Err(ContractError::InvalidAmount);
         }
+        caller.require_auth();
+
         let vault = Self::try_load_vault(&env, vault_id).ok_or(ContractError::VaultNotFound)?;
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
         if vault.balance < amount {
             return Err(ContractError::InsufficientBalance);
         }
@@ -2429,10 +2449,22 @@ impl TtlVaultContract {
     /// # Arguments
     /// * `env` - The Soroban environment
     /// * `vault_id` - The vault ID
+    /// * `caller` - The caller address (must be the escrow's beneficiary)
     ///
     /// # Returns
     /// `Ok(())` on success
-    pub fn verify_withdrawal_escrow(env: Env, vault_id: u64) -> Result<(), ContractError> {
+    ///
+    /// # Errors
+    /// * `ContractError::VaultNotFound` - If no escrow exists for the vault
+    /// * `ContractError::NotBeneficiary` - If caller is not the escrow's beneficiary
+    /// * `ContractError::InvalidAmount` - If the escrow was already verified
+    pub fn verify_withdrawal_escrow(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+
         let mut vault = Self::load_vault(&env, vault_id);
         let escrow = env
             .storage()
@@ -2440,6 +2472,9 @@ impl TtlVaultContract {
             .get::<DataKey, WithdrawalEscrow>(&DataKey::WithdrawalEscrow(vault_id))
             .ok_or(ContractError::VaultNotFound)?;
 
+        if caller != escrow.beneficiary {
+            return Err(ContractError::NotBeneficiary);
+        }
         if escrow.verified {
             return Err(ContractError::InvalidAmount);
         }
@@ -14756,137 +14791,78 @@ impl TtlVaultContract {
         composition_rules::get_slice_rules(&env, slice_id)
     }
 
-    // ── Issue #35: Slice Failover Mechanism ───────────────────────────────────
+    // ── Issue #32: Credential Anchoring to External Systems ───────────────────
 
-    /// Register a backup slice for a primary slice.
+    /// Anchor `credential_id` to `external_id` within `system`.
     ///
-    /// When `primary_slice_id` accumulates at least `failure_threshold`
-    /// recorded failures, the contract will automatically promote
-    /// `backup_slice_id` as the active slice.
+    /// This contract does not track credential ownership, so any caller may
+    /// register an anchor as long as they authorize the call themselves.
     ///
-    /// Only the vault owner may register a backup slice.
-    ///
-    /// Returns `backup_slice_id` on success.
-    pub fn register_backup_slice(
+    /// # Errors
+    /// * `InvalidExternalId` — `external_id` is empty or exceeds
+    ///   `credential_anchoring::MAX_EXTERNAL_ID_LEN`.
+    /// * `InvalidAnchorSystem` — `system` is empty or exceeds
+    ///   `credential_anchoring::MAX_SYSTEM_LEN`.
+    /// * `AnchorAlreadyExists` — an anchor for `(external_id, system)` already
+    ///   exists; remove it first via `remove_credential_anchor`.
+    pub fn create_credential_anchor(
         env: Env,
-        vault_id: u64,
         caller: Address,
-        primary_slice_id: u64,
-        backup_slice_id: u64,
-        failure_threshold: u32,
-    ) -> Result<u64, ContractError> {
+        credential_id: u64,
+        external_id: Bytes,
+        system: Bytes,
+    ) -> Result<(), ContractError> {
         caller.require_auth();
-        let vault = Self::load_vault(&env, vault_id);
-        if caller != vault.owner {
-            return Err(ContractError::NotOwner);
+        if external_id.is_empty() || external_id.len() > credential_anchoring::MAX_EXTERNAL_ID_LEN {
+            return Err(ContractError::InvalidExternalId);
         }
-        Ok(slice_failover::register_backup_slice(
-            &env,
-            primary_slice_id,
-            backup_slice_id,
-            failure_threshold,
-        ))
+        if system.is_empty() || system.len() > credential_anchoring::MAX_SYSTEM_LEN {
+            return Err(ContractError::InvalidAnchorSystem);
+        }
+        if credential_anchoring::create_credential_anchor(&env, credential_id, external_id, system)
+        {
+            Ok(())
+        } else {
+            Err(ContractError::AnchorAlreadyExists)
+        }
     }
 
-    /// Return the ordered list of backup slice IDs registered for `primary_slice_id`.
-    pub fn get_backup_slices(env: Env, primary_slice_id: u64) -> Vec<u64> {
-        slice_failover::get_backup_slices(&env, primary_slice_id)
+    /// Look up the credential ID anchored to `(external_id, system)`, if any.
+    /// Read-only; no authorization required.
+    pub fn verify_external_anchor(env: Env, external_id: Bytes, system: Bytes) -> Option<u64> {
+        credential_anchoring::verify_external_anchor(&env, &external_id, &system)
     }
 
-    /// Record a failure event against `primary_slice_id`.
+    /// Remove the anchor for `(external_id, system)` from `credential_id`.
     ///
-    /// If the accumulated failure count reaches the configured threshold,
-    /// failover to the first registered backup slice is activated automatically.
-    ///
-    /// Only the vault owner may record a slice failure.
-    ///
-    /// Returns `true` when failover was activated as a result of this call.
-    pub fn record_slice_failure(
+    /// # Errors
+    /// * `AnchorNotFound` — no anchor exists for `(external_id, system)`.
+    pub fn remove_credential_anchor(
         env: Env,
-        vault_id: u64,
         caller: Address,
-        primary_slice_id: u64,
-        reason: slice_failover::FailoverReason,
-    ) -> Result<bool, ContractError> {
+        credential_id: u64,
+        external_id: Bytes,
+        system: Bytes,
+    ) -> Result<(), ContractError> {
         caller.require_auth();
-        let vault = Self::load_vault(&env, vault_id);
-        if caller != vault.owner {
-            return Err(ContractError::NotOwner);
-        }
-        Ok(slice_failover::record_slice_failure(
+        if credential_anchoring::remove_credential_anchor(
             &env,
-            primary_slice_id,
-            reason,
-        ))
+            credential_id,
+            &external_id,
+            &system,
+        ) {
+            Ok(())
+        } else {
+            Err(ContractError::AnchorNotFound)
+        }
     }
 
-    /// Explicitly activate failover from `primary_slice_id` to `backup_slice_id`.
-    ///
-    /// Use this when you need to force-promote a backup without waiting for the
-    /// automatic failure-threshold trigger.
-    ///
-    /// Only the vault owner may activate failover.
-    ///
-    /// Returns `true` if failover was activated; `false` if it was already active
-    /// or no matching config exists.
-    pub fn activate_failover(
+    /// Retrieve all anchors registered for `credential_id`.
+    /// Read-only; no authorization required.
+    pub fn get_credential_anchors(
         env: Env,
-        vault_id: u64,
-        caller: Address,
-        primary_slice_id: u64,
-        backup_slice_id: u64,
-        reason: slice_failover::FailoverReason,
-    ) -> Result<bool, ContractError> {
-        caller.require_auth();
-        let vault = Self::load_vault(&env, vault_id);
-        if caller != vault.owner {
-            return Err(ContractError::NotOwner);
-        }
-        Ok(slice_failover::activate_failover(
-            &env,
-            primary_slice_id,
-            backup_slice_id,
-            reason,
-        ))
-    }
-
-    /// Revert an active failover and restore `primary_slice_id` as the active slice.
-    ///
-    /// Also resets the failure counter so the primary can receive fresh traffic.
-    ///
-    /// Only the vault owner may revert failover.
-    ///
-    /// Returns `true` if the failover was reverted; `false` if it was not active
-    /// or no matching config exists.
-    pub fn revert_failover(
-        env: Env,
-        vault_id: u64,
-        caller: Address,
-        primary_slice_id: u64,
-        backup_slice_id: u64,
-    ) -> Result<bool, ContractError> {
-        caller.require_auth();
-        let vault = Self::load_vault(&env, vault_id);
-        if caller != vault.owner {
-            return Err(ContractError::NotOwner);
-        }
-        Ok(slice_failover::revert_failover(
-            &env,
-            primary_slice_id,
-            backup_slice_id,
-        ))
-    }
-
-    /// Return the currently active slice ID for `slice_id`.
-    ///
-    /// Returns `slice_id` itself when no failover is active (primary is healthy),
-    /// or the backup slice ID when failover has been activated.
-    pub fn get_active_slice(env: Env, slice_id: u64) -> u64 {
-        slice_failover::get_active_slice(&env, slice_id)
-    }
-
-    /// Return the accumulated failure count for `slice_id`.
-    pub fn get_failure_count(env: Env, slice_id: u64) -> u32 {
-        slice_failover::get_failure_count(&env, slice_id)
+        credential_id: u64,
+    ) -> Vec<credential_anchoring::CredentialAnchor> {
+        credential_anchoring::get_credential_anchors(&env, credential_id)
     }
 }

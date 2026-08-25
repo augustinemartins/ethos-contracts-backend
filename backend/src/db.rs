@@ -598,6 +598,24 @@ impl Db {
 
 use rusqlite::{params, Connection};
 
+fn vault_status_to_str(status: &crate::models::VaultStatus) -> &'static str {
+    match status {
+        crate::models::VaultStatus::Active => "active",
+        crate::models::VaultStatus::Expired => "expired",
+        crate::models::VaultStatus::Released => "released",
+        crate::models::VaultStatus::Paused => "paused",
+    }
+}
+
+fn vault_status_from_str(s: &str) -> crate::models::VaultStatus {
+    match s {
+        "expired" => crate::models::VaultStatus::Expired,
+        "released" => crate::models::VaultStatus::Released,
+        "paused" => crate::models::VaultStatus::Paused,
+        _ => crate::models::VaultStatus::Active,
+    }
+}
+
 pub struct PoolConfig {
     pub min: u32,
     pub max: u32,
@@ -640,7 +658,11 @@ pub struct Db {
     // `timeout_secs` (DB_POOL_TIMEOUT_SECS) is currently applied, via busy_timeout.
     #[allow(dead_code)]
     pool_config: PoolConfig,
-    /// In-memory vault store shared across the application.
+    /// In-memory read cache mirroring the `vaults` table, kept in sync by
+    /// `insert_vault`. The `vaults` table (via `conn`) is the durable source
+    /// of truth read by `get_vault`; this cache exists only for call sites
+    /// (e.g. `simulate_release_handler`) that need to scan every vault
+    /// without a `SELECT *` round trip.
     pub vault_store: VaultStore,
 }
 
@@ -663,17 +685,65 @@ impl Db {
         })
     }
 
-    /// Insert or replace a vault in the in-memory store.
+    /// Insert or replace a vault. Persists to the `vaults` table so the vault
+    /// survives process restarts and is visible to every instance sharing the
+    /// same SQLite file, then mirrors the write into the in-memory
+    /// `vault_store` cache.
     pub fn insert_vault(&self, vault: crate::models::Vault) {
+        let _ = self.conn.lock().unwrap().execute(
+            r"INSERT OR REPLACE INTO vaults
+                (id, owner, beneficiary, balance, check_in_interval, last_check_in, created_at, status, ttl_remaining)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                vault.id,
+                vault.owner,
+                vault.beneficiary,
+                vault.balance.to_string(),
+                vault.check_in_interval.cast_signed(),
+                vault.last_check_in.to_rfc3339(),
+                vault.created_at.to_rfc3339(),
+                vault_status_to_str(&vault.status),
+                vault.ttl_remaining.map(u64::cast_signed),
+            ],
+        );
         self.vault_store
             .lock()
             .unwrap()
             .insert(vault.id.clone(), vault);
     }
 
-    /// Retrieve a vault from the in-memory store by string ID.
+    /// Retrieve a vault by string ID from the `vaults` table.
     pub fn get_vault(&self, vault_id: &str) -> Option<crate::models::Vault> {
-        self.vault_store.lock().unwrap().get(vault_id).cloned()
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding
+            .prepare(
+                r"SELECT id, owner, beneficiary, balance, check_in_interval, last_check_in,
+                         created_at, status, ttl_remaining
+                  FROM vaults WHERE id = ?1",
+            )
+            .ok()?;
+        stmt.query_row(params![vault_id], |r| {
+            let balance_str: String = r.get(3)?;
+            let last_check_in_str: String = r.get(5)?;
+            let created_at_str: String = r.get(6)?;
+            let status_str: String = r.get(7)?;
+            Ok(crate::models::Vault {
+                id: r.get(0)?,
+                owner: r.get(1)?,
+                beneficiary: r.get(2)?,
+                balance: balance_str.parse().unwrap_or(0),
+                check_in_interval: r.get::<_, i64>(4)? as u64,
+                last_check_in: chrono::DateTime::parse_from_rfc3339(&last_check_in_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
+                created_at: chrono::DateTime::parse_from_rfc3339(&created_at_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
+                status: vault_status_from_str(&status_str),
+                ttl_remaining: r.get::<_, Option<i64>>(8)?.map(|t| t as u64),
+            })
+        })
+        .ok()
     }
 
     pub fn check_connectivity(&self) -> Result<(), rusqlite::Error> {
@@ -974,6 +1044,24 @@ impl Db {
                 );
                 CREATE INDEX IF NOT EXISTS idx_capability_statuses_updated_at
                     ON capability_statuses(updated_at);
+                ",
+            ),
+            (
+                "13",
+                r"
+                -- #264: durable SQL-backed vault storage, mirroring
+                -- crate::models::Vault (previously in-memory only).
+                CREATE TABLE IF NOT EXISTS vaults (
+                    id                 TEXT PRIMARY KEY,
+                    owner              TEXT NOT NULL,
+                    beneficiary        TEXT NOT NULL,
+                    balance            TEXT NOT NULL,
+                    check_in_interval  INTEGER NOT NULL,
+                    last_check_in      TEXT NOT NULL,
+                    created_at         TEXT NOT NULL,
+                    status             TEXT NOT NULL,
+                    ttl_remaining      INTEGER
+                );
                 ",
             ),
         ];
@@ -2626,6 +2714,142 @@ impl Db {
     }
 }
 
+// ── Event sourcing persistence (#267) ────────────────────────────────────────
+
+impl Db {
+    /// Persist an event to the database.
+    pub fn append_event(
+        &self,
+        vault_id: &str,
+        sequence: u64,
+        event_type: &str,
+        timestamp: &chrono::DateTime<chrono::Utc>,
+        data: &str,
+        schema_version: u32,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r"
+            INSERT INTO events (vault_id, sequence, event_type, timestamp, data, schema_version)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ",
+            rusqlite::params![
+                vault_id,
+                sequence as i64,
+                event_type,
+                timestamp.to_rfc3339(),
+                data,
+                schema_version as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Retrieve all events for a vault, ordered by sequence.
+    pub fn get_events_for_vault(
+        &self,
+        vault_id: &str,
+    ) -> Result<Vec<(u64, String, String, String, u32)>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r"
+            SELECT sequence, event_type, timestamp, data, schema_version
+            FROM events
+            WHERE vault_id = ?1
+            ORDER BY sequence ASC
+            ",
+        )?;
+
+        let events = stmt.query_map(rusqlite::params![vault_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)? as u64,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get::<_, i64>(4)? as u32,
+            ))
+        })?;
+
+        let mut result = Vec::new();
+        for event in events {
+            result.push(event?);
+        }
+        Ok(result)
+    }
+
+    /// Save a snapshot for a vault.
+    pub fn save_snapshot(
+        &self,
+        vault_id: &str,
+        snapshot_sequence: u64,
+        taken_at: &chrono::DateTime<chrono::Utc>,
+        state: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r"
+            INSERT INTO snapshots (vault_id, snapshot_sequence, taken_at, state)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(vault_id) DO UPDATE SET
+              snapshot_sequence = excluded.snapshot_sequence,
+              taken_at = excluded.taken_at,
+              state = excluded.state
+            ",
+            rusqlite::params![
+                vault_id,
+                snapshot_sequence as i64,
+                taken_at.to_rfc3339(),
+                state
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Retrieve the snapshot for a vault, if any.
+    pub fn get_snapshot(
+        &self,
+        vault_id: &str,
+    ) -> Result<Option<(u64, String, String)>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r"
+            SELECT snapshot_sequence, taken_at, state
+            FROM snapshots
+            WHERE vault_id = ?1
+            ",
+        )?;
+
+        stmt.query_row(rusqlite::params![vault_id], |row| {
+            Ok((row.get::<_, i64>(0)? as u64, row.get(1)?, row.get(2)?))
+        })
+        .optional()
+    }
+
+    /// Delete snapshots older than a given date (for retention/archival).
+    pub fn delete_old_snapshots(
+        &self,
+        cutoff_date: &chrono::DateTime<chrono::Utc>,
+    ) -> Result<usize, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM snapshots WHERE taken_at < ?1",
+            rusqlite::params![cutoff_date.to_rfc3339()],
+        )
+    }
+
+    /// Delete events older than a given date (for retention/archival).
+    pub fn delete_old_events(
+        &self,
+        cutoff_date: &chrono::DateTime<chrono::Utc>,
+    ) -> Result<usize, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM events WHERE timestamp < ?1",
+            rusqlite::params![cutoff_date.to_rfc3339()],
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -2694,5 +2918,82 @@ mod tests {
         assert_eq!(result.vaults.len(), 10);
         assert_eq!(result.total, 25);
         assert_eq!(result.page, 2);
+    }
+
+    fn make_test_vault(id: &str) -> Vault {
+        Vault {
+            id: id.to_string(),
+            owner: "owner1".to_string(),
+            beneficiary: "ben1".to_string(),
+            balance: 1_000_000,
+            check_in_interval: 86_400,
+            last_check_in: Utc::now(),
+            created_at: Utc::now(),
+            status: VaultStatus::Active,
+            ttl_remaining: Some(100_000),
+        }
+    }
+
+    #[test]
+    fn test_get_vault_survives_db_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "ethos_vault_restart_{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let path_str = path.to_str().unwrap();
+        let vault = make_test_vault("restart-vault");
+
+        {
+            let db = Db::open(path_str).unwrap();
+            db.migrate().unwrap();
+            db.insert_vault(vault.clone());
+        }
+
+        // Re-open against the same file, simulating a process restart.
+        let db = Db::open(path_str).unwrap();
+        db.migrate().unwrap();
+        let reloaded = db
+            .get_vault(&vault.id)
+            .expect("vault should survive db restart");
+        assert_eq!(reloaded.id, vault.id);
+        assert_eq!(reloaded.owner, vault.owner);
+        assert_eq!(reloaded.balance, vault.balance);
+        assert_eq!(reloaded.status, vault.status);
+        assert_eq!(reloaded.ttl_remaining, vault.ttl_remaining);
+
+        let _ = std::fs::remove_file(path_str);
+    }
+
+    #[test]
+    fn test_get_vault_visible_across_db_handles() {
+        let path = std::env::temp_dir().join(format!(
+            "ethos_vault_multi_{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let path_str = path.to_str().unwrap();
+
+        // Two independent `Db` handles on the same file, simulating two
+        // instances sharing a database behind a load balancer.
+        let db_a = Db::open(path_str).unwrap();
+        db_a.migrate().unwrap();
+        let db_b = Db::open(path_str).unwrap();
+        db_b.migrate().unwrap();
+
+        let vault = make_test_vault("shared-vault");
+        db_a.insert_vault(vault.clone());
+        let seen_by_b = db_b
+            .get_vault(&vault.id)
+            .expect("handle B should see a vault inserted through handle A");
+        assert_eq!(seen_by_b.owner, vault.owner);
+
+        let mut vault2 = vault.clone();
+        vault2.id = "shared-vault-2".to_string();
+        db_b.insert_vault(vault2.clone());
+        let seen_by_a = db_a
+            .get_vault(&vault2.id)
+            .expect("handle A should see a vault inserted through handle B");
+        assert_eq!(seen_by_a.id, vault2.id);
+
+        let _ = std::fs::remove_file(path_str);
     }
 }

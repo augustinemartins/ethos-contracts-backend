@@ -55,8 +55,21 @@ redis = "0.27"
 rand = "0.8"
 hmac = "0.12"
 sha1 = "0.10"
-sha2 = "0.10"
+sha2 = { version = "0.10", features = ["oid"] }
 once_cell = "1"
+
+# WebAuthn assertion signature verification (#262): CBOR/COSE key parsing and
+# per-algorithm signature verification (ES256 / RS256 / EdDSA).
+#
+# RS256 verification uses `ring` (RsaPublicKeyComponents) rather than the
+# `rsa` crate: `rsa` has an unpatched RUSTSEC-2023-0071 (Marvin Attack timing
+# side-channel) advisory that fails `cargo audit --deny warnings` in CI.
+ciborium = "0.2"
+p256 = { version = "0.13", features = ["ecdsa"] }
+ecdsa = { version = "0.16", features = ["der"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+ring = "0.17"
+signature = "2"
 
 [dev-dependencies]
 tokio-test = "0.4"
