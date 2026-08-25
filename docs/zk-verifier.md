@@ -151,6 +151,66 @@ The `verify_claim` function:
 
 ---
 
+## Lattice-Tagged Proofs & Field Masking
+
+`verify_lattice_proof` and `mask_proof_fields` are separate from the stub
+verification described above; this section documents what they actually do,
+since earlier revisions shipped them undocumented and, in `verify_lattice_proof`'s
+case, under a rustdoc comment calling it a "quantum-resistant" proof check.
+
+### `verify_lattice_proof`
+
+Despite the name, **this crate implements no lattice-based (e.g.
+Dilithium/Falcon-style, post-quantum) cryptographic scheme**, and
+`verify_lattice_proof` performs no such verification. What it actually does:
+
+1. Requires `proof` to carry the `LATTICE_V1` format header
+   (`LATTICE_PROOF_HEADER`) followed by a 4-byte checksum (the first 4 bytes
+   of `sha256` over everything before it) — see `is_valid_lattice_proof`.
+   This rejects accidental or naively-forged input; it is a structural tag,
+   not a proof of any mathematical statement.
+2. Requires the exact `proof` bytes to have been attested by a
+   currently-registered oracle for `claim` — the same oracle-attestation
+   trust model `verify_claim` uses. This is the actual trust boundary: a
+   `true` result means "a registered oracle vouched for these bytes,"
+   nothing more.
+
+If genuine post-quantum proof verification is ever needed, it requires a
+real lattice signature scheme (see "What a Real ZK Implementation
+Requires" below) — `verify_lattice_proof` is not a step toward that on its
+own, only a format tag on top of the existing oracle-attestation model.
+
+### `mask_proof_fields`
+
+Given `fields_to_mask` (byte offsets into `proof`, each `< 32` and `<
+proof.len()`), returns `b"MASKED_V1" || field_mask (u32 LE) || proof` with
+every masked offset's byte zeroed out. The output does not contain the
+original byte at any masked offset — inspecting it does not recover masked
+data. `verify_masked_proof` then checks the *masked* output against oracle
+attestation, exactly like `verify_claim`.
+
+### Additional error codes
+
+| Code | Name | Description |
+|------|------|-------------|
+| 17 | InvalidLatticeProof | `proof` does not carry a valid LATTICE_V1 header + checksum |
+| 18 | ExternalFormatTooLarge | Exported/masked proof format exceeds MAX_EXTERNAL_FORMAT_SIZE (8 KB) |
+| 19 | InvalidMaskSpec | `fields_to_mask` was empty, referenced an out-of-range offset, or `masked_proof` was too short |
+| 20 | MaskedVerificationFailed | The masked proof was not attested by a currently-registered oracle |
+
+> **Note on this document's other error codes:** the table below (and the
+> Credential Dispute Resolution / Temporal Queries / Version History /
+> Hierarchies / Privacy Levels sections that follow) describe a larger
+> public API — `initiate_credential_dispute`, `vote_on_dispute`,
+> `get_credential_at_time`, `get_credential_parent`,
+> `is_credential_chain_valid`, and related functions — that is **not
+> present in `src/lib.rs`** as of this revision. That gap predates and is
+> unrelated to the lattice/masking fix described above (`src/test.rs` has
+> pre-existing compile errors referencing the same missing API); reconciling
+> it is a separate, larger effort than this document's scope here covers.
+
+---
+
 ## Credential Dispute Resolution
 
 Oracle attestations are, in effect, credentials asserting that a `(proof,

@@ -29,7 +29,7 @@ pub enum ConsistencyError {
 
 /// Identifies the type/class of a credential (e.g., "age", "kyc", "jurisdiction").
 /// Used to determine which conflict rules apply.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CredentialType {
     /// Soroban Symbol encoding the credential type.
     pub type_key: Symbol,
@@ -104,8 +104,8 @@ impl ConflictRule for KycStatusConflictRule {
         }
     }
 
-    fn conflict_reason(_env: &Env) -> Bytes {
-        Bytes::from_slice(_env, b"KYC status conflict")
+    fn conflict_reason(env: &Env) -> Bytes {
+        Bytes::from_slice(env, b"KYC status conflict")
     }
 }
 
@@ -223,13 +223,13 @@ fn is_age_claim(claim: &Bytes) -> bool {
     }
 }
 
+/// Heuristic: a claim is a KYC status claim if its first byte decodes to a
+/// known `KycStatus` variant (pending/approved/rejected).
 fn is_kyc_status_claim(claim: &Bytes) -> bool {
-    // Heuristic: KYC status claims are typically short (1-4 bytes) with a status code
-    if claim.is_empty() || claim.len() > 4 {
-        return false;
-    }
-    // Attempt to extract a valid KYC status
-    extract_kyc_status(claim).is_ok()
+    matches!(
+        extract_kyc_status(claim),
+        Ok(KycStatus::Pending | KycStatus::Approved | KycStatus::Rejected)
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -261,16 +261,16 @@ fn kyc_statuses_compatible(a: KycStatus, b: KycStatus) -> bool {
     // pending + approved = CONFLICT
     // pending + rejected = CONFLICT
     // approved + rejected = CONFLICT
-    // Only identical statuses or Unknown are compatible
-    match (a, b) {
-        (KycStatus::Pending, KycStatus::Approved) => false,
-        (KycStatus::Approved, KycStatus::Pending) => false,
-        (KycStatus::Pending, KycStatus::Rejected) => false,
-        (KycStatus::Rejected, KycStatus::Pending) => false,
-        (KycStatus::Approved, KycStatus::Rejected) => false,
-        (KycStatus::Rejected, KycStatus::Approved) => false,
-        _ => true,
-    }
+    !matches!(
+        (a, b),
+        (
+            KycStatus::Pending | KycStatus::Approved,
+            KycStatus::Rejected
+        ) | (
+            KycStatus::Rejected,
+            KycStatus::Pending | KycStatus::Approved
+        )
+    )
 }
 
 #[cfg(test)]
