@@ -50,7 +50,8 @@ fn setup() -> (Env, Address, Address, TtlVaultContractClient<'static>) {
 }
 
 /// Perform `n` check-ins against `vault_id` using `passkey_hash`, advancing
-/// the ledger timestamp by 1 second between each call so timestamps are unique.
+/// the ledger timestamp by 61 seconds between each call so the
+/// `DEFAULT_MIN_CHECKIN_COOLDOWN` (60 s) is always satisfied.
 fn do_check_ins(
     env: &Env,
     client: &TtlVaultContractClient<'_>,
@@ -60,9 +61,10 @@ fn do_check_ins(
     n: u32,
 ) {
     for _ in 0..n {
-        client.check_in(vault_id, owner, passkey_hash, &0u64);
+        client.check_in(&vault_id, owner, passkey_hash, &0u64);
+        // Advance by 61 s — just over the 60-second default cooldown.
         env.ledger().with_mut(|li| {
-            li.timestamp = li.timestamp.saturating_add(1);
+            li.timestamp = li.timestamp.saturating_add(61);
         });
     }
 }
@@ -133,7 +135,7 @@ fn test_passkey_usage_oldest_entry_pruned() {
 
     // First check-in with hash_a — this will be the entry that gets pruned.
     client.check_in(&vault_id, &owner, &hash_a, &0u64);
-    env.ledger().with_mut(|li| li.timestamp += 1);
+    env.ledger().with_mut(|li| li.timestamp += 61);
 
     // Fill the rest of the cap with hash_b entries.
     do_check_ins(
@@ -239,8 +241,8 @@ fn do_audit_cycles(
         raw[0] = (i & 0xFF) as u8;
         raw[1] = ((i >> 8) & 0xFF) as u8;
         let hash = BytesN::<32>::from_array(env, &raw);
-        client.add_passkey(vault_id, owner, &hash);
-        client.remove_passkey(vault_id, owner, &hash);
+        client.add_passkey(&vault_id, owner, &hash);
+        client.remove_passkey(&vault_id, owner, &hash);
         env.ledger().with_mut(|li| {
             li.timestamp = li.timestamp.saturating_add(1);
         });
@@ -294,7 +296,7 @@ fn test_passkey_audit_oldest_entry_pruned() {
     // Insert a single "add" entry with a known hash as the very first operation.
     let sentinel_hash = BytesN::<32>::from_array(&env, &[0xFFu8; 32]);
     client.add_passkey(&vault_id, &owner, &sentinel_hash);
-    env.ledger().with_mut(|li| li.timestamp += 1);
+    env.ledger().with_mut(|li| li.timestamp += 61);
 
     // Now fill the log with enough entries to push the sentinel off the front.
     // We already have 1 entry; add MAX_PASSKEY_AUDIT_ENTRIES more to guarantee
