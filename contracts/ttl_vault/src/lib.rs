@@ -15099,4 +15099,127 @@ impl TtlVaultContract {
             .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
         Ok(())
     }
+
+    // ── Issue #35: Slice Failover Mechanism ────────────────────────────────────
+
+    /// Register a backup slice for a primary slice.
+    ///
+    /// # Errors
+    /// * `ContractError::VaultNotFound` - vault does not exist
+    /// * `ContractError::NotOwner` - caller is not the vault owner
+    /// * `ContractError::InvalidSlice` - primary and backup slice IDs are equal
+    pub fn register_backup_slice(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        primary_slice_id: u64,
+        backup_slice_id: u64,
+        failure_threshold: u32,
+    ) -> Result<u64, ContractError> {
+        caller.require_auth();
+        let vault = Self::try_load_vault(&env, vault_id).ok_or(ContractError::VaultNotFound)?;
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        Ok(slice_failover::register_backup_slice(
+            &env,
+            primary_slice_id,
+            backup_slice_id,
+            failure_threshold,
+        ))
+    }
+
+    /// Get the list of backup slices registered for a primary slice.
+    /// Read-only; no authorization required.
+    pub fn get_backup_slices(env: Env, primary_slice_id: u64) -> Vec<u64> {
+        slice_failover::get_backup_slices(&env, primary_slice_id)
+    }
+
+    /// Get the currently active slice for a primary slice (itself if no failover).
+    /// Read-only; no authorization required.
+    pub fn get_active_slice(env: Env, slice_id: u64) -> u64 {
+        slice_failover::get_active_slice(&env, slice_id)
+    }
+
+    /// Get the current recorded failure count for a slice.
+    /// Read-only; no authorization required.
+    pub fn get_failure_count(env: Env, slice_id: u64) -> u32 {
+        slice_failover::get_failure_count(&env, slice_id)
+    }
+
+    /// Record a failure for a slice. Automatically activates failover to the
+    /// registered backup once the configured failure threshold is reached.
+    ///
+    /// # Errors
+    /// * `ContractError::VaultNotFound` - vault does not exist
+    /// * `ContractError::NotOwner` - caller is not the vault owner
+    pub fn record_slice_failure(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        primary_slice_id: u64,
+        reason: slice_failover::FailoverReason,
+    ) -> Result<bool, ContractError> {
+        caller.require_auth();
+        let vault = Self::try_load_vault(&env, vault_id).ok_or(ContractError::VaultNotFound)?;
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        Ok(slice_failover::record_slice_failure(
+            &env,
+            primary_slice_id,
+            reason,
+        ))
+    }
+
+    /// Explicitly activate failover from a primary slice to a registered backup.
+    ///
+    /// # Errors
+    /// * `ContractError::VaultNotFound` - vault does not exist
+    /// * `ContractError::NotOwner` - caller is not the vault owner
+    pub fn activate_failover(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        primary_slice_id: u64,
+        backup_slice_id: u64,
+        reason: slice_failover::FailoverReason,
+    ) -> Result<bool, ContractError> {
+        caller.require_auth();
+        let vault = Self::try_load_vault(&env, vault_id).ok_or(ContractError::VaultNotFound)?;
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        Ok(slice_failover::activate_failover(
+            &env,
+            primary_slice_id,
+            backup_slice_id,
+            reason,
+        ))
+    }
+
+    /// Revert an active failover, restoring the primary slice and resetting
+    /// its failure counter.
+    ///
+    /// # Errors
+    /// * `ContractError::VaultNotFound` - vault does not exist
+    /// * `ContractError::NotOwner` - caller is not the vault owner
+    pub fn revert_failover(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        primary_slice_id: u64,
+        backup_slice_id: u64,
+    ) -> Result<bool, ContractError> {
+        caller.require_auth();
+        let vault = Self::try_load_vault(&env, vault_id).ok_or(ContractError::VaultNotFound)?;
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        Ok(slice_failover::revert_failover(
+            &env,
+            primary_slice_id,
+            backup_slice_id,
+        ))
+    }
 }
