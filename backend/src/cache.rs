@@ -177,6 +177,35 @@ struct CacheEntry {
     version: u64,
 }
 
+/// Outcome of classifying a cached slot before metrics/decoding are applied.
+///
+/// Classification is confined to a scoped block so the mutable borrow of the
+/// map ends before metrics are updated or the value decoded.
+enum CachedLookup {
+    /// Entry present, fresh, and ready to decode.
+    Hit(MaybeCompressed),
+    /// Entry present but past its TTL; cleared on read.
+    Expired,
+    /// Entry present but beyond the staleness ratio (#90); bypassed.
+    Stale,
+    /// No entry for this vault/slot.
+    Miss,
+}
+
+/// Classify one cached slot, clearing it when expired.  Metrics are applied
+/// by the caller once its borrow of the map has ended.
+fn classify_slot(slot: &mut Option<CacheEntry>, staleness_ratio: f64) -> CachedLookup {
+    match slot.as_ref() {
+        Some(entry) if entry.is_expired() => {
+            slot.take();
+            CachedLookup::Expired
+        }
+        Some(entry) if entry.is_stale(staleness_ratio) => CachedLookup::Stale,
+        Some(entry) => CachedLookup::Hit(entry.value.clone()),
+        None => CachedLookup::Miss,
+    }
+}
+
 impl CacheEntry {
     fn new(value: MaybeCompressed, ttl: Duration, version: u64) -> Self {
         Self {
@@ -415,23 +444,28 @@ impl VaultCache {
     pub fn get_vault(&self, vault_id: &str) -> Option<Vault> {
         let mut inner = self.inner.lock().unwrap();
         let staleness_ratio = inner.config.staleness_ratio;
-        if let Some(entries) = inner.map.get_mut(vault_id) {
-            if let Some(entry) = &entries.vault {
-                if entry.is_expired() {
-                    entries.vault = None;
-                } else if entry.is_stale(staleness_ratio) {
-                    // #90 – bypass stale entry; let caller fetch fresh data.
-                    inner.metrics.stale_bypasses += 1;
-                    inner.metrics.misses += 1;
-                    return None;
-                } else {
-                    inner.metrics.hits += 1;
-                    return entry.value.decode(&mut inner.metrics);
-                }
+        let lookup = inner
+            .map
+            .get_mut(vault_id)
+            .map_or(CachedLookup::Miss, |entries| {
+                classify_slot(&mut entries.vault, staleness_ratio)
+            });
+
+        match lookup {
+            CachedLookup::Hit(encoded) => {
+                inner.metrics.hits += 1;
+                encoded.decode(&mut inner.metrics)
+            }
+            CachedLookup::Stale => {
+                inner.metrics.stale_bypasses += 1;
+                inner.metrics.misses += 1;
+                None
+            }
+            CachedLookup::Expired | CachedLookup::Miss => {
+                inner.metrics.misses += 1;
+                None
             }
         }
-        inner.metrics.misses += 1;
-        None
     }
 
     /// Insert or update the cached `Vault` for `vault_id`.
@@ -460,22 +494,28 @@ impl VaultCache {
     pub fn get_ttl_remaining(&self, vault_id: &str) -> Option<Option<u64>> {
         let mut inner = self.inner.lock().unwrap();
         let staleness_ratio = inner.config.staleness_ratio;
-        if let Some(entries) = inner.map.get_mut(vault_id) {
-            if let Some(entry) = &entries.ttl_remaining {
-                if entry.is_expired() {
-                    entries.ttl_remaining = None;
-                } else if entry.is_stale(staleness_ratio) {
-                    inner.metrics.stale_bypasses += 1;
-                    inner.metrics.misses += 1;
-                    return None;
-                } else {
-                    inner.metrics.hits += 1;
-                    return entry.value.decode(&mut inner.metrics);
-                }
+        let lookup = inner
+            .map
+            .get_mut(vault_id)
+            .map_or(CachedLookup::Miss, |entries| {
+                classify_slot(&mut entries.ttl_remaining, staleness_ratio)
+            });
+
+        match lookup {
+            CachedLookup::Hit(encoded) => {
+                inner.metrics.hits += 1;
+                encoded.decode(&mut inner.metrics)
+            }
+            CachedLookup::Stale => {
+                inner.metrics.stale_bypasses += 1;
+                inner.metrics.misses += 1;
+                None
+            }
+            CachedLookup::Expired | CachedLookup::Miss => {
+                inner.metrics.misses += 1;
+                None
             }
         }
-        inner.metrics.misses += 1;
-        None
     }
 
     /// Insert or update the cached TTL-remaining value for `vault_id`.
@@ -500,22 +540,28 @@ impl VaultCache {
     pub fn get_vault_summary(&self, vault_id: &str) -> Option<VaultSummary> {
         let mut inner = self.inner.lock().unwrap();
         let staleness_ratio = inner.config.staleness_ratio;
-        if let Some(entries) = inner.map.get_mut(vault_id) {
-            if let Some(entry) = &entries.summary {
-                if entry.is_expired() {
-                    entries.summary = None;
-                } else if entry.is_stale(staleness_ratio) {
-                    inner.metrics.stale_bypasses += 1;
-                    inner.metrics.misses += 1;
-                    return None;
-                } else {
-                    inner.metrics.hits += 1;
-                    return entry.value.decode(&mut inner.metrics);
-                }
+        let lookup = inner
+            .map
+            .get_mut(vault_id)
+            .map_or(CachedLookup::Miss, |entries| {
+                classify_slot(&mut entries.summary, staleness_ratio)
+            });
+
+        match lookup {
+            CachedLookup::Hit(encoded) => {
+                inner.metrics.hits += 1;
+                encoded.decode(&mut inner.metrics)
+            }
+            CachedLookup::Stale => {
+                inner.metrics.stale_bypasses += 1;
+                inner.metrics.misses += 1;
+                None
+            }
+            CachedLookup::Expired | CachedLookup::Miss => {
+                inner.metrics.misses += 1;
+                None
             }
         }
-        inner.metrics.misses += 1;
-        None
     }
 
     /// Insert or update the cached `VaultSummary` for `vault_id`.

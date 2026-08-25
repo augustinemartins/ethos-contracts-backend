@@ -101,7 +101,7 @@ impl ContentEncoding {
 pub fn decompress_gzip(bytes: &[u8], max_bytes: usize) -> Result<Vec<u8>, String> {
     use flate2::read::GzDecoder;
 
-    let mut decoder = GzDecoder::new(bytes);
+    let decoder = GzDecoder::new(bytes);
     let mut out = Vec::new();
 
     // Read with a hard cap to avoid unbounded memory growth.
@@ -125,7 +125,7 @@ pub fn decompress_gzip(bytes: &[u8], max_bytes: usize) -> Result<Vec<u8>, String
 pub fn decompress_deflate(bytes: &[u8], max_bytes: usize) -> Result<Vec<u8>, String> {
     use flate2::read::ZlibDecoder;
 
-    let mut decoder = ZlibDecoder::new(bytes);
+    let decoder = ZlibDecoder::new(bytes);
     let mut out = Vec::new();
     let mut limited = decoder.take(max_bytes as u64 + 1);
     limited
@@ -202,10 +202,7 @@ mod tests {
             ContentEncoding::from_header("identity"),
             ContentEncoding::Identity
         );
-        assert_eq!(
-            ContentEncoding::from_header(""),
-            ContentEncoding::Identity
-        );
+        assert_eq!(ContentEncoding::from_header(""), ContentEncoding::Identity);
         assert_eq!(
             ContentEncoding::from_header("br"),
             ContentEncoding::Unknown("br".to_string())

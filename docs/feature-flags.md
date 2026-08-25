@@ -7,14 +7,21 @@ once they're ready, via gradual rollout.
 
 ## Storage & evaluation
 
-Flags are stored in-memory (`FlagStore`, `backend/src/feature_flags.rs`) keyed
-by flag `key`. Each flag tracks:
+Flags are stored durably in SQLite via the shared [`Db`](backend/src/db.rs)
+(`backend/src/feature_flags.rs`), keyed by flag `key`. Storage is **shared
+across all instances** of the backend: every read and evaluation goes through
+the database, so an update made through one instance is immediately visible to
+every other instance sharing the same database file — including under a
+load-balanced deployment. State also **survives process restarts**.
+
+Each flag tracks:
 
 - `enabled` — the master on/off switch
 - `rollout_percentage` (0-100) — what percentage of subjects see the flag as
   enabled when `enabled` is true
 - `version` — incremented on every update
-- `history` — snapshots of prior versions for auditing/rollback
+- `history` — snapshots of prior versions (loaded from the
+  `feature_flag_history` SQL table on every read) for auditing/rollback
 
 Evaluation hashes `(flag_key, subject_id)` into a stable bucket in `[0, 100)`
 using an FNV-1a style hash, so the same subject always gets a consistent
@@ -73,11 +80,23 @@ Response:
 3. Monitor error rates / metrics.
 4. Increase `rollout_percentage` incrementally (25, 50, 100) via repeated
    `POST /admin/flags` calls — each call bumps `version` and records the
-   previous state in `history`.
+   previous state in the `feature_flag_history` table.
 
 ## Versioning & rollback
 
-Every `POST /admin/flags` call appends a `FlagVersionSnapshot` (the flag's
-state *before* the update) to `history`. To roll back, `POST` the values
-from the desired historical snapshot — this creates a new version rather
-than mutating history in place, keeping a full audit trail.
+Every `POST /admin/flags` call writes a `FlagVersionSnapshot` (the flag's
+state *before* the update) to the `feature_flag_history` SQL table, so the
+audit trail is durable and shared across instances. To roll back, `POST` the
+values from the desired historical snapshot — this creates a new version
+rather than mutating history in place, keeping a full audit trail.
+
+## Consistency guarantees
+
+- **Cross-instance:** flag reads, evaluations, and updates all go through the
+  shared SQL store (`FlagState` wraps an `Arc<Db>`), so two instances always
+  observe the same flag state after either receives an update.
+- **Durability:** flag state and version history survive process restarts.
+- **Stable bucketing:** evaluation hashes `(flag_key, subject_id)` into a
+  stable bucket in `[0, 100)` using FNV-1a, unchanged from when storage was
+  in-memory — the same subject always gets the same result for a given
+  rollout percentage, and increasing the percentage only ever adds subjects.

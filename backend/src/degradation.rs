@@ -112,6 +112,10 @@ impl DegradationState {
 
     /// Register or update a capability's degradation status.
     /// This change is immediately visible to all instances reading from the shared database.
+    ///
+    /// Setting a capability to [`DegradationLevel::Full`] deregisters it:
+    /// `check` already defaults to `Full` for unregistered capabilities, and
+    /// `list` reports only capabilities that are (or were) degraded.
     pub fn set_status(
         &self,
         name: &str,
@@ -126,9 +130,15 @@ impl DegradationState {
             fallback_available,
             updated_at: Utc::now(),
         };
-        self.db
-            .set_capability_status(&status)
-            .map_err(|e| format!("failed to set capability status: {}", e))?;
+        if level == DegradationLevel::Full {
+            self.db
+                .delete_capability_status(name)
+                .map_err(|e| format!("failed to clear capability status: {}", e))?;
+        } else {
+            self.db
+                .set_capability_status(&status)
+                .map_err(|e| format!("failed to set capability status: {}", e))?;
+        }
         Ok(status)
     }
 
@@ -413,12 +423,13 @@ mod tests {
             .expect("set_status failed");
 
         let list = state.list().expect("list failed");
-        assert_eq!(list.len(), 3);
+        // Setting `analytics` back to `Full` deregisters it (check() already
+        // defaults to Full for unregistered capabilities), so only the two
+        // genuinely degraded capabilities remain.
+        assert_eq!(list.len(), 2);
         assert!(list.iter().any(|s| s.name == "search"));
         assert!(list.iter().any(|s| s.name == "recommendations"));
-        // Full is not registered, so it won't appear in list
-        assert!(!list
-            .iter()
-            .any(|s| s.name == "analytics" && s.level == DegradationLevel::Full));
+        // Full means unregistered, so it never appears in the list.
+        assert!(!list.iter().any(|s| s.name == "analytics"));
     }
 }

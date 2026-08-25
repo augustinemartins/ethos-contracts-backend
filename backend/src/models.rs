@@ -296,7 +296,7 @@ pub struct VaultEvent {
     pub data: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventType {
     CheckIn,
@@ -485,6 +485,14 @@ pub struct RestoreRequest {
     pub backup_id: String,
     /// The same key used during backup (base64-encoded 32-byte key)
     pub encryption_key: String,
+}
+
+/// Request body for `POST /admin/validate-backup` (#81): validate the
+/// integrity of a base64-encoded backup payload.
+#[derive(Debug, Deserialize)]
+pub struct BackupValidateRequest {
+    pub backup_id: String,
+    pub data_base64: String,
 }
 
 // ── Task 3: Sharing & Collaboration ──────────────────────────────────────────

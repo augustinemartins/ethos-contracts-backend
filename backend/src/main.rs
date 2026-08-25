@@ -4,12 +4,10 @@ use std::time::Duration;
 use axum::{
     extract::State,
     http::{HeaderValue, Method, StatusCode},
-    middleware,
     routing::{delete, get, post},
     Json, Router,
 };
 use tower_http::cors::CorsLayer;
-use tower_http::decompression::RequestDecompressionLayer;
 use tracing_subscriber::EnvFilter;
 
 use ethos_protocol_backend::{
@@ -32,7 +30,7 @@ use ethos_protocol_backend::{
         DegradationState,
     },
     event_sourcing::EventSourcingState,
-    // feature_flags::{evaluate_flag_handler, get_flag, list_flags, upsert_flag, FlagState},
+    feature_flags::{evaluate_flag_handler, get_flag, list_flags, upsert_flag, FlagState},
     graphql::{build_schema, graphql_handler, graphql_playground},
     load_shedding::{admission_middleware, LoadMonitor, LoadShedder, SheddingConfig},
     message_queue::MessageQueueState,
@@ -45,7 +43,7 @@ use ethos_protocol_backend::{
     rpc_pool::{RpcPool, RpcPoolConfig},
     scheduler,
     streaming::{stream_events, stream_vaults},
-    timeout_policy::{self, TimeoutState},
+    timeout_policy::TimeoutState,
     tracing_sampling::TraceSampler,
     webauthn::{
         add_backup_authenticator, begin_authentication, begin_registration,
@@ -150,6 +148,10 @@ pub fn build_router(state: AppState) -> Router {
     let _timeout_state = TimeoutState::new();
 
     Router::new()
+        // ── Feature flags (#274) ─────────────────────────────────────────────
+        .route("/admin/flags", post(upsert_flag).get(list_flags))
+        .route("/admin/flags/:key", get(get_flag))
+        .route("/admin/flags/:key/evaluate", post(evaluate_flag_handler))
         // ── Health ──────────────────────────────────────────────────────────
         .route("/health", get(health_handler))
         .route("/health/consensus", get(consensus_health_handler))
@@ -318,6 +320,8 @@ async fn main() {
     // Create webhook state
     let webhook_state = Arc::new(WebhookState::new());
 
+    let flag_state = Arc::new(FlagState::new(Arc::clone(&db)));
+
     let state = AppState {
         db: Arc::clone(&db),
         vault_store,
@@ -338,6 +342,9 @@ async fn main() {
             MessageQueueState::new().expect("failed to initialize message queue"),
         ),
         degradation_state,
+        flag_state,
+        query_cache: Arc::new(ethos_protocol_backend::query_cache::QueryCache::new()),
+        deadlock_detector: Arc::new(ethos_protocol_backend::deadlock::DeadlockDetector::new()),
     };
 
     // ── Dynamic ACL admin routes ─────────────────────────────────────────

@@ -78,6 +78,14 @@ pub struct AppState {
     pub message_queue: Arc<crate::message_queue::MessageQueueState>,
     /// Graceful degradation: shared capability status registry across instances.
     pub degradation_state: Arc<crate::degradation::DegradationState>,
+    /// SQL-backed feature flag store (#274). Shared across all instances so
+    /// every update is immediately visible regardless of which instance
+    /// received the write.
+    pub flag_state: Arc<crate::feature_flags::FlagState>,
+    /// Query result cache stats (#80).
+    pub query_cache: Arc<crate::query_cache::QueryCache>,
+    /// Distributed-lock deadlock detector stats (#82).
+    pub deadlock_detector: Arc<crate::deadlock::DeadlockDetector>,
 }
 
 impl axum::extract::FromRef<AppState> for Arc<Db> {
@@ -110,15 +118,15 @@ impl axum::extract::FromRef<AppState> for Arc<crate::degradation::DegradationSta
     }
 }
 
+impl axum::extract::FromRef<AppState> for Arc<crate::feature_flags::FlagState> {
+    fn from_ref(state: &AppState) -> Arc<crate::feature_flags::FlagState> {
+        Arc::clone(&state.flag_state)
+    }
+}
+
 // NOTE: The following FromRef implementations reference fields that are not currently
 // in AppState. When these features are properly implemented, uncomment and add the
 // corresponding fields to AppState.
-//
-// impl axum::extract::FromRef<AppState> for Arc<crate::feature_flags::FlagState> {
-//     fn from_ref(state: &AppState) -> Arc<crate::feature_flags::FlagState> {
-//         Arc::clone(&state.flag_state)
-//     }
-// }
 //
 // impl axum::extract::FromRef<AppState> for Arc<crate::profiler::ProfilerState> {
 //     fn from_ref(state: &AppState) -> Arc<crate::profiler::ProfilerState> {
@@ -596,7 +604,7 @@ impl Db {
     }
 }
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 fn vault_status_to_str(status: &crate::models::VaultStatus) -> &'static str {
     match status {
@@ -664,6 +672,14 @@ pub struct Db {
     /// (e.g. `simulate_release_handler`) that need to scan every vault
     /// without a `SELECT *` round trip.
     pub vault_store: VaultStore,
+}
+
+impl std::fmt::Debug for Db {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Deliberately opaque: the connection cannot be inspected while the
+        // pool mutex may be contended, and it never contains secrets.
+        f.debug_struct("Db").finish_non_exhaustive()
+    }
 }
 
 impl Db {
@@ -1061,6 +1077,59 @@ impl Db {
                     created_at         TEXT NOT NULL,
                     status             TEXT NOT NULL,
                     ttl_remaining      INTEGER
+                );
+                ",
+            ),
+            (
+                "14",
+                r"
+                -- #274: SQL-backed feature flag storage so all instances share
+                -- the same flag state and the version history is durable.
+                CREATE TABLE IF NOT EXISTS feature_flags (
+                    key                  TEXT PRIMARY KEY,
+                    description          TEXT,
+                    enabled              INTEGER NOT NULL DEFAULT 0,
+                    rollout_percentage   INTEGER NOT NULL DEFAULT 100,
+                    version              INTEGER NOT NULL DEFAULT 1,
+                    created_at           TEXT NOT NULL,
+                    updated_at           TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS feature_flag_history (
+                    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                    flag_key             TEXT NOT NULL,
+                    version              INTEGER NOT NULL,
+                    enabled              INTEGER NOT NULL,
+                    rollout_percentage   INTEGER NOT NULL,
+                    updated_at           TEXT NOT NULL,
+                    updated_by           TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_feature_flag_history_key
+                    ON feature_flag_history(flag_key);
+                ",
+            ),
+            (
+                "15",
+                r"
+                -- #151/#274 follow-up: the event-sourcing persistence layer
+                -- (`Db::insert_event`, `Db::get_events_for_vault`) and the
+                -- snapshot store (`Db::upsert_snapshot`, `Db::get_snapshot`)
+                -- write to these tables, but no migration created them.
+                CREATE TABLE IF NOT EXISTS events (
+                    vault_id       TEXT NOT NULL,
+                    sequence       INTEGER NOT NULL,
+                    event_type     TEXT NOT NULL,
+                    timestamp      TEXT NOT NULL,
+                    data           TEXT NOT NULL,
+                    schema_version INTEGER NOT NULL,
+                    PRIMARY KEY (vault_id, sequence)
+                );
+                CREATE INDEX IF NOT EXISTS idx_events_vault
+                    ON events(vault_id);
+                CREATE TABLE IF NOT EXISTS snapshots (
+                    vault_id          TEXT PRIMARY KEY,
+                    snapshot_sequence INTEGER NOT NULL,
+                    taken_at          TEXT NOT NULL,
+                    state             TEXT NOT NULL
                 );
                 ",
             ),
@@ -1751,7 +1820,10 @@ impl Db {
                VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 billing.tenant_id,
-                billing.monthly_charge,
+                // Stored as its decimal string (same convention as
+                // `insert_vault`) because rusqlite's ToSql does not support
+                // i128 and an `as i64` cast could silently truncate.
+                billing.monthly_charge.to_string(),
                 billing.billing_cycle_start.to_rfc3339(),
                 billing.billing_cycle_end.to_rfc3339(),
                 billing.total_vaults as i64,
@@ -2214,15 +2286,19 @@ impl Db {
         };
 
         let mut stmt = binding.prepare(&sql)?;
-        let iter = if let Some(ref p) = param {
-            stmt.query_map(params![p], |r| Self::row_to_deletion_log(r))?
-        } else {
-            stmt.query_map([], |r| Self::row_to_deletion_log(r))?
-        };
-
+        // The two query_map calls use closures of different types, so they
+        // cannot share an if/else expression; drain each branch separately.
         let mut out = Vec::new();
-        for item in iter {
-            out.push(item?);
+        if let Some(ref p) = param {
+            let iter = stmt.query_map(params![p], |r| Self::row_to_deletion_log(r))?;
+            for item in iter {
+                out.push(item?);
+            }
+        } else {
+            let iter = stmt.query_map([], |r| Self::row_to_deletion_log(r))?;
+            for item in iter {
+                out.push(item?);
+            }
         }
         Ok(out)
     }
@@ -2594,6 +2670,17 @@ impl Db {
         Ok(())
     }
 
+    /// Remove a capability's registered status (used when a capability is
+    /// restored to `Full`, so `check` falls back to the default).
+    pub fn delete_capability_status(&self, name: &str) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM capability_statuses WHERE name = ?1",
+            params![name],
+        )?;
+        Ok(())
+    }
+
     /// Look up a capability's status, returning `Full` (default) if not found.
     pub fn get_capability_status(
         &self,
@@ -2847,6 +2934,246 @@ impl Db {
             "DELETE FROM events WHERE timestamp < ?1",
             rusqlite::params![cutoff_date.to_rfc3339()],
         )
+    }
+}
+
+// ── Feature flag persistence (#274) ──────────────────────────────────────────
+
+impl Db {
+    /// Insert a brand-new flag row.  Callers must ensure the key does not
+    /// already exist; use `upsert_feature_flag` for create-or-update.
+    fn insert_feature_flag(
+        &self,
+        flag: &crate::feature_flags::FeatureFlag,
+    ) -> Result<(), rusqlite::Error> {
+        self.conn.lock().unwrap().execute(
+            r"INSERT INTO feature_flags
+                (key, description, enabled, rollout_percentage, version, created_at, updated_at)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                flag.key,
+                flag.description,
+                flag.enabled as i64,
+                flag.rollout_percentage as i64,
+                flag.version as i64,
+                flag.created_at.to_rfc3339(),
+                flag.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Create or update a feature flag.  If the flag already exists the old
+    /// state is written to `feature_flag_history` before the row is updated,
+    /// preserving a complete audit trail across restarts and instances.
+    ///
+    /// Returns the resulting flag (with incremented version on update).
+    pub fn upsert_feature_flag(
+        &self,
+        req: &crate::feature_flags::UpsertFlagRequest,
+    ) -> Result<crate::feature_flags::FeatureFlag, rusqlite::Error> {
+        let now = chrono::Utc::now();
+
+        match self.get_feature_flag(&req.key)? {
+            Some(existing) => {
+                // Snapshot the old state into history.
+                self.conn.lock().unwrap().execute(
+                    r"INSERT INTO feature_flag_history
+                        (flag_key, version, enabled, rollout_percentage, updated_at, updated_by)
+                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![
+                        existing.key,
+                        existing.version as i64,
+                        existing.enabled as i64,
+                        existing.rollout_percentage as i64,
+                        existing.updated_at.to_rfc3339(),
+                        req.updated_by,
+                    ],
+                )?;
+
+                let new_version = existing.version + 1;
+                let new_description = req
+                    .description
+                    .clone()
+                    .or_else(|| existing.description.clone());
+
+                self.conn.lock().unwrap().execute(
+                    r"UPDATE feature_flags
+                         SET description = ?1,
+                             enabled = ?2,
+                             rollout_percentage = ?3,
+                             version = ?4,
+                             updated_at = ?5
+                       WHERE key = ?6",
+                    rusqlite::params![
+                        new_description,
+                        req.enabled as i64,
+                        req.rollout_percentage as i64,
+                        new_version as i64,
+                        now.to_rfc3339(),
+                        req.key,
+                    ],
+                )?;
+
+                Ok(crate::feature_flags::FeatureFlag {
+                    key: req.key.clone(),
+                    description: new_description,
+                    enabled: req.enabled,
+                    rollout_percentage: req.rollout_percentage,
+                    version: new_version,
+                    created_at: existing.created_at,
+                    updated_at: now,
+                    history: self.get_feature_flag_history(&req.key)?,
+                })
+            }
+            None => {
+                let flag = crate::feature_flags::FeatureFlag {
+                    key: req.key.clone(),
+                    description: req.description.clone(),
+                    enabled: req.enabled,
+                    rollout_percentage: req.rollout_percentage,
+                    version: 1,
+                    created_at: now,
+                    updated_at: now,
+                    history: Vec::new(),
+                };
+                self.insert_feature_flag(&flag)?;
+                Ok(flag)
+            }
+        }
+    }
+
+    /// Fetch a single feature flag by key, including its history.
+    /// Returns `None` if the key does not exist.
+    pub fn get_feature_flag(
+        &self,
+        key: &str,
+    ) -> Result<Option<crate::feature_flags::FeatureFlag>, rusqlite::Error> {
+        // Collect the flag row into owned values inside a scoped block so the
+        // mutex guard is released before we call get_feature_flag_history,
+        // which also needs to acquire the lock.
+        let maybe_flag = {
+            let binding = self.conn.lock().unwrap();
+            let mut stmt = binding.prepare(
+                r"SELECT key, description, enabled, rollout_percentage, version, created_at, updated_at
+                   FROM feature_flags WHERE key = ?1",
+            )?;
+            let row = stmt.query_row(rusqlite::params![key], |r| {
+                let created_at = {
+                    let s: String = r.get(5)?;
+                    chrono::DateTime::parse_from_rfc3339(&s)
+                        .map(|dt| dt.with_timezone(&chrono::Utc))
+                        .map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                5,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        })?
+                };
+                let updated_at = {
+                    let s: String = r.get(6)?;
+                    chrono::DateTime::parse_from_rfc3339(&s)
+                        .map(|dt| dt.with_timezone(&chrono::Utc))
+                        .map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                6,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        })?
+                };
+                let enabled_i: i64 = r.get(2)?;
+                Ok(crate::feature_flags::FeatureFlag {
+                    key: r.get(0)?,
+                    description: r.get(1)?,
+                    enabled: enabled_i != 0,
+                    rollout_percentage: r.get::<_, i64>(3)? as u8,
+                    version: r.get::<_, i64>(4)? as u32,
+                    created_at,
+                    updated_at,
+                    history: Vec::new(), // populated after the lock is released
+                })
+            });
+            match row {
+                Ok(flag) => Some(flag),
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(e) => return Err(e),
+            }
+        }; // mutex guard dropped here
+
+        match maybe_flag {
+            Some(mut flag) => {
+                flag.history = self.get_feature_flag_history(&flag.key)?;
+                Ok(Some(flag))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// List all feature flags, each with its full history.
+    pub fn list_feature_flags(
+        &self,
+    ) -> Result<Vec<crate::feature_flags::FeatureFlag>, rusqlite::Error> {
+        let keys: Vec<String> = {
+            let binding = self.conn.lock().unwrap();
+            let mut stmt = binding.prepare("SELECT key FROM feature_flags ORDER BY key")?;
+            let iter = stmt.query_map([], |r| r.get(0))?;
+            let mut keys = Vec::new();
+            for k in iter {
+                keys.push(k?);
+            }
+            keys
+        };
+
+        let mut out = Vec::new();
+        for key in &keys {
+            if let Some(flag) = self.get_feature_flag(key)? {
+                out.push(flag);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Retrieve the ordered version history for a flag (oldest first).
+    pub fn get_feature_flag_history(
+        &self,
+        key: &str,
+    ) -> Result<Vec<crate::feature_flags::FlagVersionSnapshot>, rusqlite::Error> {
+        let binding = self.conn.lock().unwrap();
+        let mut stmt = binding.prepare(
+            r"SELECT version, enabled, rollout_percentage, updated_at, updated_by
+               FROM feature_flag_history
+               WHERE flag_key = ?1
+               ORDER BY id ASC",
+        )?;
+        let iter = stmt.query_map(rusqlite::params![key], |r| {
+            let updated_at = {
+                let s: String = r.get(3)?;
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?
+            };
+            let enabled_i: i64 = r.get(1)?;
+            Ok(crate::feature_flags::FlagVersionSnapshot {
+                version: r.get::<_, i64>(0)? as u32,
+                enabled: enabled_i != 0,
+                rollout_percentage: r.get::<_, i64>(2)? as u8,
+                updated_at,
+                updated_by: r.get(4)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for item in iter {
+            out.push(item?);
+        }
+        Ok(out)
     }
 }
 

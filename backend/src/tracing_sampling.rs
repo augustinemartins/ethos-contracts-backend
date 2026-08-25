@@ -251,10 +251,7 @@ impl TraceSampler {
             out,
             "# HELP ethos_trace_requests_evaluated_total Requests evaluated for sampling"
         );
-        let _ = writeln!(
-            out,
-            "# TYPE ethos_trace_requests_evaluated_total counter"
-        );
+        let _ = writeln!(out, "# TYPE ethos_trace_requests_evaluated_total counter");
         let _ = writeln!(out, "ethos_trace_requests_evaluated_total {evaluated}");
 
         let _ = writeln!(
@@ -351,10 +348,7 @@ mod tests {
         for _ in 0..100 {
             assert!(!sampler.should_sample());
         }
-        assert_eq!(
-            sampler.total_sampled.load(Ordering::Relaxed),
-            0
-        );
+        assert_eq!(sampler.total_sampled.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -405,10 +399,7 @@ mod tests {
         for _ in 0..10 {
             sampler.should_sample();
         }
-        assert_eq!(
-            sampler.total_evaluated.load(Ordering::Relaxed),
-            10
-        );
+        assert_eq!(sampler.total_evaluated.load(Ordering::Relaxed), 10);
     }
 
     #[test]

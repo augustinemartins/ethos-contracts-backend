@@ -44,29 +44,32 @@ pub struct LockEntry {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DeadlockError {
     /// A deadlock cycle was detected among the named resources.
-    Deadlock {
-        resources: Vec<String>,
-    },
+    Deadlock { resources: Vec<String> },
     /// The lock could not be acquired within the permitted timeout.
-    Timeout {
-        resource: String,
-        waited_ms: u64,
-    },
+    Timeout { resource: String, waited_ms: u64 },
     /// The caller attempted to acquire locks in the wrong order.
-    LockOrderViolation {
-        expected: String,
-        got: String,
-    },
+    LockOrderViolation { expected: String, got: String },
 }
 
 impl std::fmt::Display for DeadlockError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DeadlockError::Deadlock { resources } => {
-                write!(f, "deadlock detected among resources: {}", resources.join(", "))
+                write!(
+                    f,
+                    "deadlock detected among resources: {}",
+                    resources.join(", ")
+                )
             }
-            DeadlockError::Timeout { resource, waited_ms } => {
-                write!(f, "timeout acquiring lock on '{}' after {}ms", resource, waited_ms)
+            DeadlockError::Timeout {
+                resource,
+                waited_ms,
+            } => {
+                write!(
+                    f,
+                    "timeout acquiring lock on '{}' after {}ms",
+                    resource, waited_ms
+                )
             }
             DeadlockError::LockOrderViolation { expected, got } => {
                 write!(
@@ -157,36 +160,36 @@ impl DeadlockDetector {
     pub fn acquire_lock(&self, resource: &str, holder: &str) -> Result<(), DeadlockError> {
         let mut locks = self.active_locks.lock().unwrap();
 
+        // Re-entrant: same holder already owns the lock.
+        if locks.get(resource).is_some_and(|e| e.holder == holder) {
+            return Ok(());
+        }
+
+        // Check for a deadlock cycle before adding to the wait queue.
+        if locks.contains_key(resource) && Self::check_cycle_inner(&locks, resource, holder) {
+            self.deadlock_count.fetch_add(1, Ordering::Relaxed);
+            let resources = locks.keys().cloned().collect();
+            return Err(DeadlockError::Deadlock { resources });
+        }
+
         if let Some(entry) = locks.get_mut(resource) {
-            if entry.holder == holder {
-                // Re-entrant: same holder already owns the lock.
-                return Ok(());
-            }
-
-            // Check for a deadlock cycle before adding to the wait queue.
-            if Self::check_cycle_inner(&locks, resource, holder) {
-                self.deadlock_count.fetch_add(1, Ordering::Relaxed);
-                let resources = locks.keys().cloned().collect();
-                return Err(DeadlockError::Deadlock { resources });
-            }
-
             entry.waiters.push(holder.to_string());
-            Err(DeadlockError::Timeout {
+            return Err(DeadlockError::Timeout {
                 resource: resource.to_string(),
                 waited_ms: 0,
-            })
-        } else {
-            locks.insert(
-                resource.to_string(),
-                LockEntry {
-                    resource: resource.to_string(),
-                    holder: holder.to_string(),
-                    acquired_at: Instant::now(),
-                    waiters: Vec::new(),
-                },
-            );
-            Ok(())
+            });
         }
+
+        locks.insert(
+            resource.to_string(),
+            LockEntry {
+                resource: resource.to_string(),
+                holder: holder.to_string(),
+                acquired_at: Instant::now(),
+                waiters: Vec::new(),
+            },
+        );
+        Ok(())
     }
 
     /// Release the lock on `resource` held by `holder`.
@@ -367,13 +370,15 @@ mod tests {
                 got: "tenants".into(),
             })
         });
-        assert!(matches!(result, Err(DeadlockError::LockOrderViolation { .. })));
+        assert!(matches!(
+            result,
+            Err(DeadlockError::LockOrderViolation { .. })
+        ));
     }
 
     #[test]
     fn test_enforce_query_timeout_ok() {
-        let result =
-            DeadlockDetector::enforce_query_timeout(1_000, || 99_u32);
+        let result = DeadlockDetector::enforce_query_timeout(1_000, || 99_u32);
         assert_eq!(result.unwrap(), 99);
     }
 

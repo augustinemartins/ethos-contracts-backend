@@ -204,9 +204,7 @@ pub async fn list_health(
 }
 
 /// `GET /admin/routing/metrics` — aggregate routing health metrics.
-pub async fn routing_metrics(
-    State(state): State<Arc<HealthRoutingState>>,
-) -> Json<RoutingMetrics> {
+pub async fn routing_metrics(State(state): State<Arc<HealthRoutingState>>) -> Json<RoutingMetrics> {
     let store = state.store.lock().unwrap();
     let total_endpoints = store.len();
     let healthy_endpoints = store.values().filter(|h| h.is_healthy()).count();

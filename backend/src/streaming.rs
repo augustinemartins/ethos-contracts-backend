@@ -37,7 +37,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use futures::stream;
 use serde::{Deserialize, Serialize};
 
-use crate::db::{AppState, EventStore, VaultStore};
+use crate::db::AppState;
 use crate::models::{Vault, VaultEvent};
 
 // ── Cursor encoding ───────────────────────────────────────────────────────────

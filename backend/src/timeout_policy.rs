@@ -161,11 +161,7 @@ async fn get_timeout_policy(
     State(state): State<TimeoutState>,
     Path(id): Path<String>,
 ) -> Result<Json<TimeoutPolicy>, StatusCode> {
-    state
-        .store
-        .get(&id)
-        .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+    state.store.get(&id).map(Json).ok_or(StatusCode::NOT_FOUND)
 }
 
 async fn timeout_violations_handler(State(state): State<TimeoutState>) -> Json<serde_json::Value> {

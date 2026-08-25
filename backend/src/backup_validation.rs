@@ -84,8 +84,8 @@ impl BackupValidator {
             };
         }
 
-        let integrity_ok = data.len() >= SQLITE_MAGIC.len()
-            && data[..SQLITE_MAGIC.len()] == *SQLITE_MAGIC;
+        let integrity_ok =
+            data.len() >= SQLITE_MAGIC.len() && data[..SQLITE_MAGIC.len()] == *SQLITE_MAGIC;
 
         if !integrity_ok {
             return BackupValidationResult {
@@ -93,9 +93,7 @@ impl BackupValidator {
                 valid: false,
                 integrity_ok: false,
                 restore_test_ok: false,
-                error: Some(
-                    "backup data does not start with the SQLite magic header".to_string(),
-                ),
+                error: Some("backup data does not start with the SQLite magic header".to_string()),
                 validated_at: now,
             };
         }
