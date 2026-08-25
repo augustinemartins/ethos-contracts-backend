@@ -127,6 +127,8 @@ mod lifecycle_tests;
 #[cfg(test)]
 mod passkey_audit_tests;
 #[cfg(test)]
+mod passkey_cap_tests;
+#[cfg(test)]
 mod passkey_delegation_tests;
 #[cfg(test)]
 mod passkey_escrow_tests;
@@ -188,6 +190,18 @@ const PROTOCOL_CONFIG_TIMELOCK: u64 = 86_400;
 /// Derived from benchmark data: 20 beneficiaries stays safely below the 100M
 /// Soroban instruction limit; 50 approaches it. Capped at 20 for headroom.
 pub const MAX_BENEFICIARIES: u32 = 20;
+
+/// Maximum number of on-chain passkey usage entries retained per vault.
+/// Matches the `timestamps.len() > 1000` cap already applied to vault snapshot
+/// timestamps. Once the cap is hit the oldest entry is dropped before writing
+/// the new one, keeping the serialized Vec within Soroban's practical per-entry
+/// storage limits. Full history remains available from emitted events.
+pub const MAX_PASSKEY_USAGE_ENTRIES: u32 = 1000;
+
+/// Maximum number of on-chain passkey audit log entries retained per vault.
+/// Matches the same 1000-entry cap used for passkey usage entries above.
+/// Full history remains available from emitted `pk_audit` events.
+pub const MAX_PASSKEY_AUDIT_ENTRIES: u32 = 1000;
 
 /// Compute a persistent storage TTL (in ledgers) for a vault with the given
 /// check-in interval. Applies a 2× safety buffer so storage outlives the
@@ -8939,6 +8953,13 @@ impl TtlVaultContract {
             timestamp,
         });
 
+        // Drop the oldest entry when the cap is reached so storage size stays
+        // bounded. Full history is preserved in the emitted PASSKEY_USAGE_TOPIC
+        // events for off-chain indexers.
+        if usage.len() > MAX_PASSKEY_USAGE_ENTRIES {
+            usage.remove(0);
+        }
+
         let key = DataKey::PasskeyUsage(vault_id);
         env.storage().persistent().set(&key, &usage);
         let ttl = vault_ttl_ledgers(Self::load_vault(env, vault_id).check_in_interval);
@@ -8977,6 +8998,13 @@ impl TtlVaultContract {
             passkey_hash: passkey_hash.clone(),
             timestamp,
         });
+
+        // Drop the oldest entry when the cap is reached so storage size stays
+        // bounded. Full history is preserved in the emitted PASSKEY_AUDIT_TOPIC
+        // events for off-chain indexers.
+        if log.len() > MAX_PASSKEY_AUDIT_ENTRIES {
+            log.remove(0);
+        }
 
         env.storage().persistent().set(&key, &log);
         let ttl = vault_ttl_ledgers(Self::load_vault(env, vault_id).check_in_interval);
