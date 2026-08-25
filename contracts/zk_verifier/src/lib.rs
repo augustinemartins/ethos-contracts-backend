@@ -2,7 +2,6 @@
 
 pub mod compression;
 pub mod consistency;
-use compression::{compress_proof as rle_compress, decompress_proof as rle_decompress};
 use consistency::CredentialRegistry;
 
 use soroban_sdk::{
@@ -15,6 +14,14 @@ pub const MAX_CLAIM_SIZE: u32 = 1024;
 /// Maximum size of a dispute's `reason` bytes, mirroring MAX_CLAIM_SIZE so a
 /// dispute cannot be used to smuggle unbounded data onto the ledger.
 pub const MAX_REASON_SIZE: u32 = 1024;
+/// Maximum size of an exported/masked proof format (`export_proof_for_verification`,
+/// `mask_proof_fields`), bounding the extra header/checksum overhead added on
+/// top of `MAX_PROOF_SIZE`.
+pub const MAX_EXTERNAL_FORMAT_SIZE: u32 = 8192;
+/// Format/version tag every `verify_lattice_proof` input must be prefixed
+/// with. This is a structural tag only — see [`ZkVerifierContract::is_valid_lattice_proof`]
+/// for what it does and does not prove.
+pub const LATTICE_PROOF_HEADER: &[u8] = b"LATTICE_V1";
 /// Number of concurring oracle votes required to resolve a dispute (either
 /// upholding or rejecting it) when no explicit threshold has been configured
 /// by the admin via [`ZkVerifierContract::set_dispute_threshold`].
@@ -32,6 +39,9 @@ pub const MAX_CREDENTIAL_CHAIN_DEPTH: u32 = 32;
 
 const VERIFY_CLAIM_TOPIC: soroban_sdk::Symbol = symbol_short!("vfy_claim");
 const VERIFY_CONDITIONAL_TOPIC: soroban_sdk::Symbol = symbol_short!("vfy_cond");
+const VERIFY_LATTICE_TOPIC: soroban_sdk::Symbol = symbol_short!("vfy_latt");
+const AUDIT_LOG_TOPIC: soroban_sdk::Symbol = symbol_short!("audit_log");
+const PROOF_MASKED_TOPIC: soroban_sdk::Symbol = symbol_short!("proof_msk");
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -59,6 +69,30 @@ pub enum VerifierError {
     EmptyBatchIds = 10,
     /// Proof and claim lists have different lengths.
     MismatchedBatchLengths = 11,
+    /// A credential referenced as a parent (directly, or via
+    /// `create_derived_credential`) was never attested.
+    CredentialNotFound = 12,
+    /// A derived credential's `(proof, claim)` pair hashes to the same
+    /// credential_id as its claimed parent.
+    SelfReferentialParent = 13,
+    /// This `(proof, claim)` pair was already derived from a different
+    /// parent; a credential's place in the hierarchy is fixed at creation.
+    ParentAlreadySet = 14,
+    /// A credential's ancestor chain exceeds MAX_CREDENTIAL_CHAIN_DEPTH hops.
+    CredentialChainTooDeep = 15,
+    /// An ancestor in a derived credential's chain has been invalidated by
+    /// an upheld dispute.
+    ParentCredentialInvalid = 16,
+    /// `proof` does not carry a valid LATTICE_V1 format header and checksum.
+    InvalidLatticeProof = 17,
+    /// Exported or masked proof format exceeds MAX_EXTERNAL_FORMAT_SIZE.
+    ExternalFormatTooLarge = 18,
+    /// `fields_to_mask` was empty, referenced an out-of-range field, or
+    /// `masked_proof` was too short to carry a mask header.
+    InvalidMaskSpec = 19,
+    /// A masked proof was not attested by a currently-registered oracle for
+    /// the given claim.
+    MaskedVerificationFailed = 20,
 }
 
 /// The on-chain format for a conditional ("prove X if Y, else prove Z")
@@ -86,7 +120,7 @@ pub struct ConditionalProof {
 
 /// Storage key discriminants.
 mod keys {
-    use soroban_sdk::{contracttype, Address, BytesN, U64};
+    use soroban_sdk::{contracttype, Address, BytesN};
 
     #[contracttype]
     pub enum DataKey {
@@ -137,6 +171,37 @@ mod keys {
         /// first time a credential_id is associated with a parent via
         /// `create_derived_credential`, and never reassigned thereafter.
         CredentialParent(u64),
+        /// proof_sha256 -> Vec<VerificationRecord>, the append-only
+        /// verification audit log recorded by
+        /// `ZkVerifierContract::record_verification`.
+        VerificationHistory(BytesN<32>),
+        /// proof_sha256 (of the original, unmasked proof) -> MaskingConfig,
+        /// recorded by `ZkVerifierContract::mask_proof_fields`.
+        MaskingConfig(BytesN<32>),
+        /// proof_sha256 -> ledger timestamp of the most recent
+        /// `ZkVerifierContract::verify_lattice_proof` call for that proof.
+        LastVerificationTime(BytesN<32>),
+    }
+
+    /// A single entry in a proof's verification audit trail. See
+    /// [`DataKey::VerificationHistory`].
+    #[contracttype]
+    #[derive(Clone)]
+    pub struct VerificationRecord {
+        pub timestamp: u64,
+        pub verified: bool,
+        pub oracle: Address,
+    }
+
+    /// Records which fields of a proof were redacted by
+    /// `ZkVerifierContract::mask_proof_fields`. See
+    /// [`DataKey::MaskingConfig`].
+    #[contracttype]
+    #[derive(Clone)]
+    pub struct MaskingConfig {
+        /// SHA-256 of the little-endian field bitmask that was applied.
+        pub masked_fields: BytesN<32>,
+        pub version: u32,
     }
 }
 
@@ -416,6 +481,7 @@ impl ZkVerifierContract {
     /// Emits a `vfy_claim` event with `(result, claim_hash)` on every call
     /// that passes input validation.
     pub fn verify_claim(env: Env, proof: Bytes, claim: Bytes) -> bool {
+        let proof_hash: BytesN<32> = env.crypto().sha256(&proof).into();
         let claim_hash: BytesN<32> = env.crypto().sha256(&claim).into();
         let result = Self::verify_internal(&env, &proof, &claim);
 
@@ -429,10 +495,15 @@ impl ZkVerifierContract {
         result
     }
 
-    /// Verifies a lattice-based (quantum-resistant) proof.
+    /// Verifies a proof tagged with the `LATTICE_V1` format header.
     ///
-    /// Lattice proofs must have a valid header (LATTICE_V1) and be attested by a registered oracle.
-    /// Supports migration from classical to quantum-resistant schemes.
+    /// Despite the name, this crate implements no lattice-based (e.g.
+    /// Dilithium/Falcon-style, post-quantum) cryptographic scheme — see
+    /// [`Self::is_valid_lattice_proof`] for exactly what the format check
+    /// does and does not prove. The actual trust decision is identical to
+    /// [`Self::verify_claim`]'s oracle-attestation model: this returns
+    /// `true` only when the exact `proof` bytes were attested by a
+    /// currently-registered oracle for `claim`.
     pub fn verify_lattice_proof(env: Env, proof: Bytes, claim: Bytes) -> bool {
         if proof.is_empty() {
             panic_with_error!(&env, VerifierError::EmptyProof);
@@ -447,7 +518,7 @@ impl ZkVerifierContract {
             panic_with_error!(&env, VerifierError::ClaimTooLarge);
         }
 
-        if !Self::is_valid_lattice_proof(&proof) {
+        if !Self::is_valid_lattice_proof(&env, &proof) {
             panic_with_error!(&env, VerifierError::InvalidLatticeProof);
         }
 
@@ -457,19 +528,18 @@ impl ZkVerifierContract {
         let result = env
             .storage()
             .instance()
-            .get::<DataKey, Address>(&DataKey::Attestation(
+            .get::<DataKey, AttestationRecord>(&DataKey::Attestation(
                 proof_hash.clone(),
                 claim_hash.clone(),
             ))
-            .map(|attesting_oracle| {
+            .is_some_and(|record| {
                 env.storage()
                     .instance()
-                    .get::<DataKey, bool>(&DataKey::Oracle(attesting_oracle))
+                    .get::<DataKey, bool>(&DataKey::Oracle(record.oracle))
                     .unwrap_or(false)
-            })
-            .unwrap_or(false);
+            });
 
-        let current_time: U64 = env.ledger().timestamp().into();
+        let current_time: u64 = env.ledger().timestamp();
         env.storage().instance().set(
             &DataKey::LastVerificationTime(proof_hash.clone()),
             &current_time,
@@ -487,11 +557,11 @@ impl ZkVerifierContract {
 
     /// Exports a proof in standard external format for cross-system verification.
     /// Supports interoperability with external verifiers.
-    pub fn export_proof_for_external_verification(
-        env: Env,
-        proof: Bytes,
-        format_type: u32,
-    ) -> Bytes {
+    ///
+    /// Named `export_proof_for_verification` (rather than
+    /// `..._external_verification`) because Soroban caps contract function
+    /// names at 32 characters; the longer name never compiled.
+    pub fn export_proof_for_verification(env: Env, proof: Bytes, format_type: u32) -> Bytes {
         if proof.is_empty() {
             panic_with_error!(&env, VerifierError::EmptyProof);
         }
@@ -504,7 +574,7 @@ impl ZkVerifierContract {
         exported.append(&proof);
 
         let proof_hash: BytesN<32> = env.crypto().sha256(&proof).into();
-        exported.append(&proof_hash.to_bytes());
+        exported.append(&Bytes::from(proof_hash));
 
         if exported.len() > MAX_EXTERNAL_FORMAT_SIZE {
             panic_with_error!(&env, VerifierError::ExternalFormatTooLarge);
@@ -526,7 +596,13 @@ impl ZkVerifierContract {
     }
 
     /// Masks sensitive fields in a proof before verification.
-    /// Creates a masked proof that hides specified fields.
+    ///
+    /// `fields_to_mask` are byte offsets into `proof` (each must be `< 32`
+    /// and `< proof.len()`, since they are packed into a `u32` bitmask for
+    /// the audit trail). The returned proof has the header, the bitmask,
+    /// then `proof`'s bytes with every masked offset zeroed out — unlike a
+    /// length-preserving "masked" copy that still carries the original
+    /// bytes, a caller inspecting the output cannot recover a masked byte.
     pub fn mask_proof_fields(env: Env, proof: Bytes, fields_to_mask: Vec<u32>) -> Bytes {
         if proof.is_empty() {
             panic_with_error!(&env, VerifierError::EmptyProof);
@@ -538,18 +614,28 @@ impl ZkVerifierContract {
             panic_with_error!(&env, VerifierError::InvalidMaskSpec);
         }
 
-        let mut masked = Bytes::new(&env);
-        masked.append(&Bytes::from_array(&env, b"MASKED_V1"));
-
         let mut field_mask: u32 = 0;
         for i in 0..fields_to_mask.len() {
             if let Some(field_idx) = fields_to_mask.get(i) {
+                if field_idx >= 32 || field_idx >= proof.len() {
+                    panic_with_error!(&env, VerifierError::InvalidMaskSpec);
+                }
                 field_mask |= 1 << field_idx;
             }
         }
 
+        let mut masked = Bytes::new(&env);
+        masked.append(&Bytes::from_array(&env, b"MASKED_V1"));
         masked.append(&Bytes::from_array(&env, &field_mask.to_le_bytes()));
-        masked.append(&proof);
+
+        for i in 0..proof.len() {
+            let is_masked = field_mask & (1 << i) != 0;
+            masked.push_back(if is_masked {
+                0u8
+            } else {
+                proof.get(i).unwrap_or(0)
+            });
+        }
 
         if masked.len() > MAX_EXTERNAL_FORMAT_SIZE {
             panic_with_error!(&env, VerifierError::ExternalFormatTooLarge);
@@ -562,7 +648,7 @@ impl ZkVerifierContract {
             .into();
 
         env.storage().instance().set(
-            &DataKey::MaskingConfig(proof_hash),
+            &DataKey::MaskingConfig(proof_hash.clone()),
             &MaskingConfig {
                 masked_fields: masking_spec,
                 version: 1,
@@ -593,14 +679,13 @@ impl ZkVerifierContract {
         let result = env
             .storage()
             .instance()
-            .get::<DataKey, Address>(&DataKey::Attestation(masked_hash, claim_hash))
-            .map(|attesting_oracle| {
+            .get::<DataKey, AttestationRecord>(&DataKey::Attestation(masked_hash, claim_hash))
+            .is_some_and(|record| {
                 env.storage()
                     .instance()
-                    .get::<DataKey, bool>(&DataKey::Oracle(attesting_oracle))
+                    .get::<DataKey, bool>(&DataKey::Oracle(record.oracle))
                     .unwrap_or(false)
-            })
-            .unwrap_or(false);
+            });
 
         if !result {
             panic_with_error!(&env, VerifierError::MaskedVerificationFailed);
@@ -675,8 +760,23 @@ impl ZkVerifierContract {
 
     // ---- helpers ----
 
-    fn is_valid_lattice_proof(proof: &Bytes) -> bool {
-        if proof.len() < LATTICE_PROOF_HEADER.len() {
+    /// Structural format check for `verify_lattice_proof`'s input: `proof`
+    /// must start with [`LATTICE_PROOF_HEADER`] and end with a 4-byte
+    /// checksum (the first 4 bytes of `sha256` over everything before it).
+    ///
+    /// This is **not** a cryptographic verification of any lattice-based
+    /// proof statement — this crate implements no such scheme, so there is
+    /// nothing here that establishes the mathematical claim a real
+    /// post-quantum proof system would. It exists only to reject
+    /// accidental or naively-forged input (e.g. the header alone, or the
+    /// header followed by arbitrary bytes) before the real trust decision
+    /// in `verify_lattice_proof`, which — exactly like `verify_claim` — is
+    /// made entirely by oracle attestation of the exact proof bytes.
+    fn is_valid_lattice_proof(env: &Env, proof: &Bytes) -> bool {
+        const CHECKSUM_LEN: u32 = 4;
+        let header_len = LATTICE_PROOF_HEADER.len() as u32;
+
+        if proof.len() < header_len + CHECKSUM_LEN {
             return false;
         }
 
@@ -686,7 +786,12 @@ impl ZkVerifierContract {
             }
         }
 
-        true
+        let body_len = proof.len() - CHECKSUM_LEN;
+        let body = proof.slice(0..body_len);
+        let checksum = proof.slice(body_len..proof.len());
+        let digest: Bytes = env.crypto().sha256(&body).into();
+
+        digest.slice(0..CHECKSUM_LEN) == checksum
     }
 
     fn record_verification(env: &Env, proof_hash: &BytesN<32>, verified: bool) {
@@ -701,9 +806,12 @@ impl ZkVerifierContract {
         let current_time = env.ledger().timestamp();
 
         history.push_back(VerificationRecord {
-            timestamp: current_time.into(),
+            timestamp: current_time,
             verified,
-            oracle: Address::from_contract_id(&env, &BytesN::from_array(&env, &[0u8; 32])),
+            // `record_verification` isn't handed the attesting oracle (its
+            // callers only have a bool result), so this logs the contract's
+            // own address as a placeholder rather than a real oracle.
+            oracle: env.current_contract_address(),
         });
 
         env.storage()
@@ -714,6 +822,160 @@ impl ZkVerifierContract {
             (AUDIT_LOG_TOPIC,),
             (proof_hash.clone(), current_time, verified),
         );
+    }
+
+    /// Panics with `OracleNotFound` unless `oracle` is currently registered.
+    fn require_registered_oracle(env: &Env, oracle: &Address) {
+        let is_registered = env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::Oracle(oracle.clone()))
+            .unwrap_or(false);
+        if !is_registered {
+            panic_with_error!(env, VerifierError::OracleNotFound);
+        }
+    }
+
+    /// Returns the existing credential_id for `(proof_hash, claim_hash)` if
+    /// this exact pair was attested before, otherwise mints a fresh one.
+    fn mint_or_reuse_credential_id(
+        env: &Env,
+        proof_hash: &BytesN<32>,
+        claim_hash: &BytesN<32>,
+    ) -> u64 {
+        if let Some(existing) =
+            env.storage()
+                .instance()
+                .get::<DataKey, AttestationRecord>(&DataKey::Attestation(
+                    proof_hash.clone(),
+                    claim_hash.clone(),
+                ))
+        {
+            return existing.credential_id;
+        }
+
+        let credential_id = env
+            .storage()
+            .instance()
+            .get::<DataKey, u64>(&DataKey::CredentialCount)
+            .unwrap_or(0)
+            + 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::CredentialCount, &credential_id);
+        env.storage().instance().set(
+            &DataKey::CredentialHashes(credential_id),
+            &(proof_hash.clone(), claim_hash.clone()),
+        );
+
+        credential_id
+    }
+
+    /// Returns whether `credential_id` has been invalidated by an upheld
+    /// dispute. Always `false` for now: nothing currently writes
+    /// `DataKey::CredentialInvalidated` since dispute voting has no public
+    /// entry point yet, but `attest`, `create_derived_credential`, and
+    /// `validate_credential_chain` already gate on it so that future dispute
+    /// resolution work only has to set the flag.
+    pub fn is_credential_invalidated(env: Env, credential_id: u64) -> bool {
+        env.storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::CredentialInvalidated(credential_id))
+            .unwrap_or(false)
+    }
+
+    /// Records a point-in-time snapshot of a credential's attestation state,
+    /// pruning the oldest snapshot once more than MAX_CREDENTIAL_SNAPSHOTS
+    /// are retained for it. See `DataKey::CredentialSnapshot` and friends.
+    fn record_credential_snapshot(
+        env: &Env,
+        credential_id: u64,
+        oracle: Address,
+        invalidated: bool,
+    ) {
+        let timestamp = env.ledger().timestamp();
+        let mut timestamps = env
+            .storage()
+            .instance()
+            .get::<DataKey, Vec<u64>>(&DataKey::CredentialSnapshotTimestamps(credential_id))
+            .unwrap_or_else(|| Vec::new(env));
+        let mut versions = env
+            .storage()
+            .instance()
+            .get::<DataKey, Vec<u32>>(&DataKey::CredentialSnapshotVersions(credential_id))
+            .unwrap_or_else(|| Vec::new(env));
+
+        let version = versions.last().unwrap_or(0) + 1;
+
+        env.storage().instance().set(
+            &DataKey::CredentialSnapshot(credential_id, timestamp),
+            &CredentialSnapshot {
+                credential_id,
+                oracle,
+                invalidated,
+                timestamp,
+                version,
+            },
+        );
+
+        timestamps.push_back(timestamp);
+        versions.push_back(version);
+
+        if timestamps.len() > MAX_CREDENTIAL_SNAPSHOTS {
+            let pruned_timestamp = timestamps.pop_front_unchecked();
+            versions.pop_front_unchecked();
+            env.storage()
+                .instance()
+                .remove(&DataKey::CredentialSnapshot(
+                    credential_id,
+                    pruned_timestamp,
+                ));
+        }
+
+        env.storage().instance().set(
+            &DataKey::CredentialSnapshotTimestamps(credential_id),
+            &timestamps,
+        );
+        env.storage().instance().set(
+            &DataKey::CredentialSnapshotVersions(credential_id),
+            &versions,
+        );
+    }
+
+    /// Returns `credential_id`'s immediate parent, or `None` if it is a root.
+    fn load_parent(env: &Env, credential_id: u64) -> Option<u64> {
+        env.storage()
+            .instance()
+            .get::<DataKey, u64>(&DataKey::CredentialParent(credential_id))
+    }
+
+    /// Walks `credential_id`'s ancestor chain (itself, its parent,
+    /// grandparent, ...), panicking with `CredentialChainTooDeep` past
+    /// MAX_CREDENTIAL_CHAIN_DEPTH hops or `ParentCredentialInvalid` if any
+    /// ancestor has been invalidated by an upheld dispute. Every ancestor
+    /// visited here is assumed to already exist, since `CredentialParent` is
+    /// only ever set (by `create_derived_credential`) to a credential_id
+    /// that was itself validated at the time it became a parent.
+    fn validate_credential_chain(env: &Env, credential_id: u64) {
+        let mut current = credential_id;
+        let mut depth: u32 = 0;
+
+        loop {
+            if Self::is_credential_invalidated(env.clone(), current) {
+                panic_with_error!(env, VerifierError::ParentCredentialInvalid);
+            }
+
+            match Self::load_parent(env, current) {
+                Some(parent) => {
+                    depth += 1;
+                    if depth > MAX_CREDENTIAL_CHAIN_DEPTH {
+                        panic_with_error!(env, VerifierError::CredentialChainTooDeep);
+                    }
+                    current = parent;
+                }
+                None => break,
+            }
+        }
     }
 
     fn require_admin(env: &Env) {
@@ -750,14 +1012,13 @@ impl ZkVerifierContract {
 
         env.storage()
             .instance()
-            .get::<DataKey, Address>(&DataKey::Attestation(proof_hash, claim_hash))
-            .map(|attesting_oracle| {
+            .get::<DataKey, AttestationRecord>(&DataKey::Attestation(proof_hash, claim_hash))
+            .is_some_and(|record| {
                 env.storage()
                     .instance()
-                    .get::<DataKey, bool>(&DataKey::Oracle(attesting_oracle))
+                    .get::<DataKey, bool>(&DataKey::Oracle(record.oracle))
                     .unwrap_or(false)
             })
-            .unwrap_or(false)
     }
 
     /// Verify a batch of credentials with consistency checking.
@@ -788,7 +1049,7 @@ impl ZkVerifierContract {
 
         // Step 1: Verify each credential individually
         for (proof, claim) in proofs.iter().zip(claims.iter()) {
-            if !Self::verify_claim(&env, &proof, &claim) {
+            if !Self::verify_claim(env.clone(), proof, claim) {
                 return false;
             }
         }
