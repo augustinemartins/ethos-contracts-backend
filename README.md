@@ -215,6 +215,33 @@ exit_hibernation(vault_id: u64, caller: Address)
 get_hibernation(vault_id: u64) -> Option<HibernationEntry>
 ```
 
+### Slice Failover (Issue #35)
+
+Protects slices from becoming single points of failure. The vault owner
+pre-registers backup slices; the contract auto-promotes a backup once the
+primary's failure count reaches a configured threshold.
+
+```rust
+// Owner-only: register backup and configure threshold
+register_backup_slice(vault_id, caller, primary_slice_id, backup_slice_id, failure_threshold) -> u64
+
+// Owner-only: record a failure and auto-promote backup when threshold is reached
+record_slice_failure(vault_id, caller, primary_slice_id, reason: FailoverReason) -> bool
+
+// Owner-only: force-promote backup without threshold
+activate_failover(vault_id, caller, primary_slice_id, backup_slice_id, reason) -> bool
+
+// Owner-only: restore primary and reset failure counter
+revert_failover(vault_id, caller, primary_slice_id, backup_slice_id) -> bool
+
+// Read-only queries (no auth required)
+get_backup_slices(primary_slice_id) -> Vec<u64>
+get_active_slice(slice_id) -> u64      // returns primary_id when healthy, backup_id when failed over
+get_failure_count(slice_id) -> u32
+```
+
+See [docs/slice-performance-and-rules-engine.md](docs/slice-performance-and-rules-engine.md) for full details.
+
 ## 🧪 Testing
 
 Comprehensive test suite covering:
@@ -224,6 +251,7 @@ Comprehensive test suite covering:
 ✅ TTL expiry and automatic release  
 ✅ Passkey authentication validation  
 ✅ Beneficiary payout execution  
+✅ Slice failover — authorized promotion and unauthorized rejection  
 ✅ Error handling and edge cases  
 
 Run tests:

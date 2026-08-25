@@ -49,7 +49,7 @@ bound the replay window.
 - A snapshot captures the vault's materialized state (balance, status, TTL, last
   check-in) at a specific `snapshot_sequence`.
 - Replay loads the snapshot, then only applies events with `sequence > snapshot_sequence`.
-- Snapshots are stored in `SnapshotStore` (in-memory; can be persisted to SQLite via `Db`).
+- Snapshots are stored in `SnapshotStore` and persisted to SQLite (durable) via `Db`.
 
 ```rust
 // Take a snapshot after processing the 100th event
@@ -99,11 +99,32 @@ let historical = replayer.replay_to("vault-abc", 50)?;
 | `status_change` | `status: string` | Updates vault status |
 | `release` | _(none required)_ | Sets status `released`, zeroes balance |
 
+## Durability and Persistence (#267)
+
+As of #267, events and snapshots are persisted to SQLite durably:
+
+- **Events table**: All events are written to the `events` table before `append()` returns.
+  Each row stores: `vault_id`, `sequence`, `event_type`, `timestamp`, `data` (JSON),
+  `schema_version`.
+- **Snapshots table**: Snapshots are written to the `snapshots` table (via UPSERT) when
+  `save()` is called. Each row stores: `vault_id`, `snapshot_sequence`, `taken_at`,
+  `state` (JSON).
+- **In-memory cache**: The in-memory Vec and HashMap are still maintained for quick replay
+  within the same process, but the database is the authoritative source of truth.
+- **Bounded retention**: Events and snapshots can be archived or pruned via
+  `Db::delete_old_events()` and `Db::delete_old_snapshots()` — recommended policy is to
+  keep snapshots every 100 events (or on vault release), then prune events older than 90
+  days (configurable per deployment).
+
 ## Integration with `AppState`
 
-`EventSourcingState` is injected into `AppState.event_sourcing`:
+`EventSourcingState` is injected into `AppState.event_sourcing` with database persistence
+enabled during initialization:
 
 ```rust
+// In main.rs during startup:
+let event_sourcing = EventSourcingState::with_db(db);
+
 // In a handler:
 let replayer = state.event_sourcing.replayer();
 let current = replayer.replay(&vault_id)?;
