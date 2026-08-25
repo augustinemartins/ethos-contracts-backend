@@ -19,6 +19,7 @@ pub mod ranking;
 pub mod slice_attribute_matching;
 pub mod slice_consensus_voting;
 pub mod slice_cost_tracking;
+pub mod slice_failover;
 pub mod slice_performance;
 pub mod template_inheritance;
 mod types;
@@ -130,6 +131,8 @@ mod passkey_escrow_tests;
 mod passkey_expiry_notification_tests;
 #[cfg(test)]
 mod regression_tests;
+#[cfg(test)]
+mod slice_failover_tests;
 #[cfg(test)]
 mod slice_performance_tests;
 #[cfg(test)]
