@@ -179,3 +179,153 @@ mod tests {
         });
     }
 }
+
+/// Tests that exercise the `#[contractimpl]` entry points on
+/// `TtlVaultContract` (via `TtlVaultContractClient`) rather than calling into
+/// `credential_anchoring` directly, proving the feature is reachable
+/// end-to-end (Issue #265).
+#[cfg(test)]
+mod contract_wiring_tests {
+    use crate::{ContractError, TtlVaultContract, TtlVaultContractClient};
+    use soroban_sdk::{testutils::Address as _, Address, Bytes, Env};
+
+    fn setup() -> (Env, Address, TtlVaultContractClient<'static>) {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let xlm_token = Address::generate(&env);
+        let contract_address = env.register_contract(None, TtlVaultContract);
+        let client = TtlVaultContractClient::new(&env, &contract_address);
+        client.initialize(&xlm_token, &admin);
+
+        let caller = Address::generate(&env);
+        (env, caller, client)
+    }
+
+    #[test]
+    fn test_create_verify_and_get_via_entry_points() {
+        let (env, caller, client) = setup();
+        let credential_id = 7u64;
+        let external_id = Bytes::from_slice(&env, b"external-id-abc");
+        let system = Bytes::from_slice(&env, b"kyc-v1");
+
+        client.create_credential_anchor(&caller, &credential_id, &external_id, &system);
+
+        let found = client.verify_external_anchor(&external_id, &system);
+        assert_eq!(found, Some(credential_id));
+
+        let anchors = client.get_credential_anchors(&credential_id);
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(anchors.get(0).unwrap().external_id, external_id);
+        assert_eq!(anchors.get(0).unwrap().system, system);
+    }
+
+    #[test]
+    fn test_remove_via_entry_point() {
+        let (env, caller, client) = setup();
+        let credential_id = 8u64;
+        let external_id = Bytes::from_slice(&env, b"external-id-def");
+        let system = Bytes::from_slice(&env, b"gov-id");
+
+        client.create_credential_anchor(&caller, &credential_id, &external_id, &system);
+        client.remove_credential_anchor(&caller, &credential_id, &external_id, &system);
+
+        assert_eq!(client.verify_external_anchor(&external_id, &system), None);
+    }
+
+    #[test]
+    fn test_remove_nonexistent_anchor_rejected() {
+        let (env, caller, client) = setup();
+        let external_id = Bytes::from_slice(&env, b"never-created");
+        let system = Bytes::from_slice(&env, b"kyc-v1");
+
+        let err = client
+            .try_remove_credential_anchor(&caller, &1u64, &external_id, &system)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ContractError::AnchorNotFound);
+    }
+
+    #[test]
+    fn test_duplicate_anchor_rejected_via_entry_point() {
+        let (env, caller, client) = setup();
+        let credential_id = 9u64;
+        let external_id = Bytes::from_slice(&env, b"external-id-dup");
+        let system = Bytes::from_slice(&env, b"hr-db");
+
+        client.create_credential_anchor(&caller, &credential_id, &external_id, &system);
+
+        let err = client
+            .try_create_credential_anchor(&caller, &credential_id, &external_id, &system)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ContractError::AnchorAlreadyExists);
+    }
+
+    #[test]
+    fn test_empty_external_id_rejected() {
+        let (env, caller, client) = setup();
+        let empty_external_id = Bytes::new(&env);
+        let system = Bytes::from_slice(&env, b"kyc-v1");
+
+        let err = client
+            .try_create_credential_anchor(&caller, &1u64, &empty_external_id, &system)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ContractError::InvalidExternalId);
+    }
+
+    #[test]
+    fn test_empty_system_rejected() {
+        let (env, caller, client) = setup();
+        let external_id = Bytes::from_slice(&env, b"external-id-xyz");
+        let empty_system = Bytes::new(&env);
+
+        let err = client
+            .try_create_credential_anchor(&caller, &1u64, &external_id, &empty_system)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ContractError::InvalidAnchorSystem);
+    }
+
+    #[test]
+    fn test_oversized_system_rejected() {
+        let (env, caller, client) = setup();
+        let external_id = Bytes::from_slice(&env, b"external-id-xyz");
+        let oversized_system = Bytes::from_slice(&env, &[b'a'; 65]);
+
+        let err = client
+            .try_create_credential_anchor(&caller, &1u64, &external_id, &oversized_system)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ContractError::InvalidAnchorSystem);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_unauthorized_caller_cannot_create_anchor() {
+        let (env, caller, client) = setup();
+        // Withdraw the mocked authorization: no address has signed this
+        // invocation, so `caller.require_auth()` inside the entry point must
+        // reject the call. This proves a caller cannot anchor a credential
+        // without authorizing the call themselves.
+        env.set_auths(&[]);
+
+        let external_id = Bytes::from_slice(&env, b"external-id-unauth");
+        let system = Bytes::from_slice(&env, b"kyc-v1");
+        client.create_credential_anchor(&caller, &2u64, &external_id, &system);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_unauthorized_caller_cannot_remove_anchor() {
+        let (env, caller, client) = setup();
+        let external_id = Bytes::from_slice(&env, b"external-id-unauth-2");
+        let system = Bytes::from_slice(&env, b"kyc-v1");
+        client.create_credential_anchor(&caller, &3u64, &external_id, &system);
+
+        env.set_auths(&[]);
+        client.remove_credential_anchor(&caller, &3u64, &external_id, &system);
+    }
+}
