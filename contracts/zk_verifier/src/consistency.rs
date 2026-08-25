@@ -29,7 +29,7 @@ pub enum ConsistencyError {
 
 /// Identifies the type/class of a credential (e.g., "age", "kyc", "jurisdiction").
 /// Used to determine which conflict rules apply.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CredentialType {
     /// Soroban Symbol encoding the credential type.
     pub type_key: Symbol,
@@ -65,7 +65,7 @@ pub trait ConflictRule {
 pub struct AgeConflictRule;
 
 impl ConflictRule for AgeConflictRule {
-    fn are_compatible(env: &Env, claim_a: &Bytes, claim_b: &Bytes) -> bool {
+    fn are_compatible(_env: &Env, claim_a: &Bytes, claim_b: &Bytes) -> bool {
         if claim_a == claim_b {
             return true;
         }
@@ -90,7 +90,7 @@ impl ConflictRule for AgeConflictRule {
 pub struct KycStatusConflictRule;
 
 impl ConflictRule for KycStatusConflictRule {
-    fn are_compatible(env: &Env, claim_a: &Bytes, claim_b: &Bytes) -> bool {
+    fn are_compatible(_env: &Env, claim_a: &Bytes, claim_b: &Bytes) -> bool {
         if claim_a == claim_b {
             return true;
         }
@@ -104,8 +104,8 @@ impl ConflictRule for KycStatusConflictRule {
         }
     }
 
-    fn conflict_reason(_env: &Env) -> Bytes {
-        Bytes::from_slice(_env, b"KYC status conflict")
+    fn conflict_reason(env: &Env) -> Bytes {
+        Bytes::from_slice(env, b"KYC status conflict")
     }
 }
 
@@ -128,7 +128,7 @@ impl CredentialRegistry {
             return Err(ConsistencyError::EmptyBatch);
         }
 
-        for (id_a, claim_a, id_b, claim_b) in credential_pairs.iter() {
+        for (_id_a, claim_a, _id_b, claim_b) in credential_pairs.iter() {
             if !Self::are_credentials_compatible(env, &claim_a, &claim_b) {
                 return Err(ConsistencyError::ConflictDetected);
             }
@@ -223,6 +223,15 @@ fn is_age_claim(claim: &Bytes) -> bool {
     }
 }
 
+/// Heuristic: a claim is a KYC status claim if its first byte decodes to a
+/// known `KycStatus` variant (pending/approved/rejected).
+fn is_kyc_status_claim(claim: &Bytes) -> bool {
+    matches!(
+        extract_kyc_status(claim),
+        Ok(KycStatus::Pending | KycStatus::Approved | KycStatus::Rejected)
+    )
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum KycStatus {
     Pending,
@@ -252,13 +261,16 @@ fn kyc_statuses_compatible(a: KycStatus, b: KycStatus) -> bool {
     // pending + approved = OK (both express KYC in progress or done)
     // pending + rejected = CONFLICT
     // approved + rejected = CONFLICT
-    match (a, b) {
-        (KycStatus::Pending, KycStatus::Rejected) => false,
-        (KycStatus::Rejected, KycStatus::Pending) => false,
-        (KycStatus::Approved, KycStatus::Rejected) => false,
-        (KycStatus::Rejected, KycStatus::Approved) => false,
-        _ => true,
-    }
+    !matches!(
+        (a, b),
+        (
+            KycStatus::Pending | KycStatus::Approved,
+            KycStatus::Rejected
+        ) | (
+            KycStatus::Rejected,
+            KycStatus::Pending | KycStatus::Approved
+        )
+    )
 }
 
 #[cfg(test)]

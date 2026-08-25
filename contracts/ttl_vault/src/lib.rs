@@ -132,6 +132,8 @@ mod passkey_expiry_notification_tests;
 mod regression_tests;
 #[cfg(test)]
 mod slice_performance_tests;
+#[cfg(test)]
+mod withdrawal_escrow_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
@@ -355,6 +357,11 @@ pub enum ContractError {
     // Issue #37: template inheritance
     TemplateNotFound = 118,
     InheritanceCycleDetected = 119,
+    // Issue #32: credential anchoring to external systems
+    AnchorAlreadyExists = 120,
+    AnchorNotFound = 121,
+    InvalidExternalId = 122,
+    InvalidAnchorSystem = 123,
 }
 
 #[contract]
@@ -2379,19 +2386,32 @@ impl TtlVaultContract {
     /// * `vault_id` - The vault ID
     /// * `amount` - The amount to hold in escrow
     /// * `beneficiary` - The beneficiary address
+    /// * `caller` - The caller address (must be the vault owner)
     ///
     /// # Returns
     /// `Ok(())` on success
+    ///
+    /// # Errors
+    /// * `ContractError::InvalidAmount` - If amount is not positive
+    /// * `ContractError::VaultNotFound` - If the vault does not exist
+    /// * `ContractError::NotOwner` - If caller is not the vault owner
+    /// * `ContractError::InsufficientBalance` - If vault balance is less than amount
     pub fn create_withdrawal_escrow(
         env: Env,
         vault_id: u64,
         amount: i128,
         beneficiary: Address,
+        caller: Address,
     ) -> Result<(), ContractError> {
         if amount <= 0 {
             return Err(ContractError::InvalidAmount);
         }
+        caller.require_auth();
+
         let vault = Self::try_load_vault(&env, vault_id).ok_or(ContractError::VaultNotFound)?;
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
         if vault.balance < amount {
             return Err(ContractError::InsufficientBalance);
         }
@@ -2426,10 +2446,22 @@ impl TtlVaultContract {
     /// # Arguments
     /// * `env` - The Soroban environment
     /// * `vault_id` - The vault ID
+    /// * `caller` - The caller address (must be the escrow's beneficiary)
     ///
     /// # Returns
     /// `Ok(())` on success
-    pub fn verify_withdrawal_escrow(env: Env, vault_id: u64) -> Result<(), ContractError> {
+    ///
+    /// # Errors
+    /// * `ContractError::VaultNotFound` - If no escrow exists for the vault
+    /// * `ContractError::NotBeneficiary` - If caller is not the escrow's beneficiary
+    /// * `ContractError::InvalidAmount` - If the escrow was already verified
+    pub fn verify_withdrawal_escrow(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+
         let mut vault = Self::load_vault(&env, vault_id);
         let escrow = env
             .storage()
@@ -2437,6 +2469,9 @@ impl TtlVaultContract {
             .get::<DataKey, WithdrawalEscrow>(&DataKey::WithdrawalEscrow(vault_id))
             .ok_or(ContractError::VaultNotFound)?;
 
+        if caller != escrow.beneficiary {
+            return Err(ContractError::NotBeneficiary);
+        }
         if escrow.verified {
             return Err(ContractError::InvalidAmount);
         }
@@ -14753,183 +14788,78 @@ impl TtlVaultContract {
         composition_rules::get_slice_rules(&env, slice_id)
     }
 
-    // --- Slice Consensus Voting (Issue #266) ---
+    // ── Issue #32: Credential Anchoring to External Systems ───────────────────
 
-    /// Propose a slice modification requiring attestor consensus approval.
+    /// Anchor `credential_id` to `external_id` within `system`.
     ///
-    /// Only the owner of the vault can propose modifications.
-    /// Returns the proposal ID if successful.
+    /// This contract does not track credential ownership, so any caller may
+    /// register an anchor as long as they authorize the call themselves.
     ///
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `vault_id` - The vault ID (for authorization)
-    /// * `slice_id` - The slice being modified
-    /// * `proposer` - The address proposing the modification (must be vault owner)
-    /// * `proposed_changes` - Serialized `SliceModification` describing the change
-    ///
-    /// # Returns
-    /// The proposal ID if successful, 0 if the proposal could not be created.
-    pub fn propose_slice_modification(
+    /// # Errors
+    /// * `InvalidExternalId` — `external_id` is empty or exceeds
+    ///   `credential_anchoring::MAX_EXTERNAL_ID_LEN`.
+    /// * `InvalidAnchorSystem` — `system` is empty or exceeds
+    ///   `credential_anchoring::MAX_SYSTEM_LEN`.
+    /// * `AnchorAlreadyExists` — an anchor for `(external_id, system)` already
+    ///   exists; remove it first via `remove_credential_anchor`.
+    pub fn create_credential_anchor(
         env: Env,
-        vault_id: u64,
-        slice_id: u64,
-        proposer: Address,
-        proposed_changes: Bytes,
-    ) -> u64 {
-        let vault = Self::load_vault(&env, vault_id);
-        vault.owner.require_auth();
+        caller: Address,
+        credential_id: u64,
+        external_id: Bytes,
+        system: Bytes,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        if external_id.is_empty() || external_id.len() > credential_anchoring::MAX_EXTERNAL_ID_LEN {
+            return Err(ContractError::InvalidExternalId);
+        }
+        if system.is_empty() || system.len() > credential_anchoring::MAX_SYSTEM_LEN {
+            return Err(ContractError::InvalidAnchorSystem);
+        }
+        if credential_anchoring::create_credential_anchor(&env, credential_id, external_id, system)
+        {
+            Ok(())
+        } else {
+            Err(ContractError::AnchorAlreadyExists)
+        }
+    }
 
-        slice_consensus_voting::propose_slice_modification(
+    /// Look up the credential ID anchored to `(external_id, system)`, if any.
+    /// Read-only; no authorization required.
+    pub fn verify_external_anchor(env: Env, external_id: Bytes, system: Bytes) -> Option<u64> {
+        credential_anchoring::verify_external_anchor(&env, &external_id, &system)
+    }
+
+    /// Remove the anchor for `(external_id, system)` from `credential_id`.
+    ///
+    /// # Errors
+    /// * `AnchorNotFound` — no anchor exists for `(external_id, system)`.
+    pub fn remove_credential_anchor(
+        env: Env,
+        caller: Address,
+        credential_id: u64,
+        external_id: Bytes,
+        system: Bytes,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        if credential_anchoring::remove_credential_anchor(
             &env,
-            slice_id,
-            proposed_changes,
-            proposer,
-        )
+            credential_id,
+            &external_id,
+            &system,
+        ) {
+            Ok(())
+        } else {
+            Err(ContractError::AnchorNotFound)
+        }
     }
 
-    /// Cast a vote on a slice modification proposal.
-    ///
-    /// Only registered attestors can vote. Each attestor votes once.
-    /// Returns true if the vote was recorded successfully.
-    ///
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `slice_id` - The slice being modified
-    /// * `proposal_id` - The proposal ID to vote on
-    /// * `voter` - The address voting (must be a registered attestor)
-    /// * `approve` - true to approve, false to reject
-    ///
-    /// # Returns
-    /// true if the vote was recorded, false if the voter is not an attestor,
-    /// already voted, or the proposal is not in voting phase.
-    pub fn cast_attestor_vote(
+    /// Retrieve all anchors registered for `credential_id`.
+    /// Read-only; no authorization required.
+    pub fn get_credential_anchors(
         env: Env,
-        slice_id: u64,
-        proposal_id: u64,
-        voter: Address,
-        approve: bool,
-    ) -> bool {
-        voter.require_auth();
-        slice_consensus_voting::vote_on_modification(&env, slice_id, proposal_id, voter, approve)
-    }
-
-    /// Finalize voting on a slice modification proposal.
-    ///
-    /// Called after the voting deadline to tally votes and set the proposal status.
-    /// Proposals are approved if >= 50% of attestors voted in favor.
-    /// Returns true if the proposal was resolved, false if already resolved.
-    ///
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `slice_id` - The slice being modified
-    /// * `proposal_id` - The proposal ID to finalize
-    ///
-    /// # Returns
-    /// true if the proposal was resolved, false if already resolved or invalid.
-    pub fn resolve_slice_voting(env: Env, slice_id: u64, proposal_id: u64) -> bool {
-        slice_consensus_voting::resolve_modification_voting(&env, slice_id, proposal_id)
-    }
-
-    /// Execute an approved slice modification.
-    ///
-    /// Only callable after voting is finalized and the proposal is approved.
-    /// Applies the modification to slice state and records it in history.
-    /// Returns true if execution was successful, false if proposal is not approved
-    /// or already executed.
-    ///
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `vault_id` - The vault ID (for authorization; the vault owner must execute)
-    /// * `slice_id` - The slice being modified
-    /// * `proposal_id` - The proposal ID to execute
-    ///
-    /// # Returns
-    /// true if the modification was executed successfully, false otherwise.
-    pub fn execute_slice_modification(
-        env: Env,
-        vault_id: u64,
-        slice_id: u64,
-        proposal_id: u64,
-    ) -> bool {
-        let vault = Self::load_vault(&env, vault_id);
-        vault.owner.require_auth();
-
-        slice_consensus_voting::execute_slice_modification(&env, slice_id, proposal_id)
-    }
-
-    /// Get a slice modification proposal.
-    ///
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `slice_id` - The slice ID
-    /// * `proposal_id` - The proposal ID
-    ///
-    /// # Returns
-    /// The proposal if found, None otherwise.
-    pub fn get_slice_proposal(
-        env: Env,
-        slice_id: u64,
-        proposal_id: u64,
-    ) -> Option<slice_consensus_voting::ModificationProposal> {
-        slice_consensus_voting::get_modification_proposal(&env, slice_id, proposal_id)
-    }
-
-    /// Get the modification history for a slice.
-    ///
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `slice_id` - The slice ID
-    ///
-    /// # Returns
-    /// A vector of executed modifications for this slice.
-    pub fn get_slice_modification_history(
-        env: Env,
-        slice_id: u64,
-    ) -> Vec<slice_consensus_voting::ModificationRecord> {
-        slice_consensus_voting::get_modification_history(&env, slice_id)
-    }
-
-    /// Get the current vote counts for a proposal.
-    ///
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `slice_id` - The slice ID
-    /// * `proposal_id` - The proposal ID
-    ///
-    /// # Returns
-    /// A tuple of (approve_count, reject_count) if the proposal exists, None otherwise.
-    pub fn get_slice_proposal_votes(
-        env: Env,
-        slice_id: u64,
-        proposal_id: u64,
-    ) -> Option<(u32, u32)> {
-        slice_consensus_voting::get_proposal_votes(&env, slice_id, proposal_id)
-    }
-
-    /// Register the list of attestors eligible to vote on slice modifications.
-    ///
-    /// Only the admin can call this function.
-    /// This list is used to determine quorum requirements for voting.
-    ///
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `attestors` - Vector of attestor addresses
-    ///
-    /// # Panics
-    /// Panics if the caller is not the admin
-    pub fn register_slice_attestors(env: Env, attestors: Vec<Address>) {
-        Self::require_admin(&env);
-        slice_consensus_voting::register_attestor_registry(&env, attestors);
-    }
-
-    /// Get the list of registered attestors for slice voting.
-    ///
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    ///
-    /// # Returns
-    /// Vector of registered attestor addresses.
-    pub fn get_slice_attestors(env: Env) -> Vec<Address> {
-        slice_consensus_voting::get_attestor_registry(&env)
+        credential_id: u64,
+    ) -> Vec<credential_anchoring::CredentialAnchor> {
+        credential_anchoring::get_credential_anchors(&env, credential_id)
     }
 }
