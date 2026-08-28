@@ -122,6 +122,16 @@ pub fn get_credential_chain(env: Env, credential_id: u64) -> Vec<u64>
 /// Returns whether a credential and every one of its ancestors is
 /// currently valid (none invalidated by an upheld dispute).
 pub fn is_credential_chain_valid(env: Env, credential_id: u64) -> bool
+
+/// Returns whether the credential's scheduled consistency re-check is due
+/// (now >= next_check_due), publishing a `cons_due` event with
+/// (credential_id, next_check_due) when it is. Never-attested ids are never due.
+pub fn is_consistency_check_due(env: Env, credential_id: u64) -> bool
+
+/// Advances a credential's consistency-check window by one full
+/// CONSISTENCY_CHECK_INTERVAL from the current timestamp, after a completed
+/// re-check. Panics with CredentialNotFound if never attested. Anyone may call it.
+pub fn reschedule_consistency_check(env: Env, credential_id: u64)
 ```
 
 ### Current Verification Logic
@@ -545,6 +555,42 @@ already requires the caller to possess the exact `proof` and `claim` bytes,
 so it authenticates via knowledge of the secret rather than identity, and
 restricting it further would not add confidentiality — only availability
 loss for legitimate holders of a confidential credential's proof.
+
+---
+
+## Scheduled Consistency Re-Checks
+
+`verify_credentials_consistent` (and `CredentialRegistry` in
+`src/consistency.rs`) provides on-demand consistency verification, but until
+this feature there was no way to schedule periodic re-checks for long-lived
+attestations. Every attestation now tracks a `next_check_due` timestamp:
+
+- **Scheduling**: `attest` and `create_derived_credential` set
+  `next_check_due` to the attestation time plus `CONSISTENCY_CHECK_INTERVAL`
+  (30 days). Re-attesting an existing `(proof, claim)` pair refreshes the
+  schedule.
+- **Detection**: `is_consistency_check_due(credential_id)` returns `true`
+  once the ledger timestamp is at or past `next_check_due`. When due it also
+  publishes a `cons_due` event with `(credential_id, next_check_due)` so
+  off-chain workers can pick the credential up for re-verification (e.g. via
+  `verify_credentials_consistent`). Unknown credential ids are never due
+  (absence means no schedule), mirroring `is_credential_invalidated`.
+- **Periodicity**: a due check stays due until an off-chain worker completes
+  the re-check and calls `reschedule_consistency_check(credential_id)`, which
+  pushes the next window out by one full `CONSISTENCY_CHECK_INTERVAL` from
+  the current timestamp. Anyone may call it — it only moves a timer forward.
+  Without this step the check would be due-once-and-forever instead of
+  periodic.
+
+Note: because publishing an event requires a real transaction, off-chain
+workers must *invoke* `is_consistency_check_due` (not view-call it) for the
+`cons_due` event to be recorded; the boolean result is available either way.
+
+Adding `next_check_due` to the stored `AttestationRecord` changes its XDR
+layout, so attestation records persisted by an older contract version would
+fail to decode — in this stub's lifecycle that only matters for contracts
+that were already deployed before the field existed, and is resolved by
+re-attestation (which rewrites the record with a fresh schedule).
 
 ---
 

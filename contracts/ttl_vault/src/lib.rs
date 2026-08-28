@@ -139,6 +139,8 @@ mod regression_tests;
 #[cfg(test)]
 mod slice_failover_tests;
 #[cfg(test)]
+mod slice_consensus_voting_tests;
+#[cfg(test)]
 mod slice_performance_tests;
 #[cfg(test)]
 mod withdrawal_escrow_tests;
@@ -384,6 +386,8 @@ pub enum ContractError {
     // Issue #37: template inheritance
     TemplateNotFound = 124,
     InheritanceCycleDetected = 125,
+    // Slice consensus voting: finalization attempted below the minimum quorum
+    InsufficientQuorum = 126,
 }
 
 #[contract]
