@@ -36,12 +36,20 @@ pub const MAX_CREDENTIAL_SNAPSHOTS: u32 = 1000;
 /// validating a parent's ancestry, so that chain walks (and the gas they
 /// cost) stay bounded. See docs/zk-verifier.md, "Credential Hierarchies".
 pub const MAX_CREDENTIAL_CHAIN_DEPTH: u32 = 32;
+/// Number of ledger seconds between scheduled consistency re-checks for a
+/// long-lived attestation. `attest` and `create_derived_credential` schedule
+/// the first check this far after attestation; each completed re-check (via
+/// [`ZkVerifierContract::reschedule_consistency_check`]) pushes the next one
+/// out by the same window. See docs/zk-verifier.md, "Scheduled Consistency
+/// Re-Checks".
+pub const CONSISTENCY_CHECK_INTERVAL: u64 = 30 * 24 * 60 * 60;
 
 const VERIFY_CLAIM_TOPIC: soroban_sdk::Symbol = symbol_short!("vfy_claim");
 const VERIFY_CONDITIONAL_TOPIC: soroban_sdk::Symbol = symbol_short!("vfy_cond");
 const VERIFY_LATTICE_TOPIC: soroban_sdk::Symbol = symbol_short!("vfy_latt");
 const AUDIT_LOG_TOPIC: soroban_sdk::Symbol = symbol_short!("audit_log");
 const PROOF_MASKED_TOPIC: soroban_sdk::Symbol = symbol_short!("proof_msk");
+const CONSISTENCY_DUE_TOPIC: soroban_sdk::Symbol = symbol_short!("cons_due");
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -214,6 +222,13 @@ use keys::{DataKey, MaskingConfig, VerificationRecord};
 pub struct AttestationRecord {
     pub credential_id: u64,
     pub oracle: Address,
+    /// Ledger timestamp at which the attestation's next scheduled
+    /// consistency re-check becomes due. Set to `attestation time +
+    /// CONSISTENCY_CHECK_INTERVAL` at attestation (and re-attestation), and
+    /// advanced by `reschedule_consistency_check` after each completed
+    /// re-check. See `is_consistency_check_due` and
+    /// docs/zk-verifier.md, "Scheduled Consistency Re-Checks".
+    pub next_check_due: u64,
 }
 
 /// A point-in-time snapshot of a credential's attestation state, captured
@@ -364,6 +379,10 @@ impl ZkVerifierContract {
             &AttestationRecord {
                 credential_id,
                 oracle: oracle.clone(),
+                next_check_due: env
+                    .ledger()
+                    .timestamp()
+                    .saturating_add(CONSISTENCY_CHECK_INTERVAL),
             },
         );
 
@@ -447,6 +466,10 @@ impl ZkVerifierContract {
             &AttestationRecord {
                 credential_id,
                 oracle: oracle.clone(),
+                next_check_due: env
+                    .ledger()
+                    .timestamp()
+                    .saturating_add(CONSISTENCY_CHECK_INTERVAL),
             },
         );
 
@@ -1070,6 +1093,84 @@ impl ZkVerifierContract {
             Ok(()) => true,
             Err(_) => false,
         }
+    }
+
+    /// Returns whether the credential's scheduled consistency re-check is
+    /// due: the current ledger timestamp is at or past the attestation's
+    /// `next_check_due` (set at attestation, advanced by
+    /// [`Self::reschedule_consistency_check`]). Mirrors
+    /// [`Self::is_credential_invalidated`]'s absence semantics — a
+    /// credential id that was never attested has no schedule and is never
+    /// due, so this returns `false` rather than panicking.
+    ///
+    /// When the check is due, this also publishes a `cons_due` event
+    /// carrying `(credential_id, next_check_due)` so off-chain workers can
+    /// pick the credential up for re-verification (e.g. via
+    /// [`Self::verify_credentials_consistent`]) — the same "return a bool
+    /// and emit an event" shape as `verify_claim`'s `vfy_claim` event.
+    /// Publishing an event requires an actual transaction, so workers must
+    /// *invoke* this (not view-call it) for the event to be recorded; the
+    /// boolean result is available either way.
+    ///
+    /// A due check stays due until [`Self::reschedule_consistency_check`]
+    /// advances the window, so a worker that misses one poll can still act
+    /// on the next.
+    pub fn is_consistency_check_due(env: Env, credential_id: u64) -> bool {
+        let Some((proof_hash, claim_hash)) = env
+            .storage()
+            .instance()
+            .get::<DataKey, (BytesN<32>, BytesN<32>)>(&DataKey::CredentialHashes(credential_id))
+        else {
+            return false;
+        };
+        let Some(record) = env.storage().instance().get::<DataKey, AttestationRecord>(
+            &DataKey::Attestation(proof_hash, claim_hash),
+        ) else {
+            return false;
+        };
+
+        let due = env.ledger().timestamp() >= record.next_check_due;
+        if due {
+            env.events().publish(
+                (CONSISTENCY_DUE_TOPIC,),
+                (credential_id, record.next_check_due),
+            );
+        }
+        due
+    }
+
+    /// Advances a credential's consistency-check schedule by one full
+    /// [`CONSISTENCY_CHECK_INTERVAL`] from the current ledger timestamp.
+    ///
+    /// Off-chain workers call this after performing the re-verification the
+    /// `cons_due` event signalled, which is what makes the check *periodic*
+    /// rather than due-once-and-forever. It has no privileged inputs — it
+    /// only moves a timer forward — so anyone may call it. Panics with
+    /// `CredentialNotFound` if `credential_id` was never attested.
+    pub fn reschedule_consistency_check(env: Env, credential_id: u64) {
+        let Some((proof_hash, claim_hash)) = env
+            .storage()
+            .instance()
+            .get::<DataKey, (BytesN<32>, BytesN<32>)>(&DataKey::CredentialHashes(credential_id))
+        else {
+            panic_with_error!(&env, VerifierError::CredentialNotFound);
+        };
+
+        let mut record = env
+            .storage()
+            .instance()
+            .get::<DataKey, AttestationRecord>(&DataKey::Attestation(
+                proof_hash.clone(),
+                claim_hash.clone(),
+            ))
+            .unwrap_or_else(|| panic_with_error!(&env, VerifierError::CredentialNotFound));
+        record.next_check_due = env
+            .ledger()
+            .timestamp()
+            .saturating_add(CONSISTENCY_CHECK_INTERVAL);
+        env.storage()
+            .instance()
+            .set(&DataKey::Attestation(proof_hash, claim_hash), &record);
     }
 }
 
