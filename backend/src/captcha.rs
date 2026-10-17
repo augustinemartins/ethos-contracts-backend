@@ -19,10 +19,11 @@
 #![allow(clippy::unused_async)]
 
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 use axum::{
-    extract::State,
+    extract::{ConnectInfo, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
@@ -164,23 +165,8 @@ pub fn consecutive_failures_for_ip(ip: &str) -> u32 {
 
 // ── Helper: extract IP from request headers ───────────────────────────────────
 
-fn extract_ip(headers: &HeaderMap) -> String {
-    // Prefer X-Forwarded-For (first entry), fall back to X-Real-IP.
-    if let Some(val) = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-    {
-        return val
-            .split(',')
-            .next()
-            .unwrap_or("unknown")
-            .trim()
-            .to_string();
-    }
-    if let Some(val) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
-        return val.to_string();
-    }
-    "unknown".to_string()
+fn extract_ip(headers: &HeaderMap, peer_ip: IpAddr) -> String {
+    crate::audit::extract_client_ip(headers, Some(peer_ip))
 }
 
 /// Extract the optional `X-User-ID` header value.
@@ -389,14 +375,15 @@ pub async fn verify_captcha(
 
 /// `POST /captcha/challenge`
 ///
-/// Inspects `X-Forwarded-For` / `X-User-ID` headers.  If the caller is a
-/// trusted user, returns `204 No Content` (no challenge needed).  Otherwise,
-/// issues a challenge and returns `200 OK` with the `CaptchaChallenge` body.
+/// Uses the socket peer IP and honors forwarded headers only from a trusted
+/// proxy. If the caller is a trusted user, returns `204 No Content` (no
+/// challenge needed); otherwise, issues a challenge and returns `200 OK`.
 pub async fn post_challenge_handler(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
-    let ip = extract_ip(&headers);
+    let ip = extract_ip(&headers, peer.ip());
     let user_id = extract_user_id(&headers).unwrap_or_default();
 
     // Trusted users are exempt.
@@ -426,9 +413,10 @@ pub async fn post_challenge_handler(
 pub async fn post_verify_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Json(req): Json<CaptchaVerifyRequest>,
 ) -> Result<Json<CaptchaVerifyResponse>, AppError> {
-    let ip = extract_ip(&headers);
+    let ip = extract_ip(&headers, peer.ip());
 
     if is_backoff_active(&ip) {
         return Err(AppError::TooManyRequests(
@@ -803,7 +791,8 @@ mod tests {
             user_token: "irrelevant".to_string(),
         };
 
-        let result = post_verify_handler(State(state), headers, Json(req)).await;
+        let peer = ConnectInfo("203.0.113.15:3000".parse().unwrap());
+        let result = post_verify_handler(State(state), headers, peer, Json(req)).await;
         match result {
             Err(AppError::TooManyRequests(_)) => {}
             other => panic!("expected TooManyRequests, got {other:?}"),

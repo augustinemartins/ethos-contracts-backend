@@ -1,8 +1,9 @@
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use axum::{
     body::Body,
-    extract::State,
+    extract::{ConnectInfo, State},
     http::{HeaderMap, Request, StatusCode},
     middleware::Next,
     response::Response,
@@ -26,7 +27,11 @@ pub async fn audit_middleware(
         return next.run(req).await;
     }
 
-    let ip = extract_client_ip(req.headers());
+    let peer_ip = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.ip());
+    let ip = extract_client_ip(req.headers(), peer_ip);
     let user_id = extract_user_id(req.headers());
 
     let response = next.run(req).await;
@@ -79,7 +84,7 @@ pub fn log_state_modification(
         action: action.to_string(),
         resource: resource.to_string(),
         result: result.to_string(),
-        ip_address: extract_client_ip(headers),
+        ip_address: extract_client_ip(headers, None),
         details,
     };
     if let Err(e) = db.insert_audit_log(&entry) {
@@ -107,19 +112,61 @@ pub fn authorize_admin(headers: &HeaderMap) -> Result<(), ApiError> {
     }
 }
 
-fn extract_client_ip(headers: &HeaderMap) -> String {
-    if let Some(val) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        return val
-            .split(',')
-            .next()
-            .unwrap_or("unknown")
-            .trim()
-            .to_string();
+pub fn extract_client_ip(headers: &HeaderMap, peer_ip: Option<IpAddr>) -> String {
+    let trusted_proxies = std::env::var("TRUSTED_PROXY_IPS")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|value| value.trim().parse::<IpAddr>().ok())
+        .collect::<Vec<_>>();
+
+    extract_client_ip_from_trusted_proxies(headers, peer_ip, &trusted_proxies)
+}
+
+fn extract_client_ip_from_trusted_proxies(
+    headers: &HeaderMap,
+    peer_ip: Option<IpAddr>,
+    trusted_proxies: &[IpAddr],
+) -> String {
+    let Some(peer_ip) = peer_ip else {
+        return "unknown".to_string();
+    };
+
+    if trusted_proxies.contains(&peer_ip) {
+        let forwarded = headers
+            .get_all("x-forwarded-for")
+            .iter()
+            .map(|value| {
+                value
+                    .to_str()
+                    .ok()?
+                    .split(',')
+                    .map(str::trim)
+                    .map(str::parse::<IpAddr>)
+                    .collect::<Result<Vec<_>, _>>()
+                    .ok()
+            })
+            .collect::<Option<Vec<_>>>()
+            .and_then(|chain| {
+                chain
+                    .into_iter()
+                    .flatten()
+                    .rev()
+                    .find(|ip| !trusted_proxies.contains(ip))
+            });
+        if let Some(ip) = forwarded {
+            return ip.to_string();
+        }
+
+        if let Some(ip) = headers
+            .get("x-real-ip")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<IpAddr>().ok())
+        {
+            return ip.to_string();
+        }
     }
-    if let Some(val) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
-        return val.to_string();
-    }
-    "unknown".to_string()
+
+    peer_ip.to_string()
 }
 
 fn extract_user_id(headers: &HeaderMap) -> String {
@@ -128,4 +175,43 @@ fn extract_user_id(headers: &HeaderMap) -> String {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn untrusted_peer_cannot_spoof_client_ip_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "198.51.100.10".parse().unwrap());
+        headers.insert("x-real-ip", "198.51.100.11".parse().unwrap());
+
+        let client_ip = extract_client_ip_from_trusted_proxies(
+            &headers,
+            Some("203.0.113.1".parse().unwrap()),
+            &["10.0.0.1".parse().unwrap()],
+        );
+
+        assert_eq!(client_ip, "203.0.113.1");
+    }
+
+    #[test]
+    fn trusted_proxy_uses_first_untrusted_address_in_forwarded_chain() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "198.51.100.99, 192.0.2.45, 10.0.0.2"
+                .parse()
+                .unwrap(),
+        );
+
+        let client_ip = extract_client_ip_from_trusted_proxies(
+            &headers,
+            Some("10.0.0.1".parse().unwrap()),
+            &["10.0.0.1".parse().unwrap(), "10.0.0.2".parse().unwrap()],
+        );
+
+        assert_eq!(client_ip, "192.0.2.45");
+    }
 }
