@@ -333,8 +333,10 @@ async fn main() {
         "database pool configuration"
     );
 
-    let db =
-        Arc::new(Db::open_with_pool_config(":memory:", &pool_config).expect("failed to open db"));
+    let database_path = std::env::var("DATABASE_URL").unwrap_or_else(|_| ":memory:".to_string());
+    let db = Arc::new(
+        Db::open_with_pool_config(&database_path, &pool_config).expect("failed to open db"),
+    );
     db.migrate().expect("migration failed");
 
     // Keep sampler and rpc_pool alive for the duration of the process.

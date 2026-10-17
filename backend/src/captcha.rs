@@ -49,6 +49,9 @@ const DEFAULT_CHALLENGE_TTL_SECS: i64 = 300;
 /// Default number of events in a window before an IP is considered suspicious.
 const DEFAULT_SUSPICIOUS_THRESHOLD: u32 = 10;
 
+/// Default rolling window for suspicious-activity events (5 minutes).
+const DEFAULT_SUSPICIOUS_WINDOW_SECS: i64 = 300;
+
 /// Lifetime of the session token minted after a successful CAPTCHA (1 hour).
 const SESSION_TOKEN_TTL_SECS: i64 = 3_600;
 
@@ -64,11 +67,6 @@ static CHALLENGE_STORE: std::sync::LazyLock<
 
 static TRUSTED_STORE: std::sync::LazyLock<Arc<Mutex<Vec<TrustedUser>>>> =
     std::sync::LazyLock::new(|| Arc::new(Mutex::new(Vec::new())));
-
-/// Per-IP event counter used by `is_suspicious`.
-/// Maps IP → count of events seen in the current window.
-static IP_EVENT_COUNTER: std::sync::LazyLock<Arc<Mutex<HashMap<String, u32>>>> =
-    std::sync::LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
 /// Per-IP CAPTCHA failure tracking, used to detect automated bypass attempts
 /// (#392): a client that repeatedly fails CAPTCHA and retries rapidly looks
@@ -214,30 +212,34 @@ pub fn is_trusted_user(user_id: &str, ip: &str, _state: &AppState) -> bool {
 /// threshold.
 ///
 /// The threshold is read from `CAPTCHA_SUSPICIOUS_THRESHOLD` (default 10).
-/// The counter is a simple in-memory stub; a production implementation would
-/// use a sliding-window backed by Redis or the SQLite `Db`.
-pub fn is_suspicious(ip: &str, _state: &AppState) -> bool {
+/// Events are stored in the shared SQLite database over a rolling window.
+pub fn is_suspicious(ip: &str, state: &AppState) -> Result<bool, rusqlite::Error> {
     let threshold = std::env::var("CAPTCHA_SUSPICIOUS_THRESHOLD")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(DEFAULT_SUSPICIOUS_THRESHOLD);
 
-    let counter = IP_EVENT_COUNTER.lock().unwrap_or_else(|p| p.into_inner());
-    counter.get(ip).copied().unwrap_or(0) >= threshold
+    let window_secs = std::env::var("CAPTCHA_SUSPICIOUS_WINDOW_SECS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_SUSPICIOUS_WINDOW_SECS);
+    Ok(state.db.captcha_event_count(ip, window_secs)? >= threshold)
 }
 
 /// Increment the per-IP event counter (used by other modules to signal
 /// potentially suspicious activity from an IP).
-pub fn record_event_for_ip(ip: &str) {
-    let mut counter = IP_EVENT_COUNTER.lock().unwrap_or_else(|p| p.into_inner());
-    *counter.entry(ip.to_string()).or_insert(0) += 1;
+pub fn record_event_for_ip(ip: &str, state: &AppState) -> Result<u32, rusqlite::Error> {
+    let window_secs = std::env::var("CAPTCHA_SUSPICIOUS_WINDOW_SECS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_SUSPICIOUS_WINDOW_SECS);
+    state.db.record_captcha_event(ip, window_secs)
 }
 
 /// Reset the per-IP event counter (e.g. after a successful CAPTCHA verification
 /// or when the observation window rolls over).
-pub fn reset_event_counter_for_ip(ip: &str) {
-    let mut counter = IP_EVENT_COUNTER.lock().unwrap_or_else(|p| p.into_inner());
-    counter.remove(ip);
+pub fn reset_event_counter_for_ip(ip: &str, state: &AppState) -> Result<(), rusqlite::Error> {
+    state.db.reset_captcha_events(ip)
 }
 
 /// Generate a fresh `CaptchaChallenge`.
@@ -393,25 +395,25 @@ pub async fn verify_captcha(
 pub async fn post_challenge_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, AppError> {
     let ip = extract_ip(&headers);
     let user_id = extract_user_id(&headers).unwrap_or_default();
 
     // Trusted users are exempt.
     if !user_id.is_empty() && is_trusted_user(&user_id, &ip, &state) {
-        return (StatusCode::NO_CONTENT, Json(json!(null))).into_response();
+        return Ok((StatusCode::NO_CONTENT, Json(json!(null))).into_response());
     }
 
     // Only issue a challenge when the IP looks suspicious (or when the user
     // has no recorded trust entry — i.e. unknown users always get a challenge
     // if the IP is flagged, and known users only if they are not trusted).
-    if !user_id.is_empty() && !is_suspicious(&ip, &state) {
+    if !user_id.is_empty() && !is_suspicious(&ip, &state)? {
         // Known, non-suspicious user — no challenge needed.
-        return (StatusCode::NO_CONTENT, Json(json!(null))).into_response();
+        return Ok((StatusCode::NO_CONTENT, Json(json!(null))).into_response());
     }
 
     let challenge = generate_challenge(&state);
-    (StatusCode::OK, Json(json!(challenge))).into_response()
+    Ok((StatusCode::OK, Json(json!(challenge))).into_response())
 }
 
 /// `POST /captcha/verify`
@@ -441,7 +443,7 @@ pub async fn post_verify_handler(
                 // and the suspicious-activity counter for this IP so that
                 // subsequent requests are not immediately flagged again.
                 record_captcha_success(&ip);
-                reset_event_counter_for_ip(&ip);
+                reset_event_counter_for_ip(&ip, &state)?;
                 tracing::debug!(
                     challenge_id = %req.challenge_id,
                     ip = %ip,
@@ -639,7 +641,7 @@ mod tests {
     fn not_suspicious_below_threshold() {
         let state = dummy_state();
         // Use a unique IP to avoid interference from other tests.
-        assert!(!is_suspicious("192.0.2.1", &state));
+        assert!(!is_suspicious("192.0.2.1", &state).unwrap());
     }
 
     #[test]
@@ -648,11 +650,11 @@ mod tests {
         let ip = "192.0.2.2";
         // Default threshold is 10.
         for _ in 0..10 {
-            record_event_for_ip(ip);
+            record_event_for_ip(ip, &state).unwrap();
         }
-        assert!(is_suspicious(ip, &state));
-        reset_event_counter_for_ip(ip);
-        assert!(!is_suspicious(ip, &state));
+        assert!(is_suspicious(ip, &state).unwrap());
+        reset_event_counter_for_ip(ip, &state).unwrap();
+        assert!(!is_suspicious(ip, &state).unwrap());
     }
 
     #[test]

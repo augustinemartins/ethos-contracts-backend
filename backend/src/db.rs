@@ -711,6 +711,64 @@ impl Db {
         })
     }
 
+    /// Add a CAPTCHA activity event and return the event count for `ip` in
+    /// the trailing `window_secs` window.
+    pub fn record_captcha_event(
+        &self,
+        ip: &str,
+        window_secs: i64,
+    ) -> Result<u32, rusqlite::Error> {
+        let now = chrono::Utc::now().timestamp();
+        let cutoff = now.saturating_sub(window_secs.max(1));
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
+            "DELETE FROM captcha_ip_events WHERE occurred_at < ?1",
+            params![cutoff],
+        )?;
+        tx.execute(
+            "INSERT INTO captcha_ip_events (ip, occurred_at) VALUES (?1, ?2)",
+            params![ip, now],
+        )?;
+        let count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM captcha_ip_events
+             WHERE ip = ?1 AND occurred_at >= ?2",
+            params![ip, cutoff],
+            |row| row.get(0),
+        )?;
+        tx.commit()?;
+        Ok(u32::try_from(count).unwrap_or(u32::MAX))
+    }
+
+    /// Return the number of CAPTCHA activity events for `ip` in the trailing
+    /// `window_secs` window.
+    pub fn captcha_event_count(
+        &self,
+        ip: &str,
+        window_secs: i64,
+    ) -> Result<u32, rusqlite::Error> {
+        let cutoff = chrono::Utc::now()
+            .timestamp()
+            .saturating_sub(window_secs.max(1));
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM captcha_ip_events
+             WHERE ip = ?1 AND occurred_at >= ?2",
+            params![ip, cutoff],
+            |row| row.get(0),
+        )?;
+        Ok(u32::try_from(count).unwrap_or(u32::MAX))
+    }
+
+    /// Remove all CAPTCHA activity events for `ip`.
+    pub fn reset_captcha_events(&self, ip: &str) -> Result<(), rusqlite::Error> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM captcha_ip_events WHERE ip = ?1", params![ip])?;
+        Ok(())
+    }
+
     /// Insert or replace a vault. Persists to the `vaults` table so the vault
     /// survives process restarts and is visible to every instance sharing the
     /// same SQLite file, then mirrors the write into the in-memory
@@ -1216,6 +1274,20 @@ impl Db {
                     ON vaults(owner, created_at);
                 ",
             ),
+            (
+                "20",
+                r"
+                CREATE TABLE IF NOT EXISTS captcha_ip_events (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ip          TEXT    NOT NULL,
+                    occurred_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_captcha_ip_events_ip_time
+                    ON captcha_ip_events(ip, occurred_at);
+                CREATE INDEX IF NOT EXISTS idx_captcha_ip_events_time
+                    ON captcha_ip_events(occurred_at);
+                ",
+            ),
         ];
 
         for (version, sql) in MIGRATIONS {
@@ -1306,6 +1378,12 @@ impl Db {
                 ",
             ),
             ("9", "DROP TABLE IF EXISTS idempotency_keys_cleanup;"),
+            (
+                "20",
+                "DROP INDEX IF EXISTS idx_captcha_ip_events_time;
+                 DROP INDEX IF EXISTS idx_captcha_ip_events_ip_time;
+                 DROP TABLE IF EXISTS captcha_ip_events;",
+            ),
             (
                 "10",
                 "ALTER TABLE reminder_preferences DROP COLUMN normalized_frequency;",
@@ -3576,6 +3654,30 @@ mod tests {
             .expect("handle A should see a vault inserted through handle B");
         assert_eq!(seen_by_a.id, vault2.id);
 
+        let _ = std::fs::remove_file(path_str);
+    }
+
+    #[test]
+    fn captcha_activity_is_shared_across_db_handles() {
+        let path = std::env::temp_dir().join(format!(
+            "ethos_captcha_events_{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let path_str = path.to_str().unwrap();
+        let db_a = Db::open(path_str).unwrap();
+        db_a.migrate().unwrap();
+        let db_b = Db::open(path_str).unwrap();
+        db_b.migrate().unwrap();
+
+        assert_eq!(db_a.record_captcha_event("192.0.2.80", 300).unwrap(), 1);
+        assert_eq!(db_a.record_captcha_event("192.0.2.80", 300).unwrap(), 2);
+        assert_eq!(db_b.captcha_event_count("192.0.2.80", 300).unwrap(), 2);
+
+        db_b.reset_captcha_events("192.0.2.80").unwrap();
+        assert_eq!(db_a.captcha_event_count("192.0.2.80", 300).unwrap(), 0);
+
+        drop(db_a);
+        drop(db_b);
         let _ = std::fs::remove_file(path_str);
     }
 }
