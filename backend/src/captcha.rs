@@ -4,11 +4,9 @@
 // request IP is considered "suspicious" (exceeded a configurable threshold of
 // recent events).  Trusted users are exempt.
 //
-// Integration with Google reCAPTCHA v2/v3 is optional:
+// Google reCAPTCHA v2/v3 verification:
 //   - Set RECAPTCHA_SITE_KEY   → sent to the frontend so it can render the widget.
-//   - Set RECAPTCHA_SECRET_KEY → used for server-side token verification.
-//   - Leave RECAPTCHA_SECRET_KEY empty to run in *development mode* (all tokens
-//     accepted without contacting Google).
+//   - Set RECAPTCHA_SECRET_KEY → required for server-side token verification.
 //
 // The suspicious-activity threshold is controlled by the
 // `CAPTCHA_SUSPICIOUS_THRESHOLD` env var (default: 10 events per window).
@@ -256,14 +254,25 @@ pub fn generate_challenge(_state: &AppState) -> CaptchaChallenge {
     challenge
 }
 
+fn recaptcha_secret_key() -> Result<String, String> {
+    std::env::var("RECAPTCHA_SECRET_KEY")
+        .map_err(|_| "RECAPTCHA_SECRET_KEY is not configured".to_string())
+        .and_then(|secret| {
+            let secret = secret.trim().to_string();
+            if secret.is_empty() {
+                Err("RECAPTCHA_SECRET_KEY is not configured".to_string())
+            } else {
+                Ok(secret)
+            }
+        })
+}
+
 /// Verify a CAPTCHA token against the Google reCAPTCHA API.
 ///
 /// # Behaviour
-/// * If `RECAPTCHA_SECRET_KEY` is empty (development / CI mode), the function
-///   skips the HTTP call and returns a stub success response.
-/// * Otherwise, a `POST` is sent to
-///   `https://www.google.com/recaptcha/api/siteverify` with the secret key and
-///   the user-supplied token.
+/// A `POST` is sent to `https://www.google.com/recaptcha/api/siteverify` with
+/// the configured secret key and user-supplied token. Missing configuration
+/// is an error; it never accepts a token without verification.
 ///
 /// # Errors
 /// Returns `Err(String)` if the challenge is unknown / expired, or if the
@@ -284,26 +293,8 @@ pub async fn verify_captcha(
         return Err("challenge has expired".to_string());
     }
 
-    // 2. Validate against reCAPTCHA (or return stub success in dev mode).
-    let secret_key = std::env::var("RECAPTCHA_SECRET_KEY").unwrap_or_default();
-
-    if secret_key.is_empty() {
-        // Development / CI mode — accept any token without contacting Google.
-        tracing::debug!("RECAPTCHA_SECRET_KEY not set; returning stub success (dev mode)");
-
-        // Remove the used challenge.
-        CHALLENGE_STORE
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&req.challenge_id);
-
-        let session_token = Uuid::new_v4().to_string();
-        return Ok(CaptchaVerifyResponse {
-            verified: true,
-            session_token: Some(session_token),
-            message: "CAPTCHA verified (development mode)".to_string(),
-        });
-    }
+    // 2. Validate against reCAPTCHA; missing configuration is a hard failure.
+    let secret_key = recaptcha_secret_key()?;
 
     // 3. Real reCAPTCHA verification via reqwest.
     let client = reqwest::Client::new();
@@ -422,6 +413,16 @@ pub async fn post_verify_handler(
         return Err(AppError::TooManyRequests(
             "too many failed CAPTCHA attempts; please wait before retrying".to_string(),
         ));
+    }
+
+    if let Err(error) = recaptcha_secret_key() {
+        tracing::error!(%error, "CAPTCHA verification is unavailable");
+        return Err(crate::error::ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "captcha_unavailable",
+            "CAPTCHA verification is not configured",
+        )
+        .into());
     }
 
     match verify_captcha(&req, &state).await {
@@ -655,8 +656,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verify_captcha_dev_mode_succeeds() {
-        // Ensure no secret key is set for this test.
+    async fn verify_captcha_without_secret_fails_closed() {
         std::env::remove_var("RECAPTCHA_SECRET_KEY");
 
         let state = dummy_state();
@@ -669,10 +669,39 @@ mod tests {
         };
 
         let result = verify_captcha(&req, &state).await;
-        assert!(result.is_ok());
-        let resp = result.unwrap();
-        assert!(resp.verified);
-        assert!(resp.session_token.is_some());
+        assert_eq!(
+            result.unwrap_err(),
+            "RECAPTCHA_SECRET_KEY is not configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_verify_handler_reports_unavailable_without_secret() {
+        std::env::remove_var("RECAPTCHA_SECRET_KEY");
+        let state = Arc::new(dummy_state());
+        let ip = "203.0.113.16";
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", ip.parse().unwrap());
+        let req = CaptchaVerifyRequest {
+            challenge_id: "unneeded".to_string(),
+            captcha_token: "unneeded".to_string(),
+            user_token: "unneeded".to_string(),
+        };
+
+        let result = post_verify_handler(
+            State(state),
+            headers,
+            ConnectInfo("203.0.113.16:3000".parse().unwrap()),
+            Json(req),
+        )
+        .await;
+        match result {
+            Err(AppError::Api(error)) => {
+                assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+            }
+            other => panic!("expected unavailable response, got {other:?}"),
+        }
+        assert_eq!(consecutive_failures_for_ip(ip), 0);
     }
 
     #[tokio::test]
