@@ -134,6 +134,7 @@ let (new_field, result) = engine.rotate_field(&field, 2)?;
 
 ## Development / test mode
 
-If `FIELD_ENCRYPTION_KEY_<N>` is not set in the environment the engine falls
-back to a zero-key for that version.  A `tracing::warn` is emitted.  **Never
-deploy without setting real keys.**
+The active `FIELD_ENCRYPTION_KEY_<N>` must be configured; if it is missing,
+engine initialization fails. Missing older keys are skipped, but any older
+versions still needed to decrypt stored values must remain configured. Outside
+tests, the all-zero development key is rejected as insecure.

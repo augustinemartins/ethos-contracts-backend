@@ -27,9 +27,8 @@
 //! - `FIELD_ENCRYPTION_KEY_<N>` — base64-encoded 32-byte key for version N.
 //! - `FIELD_ENCRYPTION_KEY_VERSION` — the **current** (active) version number.
 //!
-//! If neither variable is set the engine falls back to a hard-coded **dev-only**
-//! key so unit tests can run without environment setup.  The engine panics at
-//! runtime if it detects the dev key in a non-test environment.
+//! The active key must be configured. Missing keys and the all-zero
+//! development key are rejected outside tests.
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use serde::{Deserialize, Serialize};
@@ -43,7 +42,8 @@ const NONCE_LEN: usize = 12;
 /// Length of the AES-256-GCM authentication tag in bytes.
 const TAG_LEN: usize = 16;
 
-/// Dev-only fallback key (all zeros).  Never use in production.
+/// Reserved development key (all zeros). Never use in production.
+#[cfg(not(test))]
 const DEV_KEY: [u8; KEY_LEN] = [0u8; KEY_LEN];
 
 /// Perform the AES-256-GCM core using only the standard library and the
@@ -123,6 +123,8 @@ pub enum EncryptionError {
     InvalidFormat(String),
     #[error("key version {0} not found in environment")]
     KeyNotFound(u32),
+    #[error("insecure development key configured for version {0}")]
+    InsecureKey(u32),
     #[error("base64 decode error: {0}")]
     Base64(#[from] base64::DecodeError),
 }
@@ -141,8 +143,8 @@ impl FieldEncryptionEngine {
     ///
     /// Reads `FIELD_ENCRYPTION_KEY_VERSION` (defaults to `1`) and then looks
     /// for `FIELD_ENCRYPTION_KEY_<N>` for each version it needs to support.
-    /// If a key env-var is absent the dev-only zero-key is substituted —
-    /// **only safe in test/local environments**.
+    /// The active key must be configured. Missing older keys are skipped so
+    /// deployments only need to retain versions that are still in use.
     pub fn from_env() -> Result<Self, EncryptionError> {
         let active_version: u32 = std::env::var("FIELD_ENCRYPTION_KEY_VERSION")
             .ok()
@@ -152,8 +154,13 @@ impl FieldEncryptionEngine {
         let mut keys = std::collections::HashMap::new();
         // Load the active version key and up to 9 previous versions.
         for v in active_version.saturating_sub(9)..=active_version {
-            let key = Self::load_key_for_version(v)?;
-            keys.insert(v, key);
+            match Self::load_key_for_version(v) {
+                Ok(key) => {
+                    keys.insert(v, key);
+                }
+                Err(EncryptionError::KeyNotFound(_)) if v != active_version => {}
+                Err(error) => return Err(error),
+            }
         }
 
         Ok(Self { keys, active_version })
@@ -277,21 +284,13 @@ impl FieldEncryptionEngine {
                 }
                 let mut key = [0u8; KEY_LEN];
                 key.copy_from_slice(&bytes);
+                #[cfg(not(test))]
+                if key == DEV_KEY {
+                    return Err(EncryptionError::InsecureKey(version));
+                }
                 Ok(key)
             }
-            Err(_) => {
-                // Fall back to dev key if no env var is set.
-                // Warn loudly so this is never silently used in production.
-                #[cfg(not(test))]
-                tracing::warn!(
-                    version,
-                    var = var_name,
-                    "FIELD_ENCRYPTION_KEY_{} not set — using insecure dev key. \
-                     Set the environment variable before deploying.",
-                    version
-                );
-                Ok(DEV_KEY)
-            }
+            Err(_) => Err(EncryptionError::KeyNotFound(version)),
         }
     }
 
